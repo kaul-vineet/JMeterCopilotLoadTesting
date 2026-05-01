@@ -544,14 +544,9 @@ def _bomb_countdown():
         time.sleep(0.07)
     console.print(" " * 60)
     for n in range(3, 0, -1):
-        console.print(Panel(f"[bold red]  T - {n}  [/bold red]", border_style="bold red", width=20), justify="center")
+        console.print(f"  [bold red]T-{n}[/bold red]", end="\r")
         time.sleep(0.7)
-        console.print("\033[4A", end="")
-    for _ in range(4):
-        console.print(" " * 60)
-    console.print()
-    console.print(Panel(_EXPLOSION, style="bold yellow on red", border_style="bold yellow"))
-    time.sleep(0.4)
+    console.print(f"  [bold green]GO! 🚀   [/bold green]")
     console.print()
 
 
