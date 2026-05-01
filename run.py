@@ -566,14 +566,16 @@ def _gconfirm(prompt: str, *, default: bool = False) -> bool:
     return r.returncode == 0
 
 
-def _gchoose(*items: str, header: str = "", height: int = 12) -> str:
+def _gchoose(*items: str, header: str = "", height: int = 12,
+             selected_fg: str = "213", item_fg: str = "252") -> str:
     """Arrow-key selection via `gum choose`. Returns chosen item or ''."""
     cmd = ["gum", "choose",
-           "--cursor.foreground",   _G_CYAN,
-           "--selected.foreground", _G_GREEN,
-           "--header.foreground",   _G_DIM,
-           "--cursor",              "▸ ",
-           "--height",              str(height)]
+           "--cursor.foreground",     _G_CYAN,
+           "--selected.foreground",   selected_fg,
+           "--unselected.foreground", item_fg,
+           "--header.foreground",     _G_PURPLE,
+           "--cursor",                "▸ ",
+           "--height",                str(height)]
     if header:
         cmd += ["--header", header]
     cmd += list(items)
@@ -609,6 +611,102 @@ def _rainbow(line: str, offset: int) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _section_header(title: str):
+    """Rainbow sparkle-bordered section header — replaces drab gum style boxes."""
+    rng   = random.Random(hash(title) & 0xFFFF)
+    width = max(len(title) + 10, 44)
+    border = "  " + "".join(
+        _ansi_col(rng.choice(_BANNER_PALETTE), rng.choice(_SPARKLE_CHARS), bold=False)
+        for _ in range(width)
+    )
+    sys.stdout.write("\n" + border + "\n")
+    sys.stdout.write("  " + _rainbow(f"  {title}  ", 0) + "\n")
+    sys.stdout.write(border + "\n\n")
+    sys.stdout.flush()
+
+
+def _ok_line(label: str, note: str = ""):
+    check = _ansi_col(82,  "  ✓  ", bold=True)
+    lbl   = _ansi_col(255, f"{label:<30} ", bold=False)
+    nt    = _ansi_col(82,  note, bold=False) if note else ""
+    sys.stdout.write(check + lbl + nt + "\n")
+    sys.stdout.flush()
+
+
+def _fail_line(label: str, detail: str = ""):
+    check = _ansi_col(196, "  ✗  ", bold=True)
+    lbl   = _ansi_col(255, f"{label:<30} ", bold=True)
+    dt    = _ansi_col(196, detail, bold=True) if detail else ""
+    sys.stdout.write(check + lbl + dt + "\n")
+    sys.stdout.flush()
+
+
+def _dim_line(label: str, note: str = ""):
+    dash = _ansi_col(240, "  ─  ", bold=False)
+    lbl  = _ansi_col(240, f"{label:<30} {note}", bold=False)
+    sys.stdout.write(dash + lbl + "\n")
+    sys.stdout.flush()
+
+
+def _celebrate(msg: str):
+    """Sparkle flash then big rainbow success message."""
+    rng = random.Random()
+    for _ in range(2):
+        row = "  "
+        for _ in range(55):
+            row += _ansi_col(rng.choice(_BANNER_PALETTE), rng.choice(_SPARKLE_CHARS))
+        sys.stdout.write(row + "\n")
+    sys.stdout.flush()
+    time.sleep(0.12)
+    sys.stdout.write("\033[2A\033[J")
+    sys.stdout.write("\n  " + _rainbow(f"  {msg}  ", 5) + "\n")
+    row = "  "
+    for _ in range(55):
+        row += _ansi_col(rng.choice(_BANNER_PALETTE), rng.choice(_SPARKLE_CHARS), bold=False)
+    sys.stdout.write(row + "\n\n")
+    sys.stdout.flush()
+
+
+def _wizard_rocket_float():
+    """Bouncing rocket animation shown before the setup wizard."""
+    def _stars(seed: int) -> str:
+        rng = random.Random(seed)
+        s = "  "
+        for _ in range(55):
+            s += (_ansi_col(rng.choice([255, 251, 15, 14, 51, 99, 201]),
+                            rng.choice(_SPARKLE_CHARS), bold=False)
+                  if rng.random() < 0.11 else " ")
+        return s
+
+    ROCKET = [
+        ("        /\\          ", 214, True),
+        ("       /  \\         ", 214, True),
+        ("      / 🔥 \\        ", 220, True),
+        ("     /______\\       ", 214, True),
+        ("    /        \\      ", 255, False),
+        ("   /  COPILOT \\     ", 51,  True),
+        ("  /____________\\    ", 214, True),
+        ("       |  |         ", 255, False),
+        ("       |  |         ", 255, False),
+        ("   ~ ~ ~ ~ ~ ~   ", 202, False),
+        ("  ~ ~ ~ ~ ~ ~ ~  ", 196, False),
+    ]
+
+    for seed, offset in [(1,2),(2,1),(3,2),(4,1),(5,0),(6,1),(7,0)]:
+        os.system("cls" if os.name == "nt" else "clear")
+        sys.stdout.write("\n" + _stars(seed) + "\n" + _stars(seed + 50) + "\n")
+        for _ in range(offset):
+            sys.stdout.write("\n")
+        for text, col, bold in ROCKET:
+            sys.stdout.write("  " + _ansi_col(col, text, bold=bold) + "\n")
+        sys.stdout.write(_stars(seed + 100) + "\n" + _stars(seed + 150) + "\n")
+        sys.stdout.flush()
+        time.sleep(0.10)
+
+    time.sleep(0.25)
+    os.system("cls" if os.name == "nt" else "clear")
 
 
 def _with_spinner(title: str, fn, *, spinner: str = "dot"):
@@ -696,47 +794,24 @@ def _user_auth_required() -> bool:
 
 
 def _show_profile_status(profiles: list[dict]) -> list[str]:
-    if _gum_ok():
-        _gprint("  PROFILE STATUS", border="rounded", fg=_G_CYAN,
-                bold=True, padding="0 3", margin="1 0")
-        print()
-    else:
-        console.print(Panel("[bold cyan]  👾  PROFILE STATUS  👾[/bold cyan]", border_style="cyan"))
-        console.print()
+    _section_header("✦  PROFILE STATUS  ✦")
 
     needs_auth = []
-    for profile in profiles:
+    for i, profile in enumerate(profiles):
         username = profile["username"]
         display  = profile.get("display_name", username)
 
-        if _gum_ok():
-            if not _user_auth_required():
-                _gprint(f"  {display:<24}  READY  (no auth required)",
-                        fg=_G_GREEN, padding="0 1", margin="0 0")
-                continue
-            try:
-                _with_spinner(f"Checking {display}…",
-                              lambda u=username: get_valid_token(u))
-                _gprint(f"  {display:<24}  READY ✓",
-                        fg=_G_GREEN, bold=True, padding="0 1", margin="0 0")
-            except RuntimeError:
-                _gprint(f"  {display:<24}  NEEDS AUTH ✗",
-                        fg=_G_RED, bold=True, padding="0 1", margin="0 0")
-                needs_auth.append(username)
-        else:
-            for i in range(11):
-                bar = "█" * i + "░" * (10 - i)
-                console.print(f"  [dim]{display:<25}[/dim]  [[cyan]{bar}[/cyan]]", end="\r")
-                time.sleep(0.04)
-            if not _user_auth_required():
-                console.print(f"  [green]{display:<25}[/green]  [[bold green]██████████[/bold green]]  [bold green]READY ✓[/bold green]")
-                continue
-            try:
-                get_valid_token(username)
-                console.print(f"  [green]{display:<25}[/green]  [[bold green]██████████[/bold green]]  [bold green]READY ✓[/bold green]")
-            except RuntimeError:
-                console.print(f"  [red]{display:<25}[/red]  [[bold red]░░░░░░░░░░[/bold red]]  [bold red]NEEDS AUTH ✗[/bold red]")
-                needs_auth.append(username)
+        if not _user_auth_required():
+            _ok_line(display, "READY  (no auth required)")
+            continue
+
+        try:
+            _with_spinner(f"Checking {display}…", lambda u=username: get_valid_token(u))
+            sys.stdout.write("  " + _rainbow(f"  ✓  {display:<24}  READY ✓", i * 3) + "\n")
+            sys.stdout.flush()
+        except RuntimeError:
+            _fail_line(display, "NEEDS AUTH ✗")
+            needs_auth.append(username)
 
     print()
     return needs_auth
@@ -1007,37 +1082,14 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
     Per-profile token validation, then a single end-to-end bot ping with 'hi'.
     Returns False and prints a clear error if anything fails.
     """
-    if _gum_ok():
-        _gprint("  BOT PRE-FLIGHT CHECK", border="rounded", fg=_G_CYAN,
-                bold=True, padding="0 3", margin="1 0")
-    else:
-        console.print(Panel("[bold cyan]  🤖  BOT PRE-FLIGHT CHECK  [/bold cyan]", border_style="cyan"))
-    print()
-
-    def _ok(label: str, note: str = ""):
-        if _gum_ok():
-            _gprint(f"  ✓  {label:<30} {note}", fg=_G_GREEN, padding="0 0")
-        else:
-            console.print(f"  [bold green]✓[/bold green]  {label:<30} [green]{note}[/green]")
-
-    def _fail(label: str, detail: str = ""):
-        if _gum_ok():
-            _gprint(f"  ✗  {label:<30} {detail}", fg=_G_RED, bold=True, padding="0 0")
-        else:
-            console.print(f"  [bold red]✗[/bold red]  {label:<30} [bold red]{detail}[/bold red]")
+    _section_header("🚀  BOT PRE-FLIGHT CHECK  🚀")
 
     def _spin(title: str, fn):
-        if _gum_ok():
-            return _with_spinner(title, fn, spinner="globe")
-        # Rich fallback: just run the function (spinner was cosmetic)
-        return fn()
+        return _with_spinner(title, fn, spinner="globe") if _gum_ok() else fn()
 
     # ── Per-profile token check ───────────────────────────────────────────
-    if _gum_ok():
-        _gprint("  Profile tokens", bold=True, fg=_G_WHITE, padding="0 0", margin="0 0")
-    else:
-        console.print("  [bold]Profile tokens[/bold]")
-    print()
+    sys.stdout.write("  " + _rainbow("  Profile tokens", 1) + "\n\n")
+    sys.stdout.flush()
 
     aad_token_for_bot = None
     if _user_auth_required():
@@ -1048,85 +1100,65 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
                 tok = _spin(f"Checking token — {display}…", lambda u=username: get_valid_token(u))
                 if aad_token_for_bot is None:
                     aad_token_for_bot = tok
-                _ok(display, "token valid")
+                _ok_line(display, "token valid")
             except Exception as e:
-                _fail(display, f"FAILED — {e}")
+                _fail_line(display, f"FAILED — {e}")
                 print()
-                if _gum_ok():
-                    _gprint("  Re-run setup and re-authenticate profiles.",
-                            fg=_G_YELLOW, padding="0 2", margin="0 1")
-                else:
-                    console.print("  [yellow]Re-run setup and re-authenticate profiles.[/yellow]")
-                print()
+                sys.stdout.write("  " + _ansi_col(214, "  Re-run setup and re-authenticate profiles.", bold=False) + "\n\n")
+                sys.stdout.flush()
                 return False
     else:
         for profile in profiles:
-            display = profile.get("display_name", profile["username"])
-            if _gum_ok():
-                _gprint(f"  ─  {display:<30} no auth required", fg=_G_DIM, padding="0 0")
-            else:
-                console.print(f"  [dim]─[/dim]  {display:<30} [dim]no auth required[/dim]")
+            _dim_line(profile.get("display_name", profile["username"]), "no auth required")
 
     print()
 
     # ── Bot connectivity ping ─────────────────────────────────────────────
-    if _gum_ok():
-        _gprint("  Bot connectivity", bold=True, fg=_G_WHITE, padding="0 0", margin="0 0")
-    else:
-        console.print("  [bold]Bot connectivity[/bold]")
-    print()
+    sys.stdout.write("  " + _rainbow("  Bot connectivity", 8) + "\n\n")
+    sys.stdout.flush()
 
     try:
         dl_token = _spin("Fetching DirectLine token…",
                          lambda: fetch_directline_token(aad_token_for_bot))
-        _ok("DirectLine token", "OK")
+        _ok_line("DirectLine token", "OK")
     except Exception as e:
-        _fail("DirectLine token", f"FAILED — {e}")
+        _fail_line("DirectLine token", f"FAILED — {e}")
         print()
-        if _gum_ok():
-            _gprint(
-                "  Possible causes:\n"
-                "  • Wrong DirectLine secret → press U at startup to update\n"
-                "  • Direct Line channel not enabled in Copilot Studio\n"
-                "  • Bot uses Enhanced Authentication → switch to Token Endpoint",
-                border="rounded", fg=_G_YELLOW,
-                padding="1 2", margin="0 1", border_fg=_G_YELLOW,
-            )
-        else:
-            console.print(Panel(
-                "[yellow]  Possible causes:\n\n"
-                "  • Wrong DirectLine secret → press U at startup to update\n"
-                "  • Direct Line channel not enabled → Copilot Studio → Settings → Channels → Direct Line\n"
-                "  • Bot uses Enhanced Authentication → re-run setup and switch to Token Endpoint[/yellow]",
-                border_style="yellow",
-            ))
+        _gprint(
+            "  Possible causes:\n"
+            "  • Wrong DirectLine secret → re-run setup\n"
+            "  • Direct Line channel not enabled in Copilot Studio\n"
+            "  • Bot uses Enhanced Authentication → switch to Token Endpoint",
+            border="rounded", fg=_G_YELLOW,
+            padding="1 2", margin="0 1", border_fg=_G_YELLOW,
+        )
         print()
         return False
 
     try:
         conversation = _spin("Starting conversation…",
                              lambda: start_conversation(dl_token))
-        _ok("Conversation started", f"OK  ({conversation.id[:16]}…)")
+        _ok_line("Conversation started", f"OK  ({conversation.id[:16]}…)")
     except Exception as e:
-        _fail("Start conversation", f"FAILED — {e}")
+        _fail_line("Start conversation", f"FAILED — {e}")
         print()
         return False
 
     try:
         ws = _spin("Opening WebSocket…",
                    lambda: open_websocket(conversation.stream_url))
-        _ok("WebSocket", "OK")
+        _ok_line("WebSocket", "OK")
     except Exception as e:
-        _fail("WebSocket", f"FAILED — {e}")
+        _fail_line("WebSocket", f"FAILED — {e}")
         print()
         return False
 
     try:
         activity_id, _ = _spin("Sending 'hi'…",
                                lambda: send_utterance(conversation, "hi"))
-        _ok("Sent 'hi'", "OK")
+        _ok_line("Sent 'hi'", "OK")
     except Exception as e:
-        _fail("Send utterance", f"FAILED — {e}")
+        _fail_line("Send utterance", f"FAILED — {e}")
         close_websocket(ws)
         return False
 
@@ -1136,20 +1168,16 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
                                                conversation=conversation,
                                                aad_token=aad_token_for_bot))
     except Exception as e:
-        _fail("Bot response", f"FAILED — {e}")
+        _fail_line("Bot response", f"FAILED — {e}")
         return False
     finally:
         close_websocket(ws)
 
     if response.timed_out:
-        _fail("Bot response", "NO REPLY (15s timeout)")
+        _fail_line("Bot response", "NO REPLY (15s timeout)")
         print()
-        if _gum_ok():
-            _gprint("  The bot did not respond. Check it is published and the channel is configured.",
-                    fg=_G_YELLOW, padding="0 2", margin="0 1")
-        else:
-            console.print("  [yellow]The bot did not respond. Check the bot is published and the channel is configured.[/yellow]")
-        print()
+        sys.stdout.write("  " + _ansi_col(214, "  The bot did not respond. Check it is published and the channel is configured.", bold=False) + "\n\n")
+        sys.stdout.flush()
         return False
 
     first_reply = response.activities[0].get("text", "").strip()
@@ -1160,32 +1188,20 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
         error_code = m.group(1).rstrip(".")
 
     if error_code:
-        _fail("Bot responded with error", error_code)
+        _fail_line("Bot responded with error", error_code)
         print()
-        if _gum_ok():
-            _gprint(f"  Bot said:\n\n  {first_reply[:400]}",
-                    border="rounded", fg=_G_RED,
-                    padding="1 2", margin="0 1", border_fg=_G_RED)
-        else:
-            console.print(Panel(
-                f"[red]Bot said:[/red]\n\n  [white]{first_reply[:400]}[/white]",
-                border_style="red", title="[dim]pre-flight response[/dim]",
-            ))
+        _gprint(f"  Bot said:\n\n  {first_reply[:400]}",
+                border="rounded", fg=_G_RED,
+                padding="1 2", margin="0 1", border_fg=_G_RED)
         print()
         _print_error_hint(error_code)
         return False
 
-    _ok("Bot responded", f"{response.latency_ms:.0f}ms")
+    _ok_line("Bot responded", f"{response.latency_ms:.0f}ms")
     print()
-    if _gum_ok():
-        _gprint(f"  Bot said:\n\n  {first_reply[:300]}",
-                border="rounded", fg=_G_GREEN,
-                padding="1 2", margin="0 1", border_fg=_G_GREEN)
-    else:
-        console.print(Panel(
-            f"[bold green]Bot said:[/bold green]\n\n  [white]{first_reply[:300]}[/white]",
-            border_style="green", title="[dim]pre-flight response[/dim]",
-        ))
+    _gprint(f"  Bot said:\n\n  {first_reply[:300]}",
+            border="rounded", fg=_G_GREEN,
+            padding="1 2", margin="0 1", border_fg=_G_GREEN)
     print()
     return True
 
@@ -1267,6 +1283,7 @@ def _write_profiles(profiles: list[dict]):
 
 def run_wizard():
     _gum_require()
+    _wizard_rocket_float()
 
     state = {
         "tenant":              _load_credential("CS_TENANT_ID"),
@@ -1294,12 +1311,14 @@ def run_wizard():
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
-        _gprint(
-            "  COPILOT STUDIO  ·  LOAD TEST  ·  SETUP WIZARD\n\n"
-            "  Saves credentials to Windows Credential Manager.",
-            border="double", fg=_G_CYAN, bold=True,
-            border_fg=_G_PURPLE, padding="1 3", margin="1 0",
-        )
+        rng = random.Random(99)
+        w   = 58
+        bdr = "  " + "".join(_ansi_col(rng.choice(_BANNER_PALETTE), "═") for _ in range(w))
+        sys.stdout.write("\n" + bdr + "\n")
+        sys.stdout.write("  " + _rainbow("  ✦  COPILOT STUDIO  ·  LOAD TEST  ·  SETUP WIZARD  ✦", 0) + "\n")
+        sys.stdout.write("  " + _ansi_col(240, "     Saves credentials to Windows Credential Manager.", bold=False) + "\n")
+        sys.stdout.write(bdr + "\n\n")
+        sys.stdout.flush()
 
         t_ok  = bool(state["tenant"]  and _GUID_RE.match(state["tenant"]))
         c_ok  = bool(state["client"]  and _GUID_RE.match(state["client"]))
@@ -1360,9 +1379,8 @@ def run_wizard():
 
         if choice.strip() == _ADD.strip():
             os.system("cls" if os.name == "nt" else "clear")
-            _gprint("  ADD PROFILE", border="rounded", fg=_G_CYAN,
-                    bold=True, padding="0 3", margin="1 0")
-            print()
+            _section_header("✦  ADD PROFILE  ✦")
+
             uname = _ginput(
                 "loadtest.user@yourcompany.com",
                 header="Username (UPN) — the Microsoft 365 email for this test account",
@@ -1518,7 +1536,8 @@ def run_wizard():
 
     # ── Save ──────────────────────────────────────────────────────────────────
     os.system("cls" if os.name == "nt" else "clear")
-    _gprint("  SAVING…", bold=True, fg=_G_DIM, padding="0 2", margin="1 0")
+    sys.stdout.write("\n  " + _ansi_col(240, "  Saving…", bold=True) + "\n\n")
+    sys.stdout.flush()
     _save_credentials({
         "CS_TENANT_ID":                    state["tenant"],
         "CS_CLIENT_ID":                    state["client"],
@@ -1529,9 +1548,7 @@ def run_wizard():
             state["endpoint"].strip() and state.get("endpoint_needs_auth")) else "false",
     })
     _write_profiles(state["profiles"])
-    _gprint("  ✓  Credentials saved to Windows Credential Manager.",
-            fg=_G_GREEN, bold=True, padding="0 2", margin="0 1")
-    print()
+    _ok_line("Credentials saved to Windows Credential Manager.")
 
     # ── Auth profiles that still need it ──────────────────────────────────
     needs_auth = [
@@ -1539,6 +1556,7 @@ def run_wizard():
         if not is_token_valid(load_token(p["username"]) or {})
     ]
     if needs_auth:
+        print()
         _gprint(
             f"  {len(needs_auth)} profile(s) need sign-in.\n"
             "  Open the URL shown below and enter the code in a browser.",
@@ -1549,10 +1567,7 @@ def run_wizard():
         for username in needs_auth:
             _rocket_auth(username)
 
-    _gprint("  ✓  Setup complete!",
-            border="rounded", fg=_G_GREEN,
-            border_fg=_G_GREEN, bold=True, padding="1 3", margin="1 0")
-    print()
+    _celebrate("  ✦  SETUP COMPLETE!  ALL SYSTEMS READY  ✦")
 
 
 # ── Locust web UI extension ───────────────────────────────────────────────────
