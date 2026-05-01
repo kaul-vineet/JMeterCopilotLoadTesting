@@ -55,7 +55,9 @@ _HERE          = Path(__file__).parent
 PROFILES_JSON  = _HERE / "profiles" / "profiles.json"
 TOKENS_DIR     = _HERE / "profiles" / ".tokens"
 UTTERANCES_DIR = _HERE / "utterances"
+REPORT_DIR     = _HERE / "report"
 TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(exist_ok=True)
 
 # ── Windows Credential Manager helpers ───────────────────────────────────────
 
@@ -1659,8 +1661,47 @@ def _on_locust_init(environment, **kwargs):
     run_startup_sequence(environment, profiles)
 
 
+# ── Per-request detail log ────────────────────────────────────────────────────
+# Writes one CSV row per bot reply: timestamp, profile, scenario,
+# conversation_id, utterance, response_ms, timed_out.
+# File: report/detail_YYYYMMDD_HHMMSS.csv  (new file per test run)
+
+_detail_log_path: Path | None = None
+_detail_lock = threading.Lock()
+
+
+def _init_detail_log():
+    global _detail_log_path
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _detail_log_path = REPORT_DIR / f"detail_{ts}.csv"
+    with open(_detail_log_path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            "timestamp", "profile", "scenario",
+            "conversation_id", "utterance",
+            "response_ms", "timed_out",
+        ])
+    log.info("Detail log → %s", _detail_log_path)
+
+
+def _log_request(profile: str, scenario: str, conv_id: str,
+                 utterance: str, response_ms: float, timed_out: bool):
+    if not _detail_log_path:
+        return
+    row = [
+        datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
+        profile, scenario, conv_id,
+        utterance,
+        f"{response_ms:.0f}",
+        "1" if timed_out else "0",
+    ]
+    with _detail_lock:
+        with open(_detail_log_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(row)
+
+
 @events.test_start.add_listener
 def _on_test_start(environment, **kwargs):
+    _init_detail_log()
     if "--headless" not in sys.argv and "-headless" not in sys.argv:
         return
     if not _user_auth_required():
@@ -1776,12 +1817,20 @@ class CopilotBaseUser(User):
             _fire_metric(self.environment, "Copilot Response", 0, error=e)
             raise StopUser()
 
+        profile_label = self.profile.get("display_name", self.profile.get("username", ""))
+
         if response.timed_out:
             log.warning("No bot reply received for activity %s", activity_id)
+            _log_request(profile_label, self.scenario_name,
+                         self.conversation.id, utterance,
+                         response.latency_ms, timed_out=True)
             _fire_metric(self.environment, "Copilot Response", response.latency_ms,
                          error=Exception("No bot reply received"))
             raise StopUser()
 
+        _log_request(profile_label, self.scenario_name,
+                     self.conversation.id, utterance,
+                     response.latency_ms, timed_out=False)
         _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms)
         time.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
