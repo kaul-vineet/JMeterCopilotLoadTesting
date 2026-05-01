@@ -553,14 +553,16 @@ def _ginput(placeholder: str = "", *, header: str = "", default: str = "",
 
 def _gconfirm(prompt: str, *, default: bool = False) -> bool:
     """Yes/No prompt via `gum confirm`. Returns True for Yes."""
-    r = subprocess.run([
+    cmd = [
         "gum", "confirm", prompt,
         "--affirmative",         "Yes",
         "--negative",            "No",
         "--selected.background", _G_CYAN,
         "--selected.foreground", _G_BLACK,
-        "--default",             "yes" if default else "no",
-    ], text=True, encoding="utf-8")
+    ]
+    if default:
+        cmd.append("--default")
+    r = subprocess.run(cmd, text=True, encoding="utf-8")
     return r.returncode == 0
 
 
