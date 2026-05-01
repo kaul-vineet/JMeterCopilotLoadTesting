@@ -547,7 +547,7 @@ def _ginput(placeholder: str = "", *, header: str = "", default: str = "",
         cmd += ["--value", default]
     if password:
         cmd += ["--password"]
-    r = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, encoding="utf-8")
     return r.stdout.strip()
 
 
@@ -577,11 +577,38 @@ def _gchoose(*items: str, header: str = "", height: int = 12) -> str:
     if header:
         cmd += ["--header", header]
     cmd += list(items)
-    r = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, encoding="utf-8")
     return r.stdout.strip()
 
 
 _GUM_ENV = {**os.environ, "PYTHONUTF8": "1"}   # ensure UTF-8 I/O on Windows
+
+# ── Banner animation helpers ──────────────────────────────────────────────────
+
+_BANNER_PALETTE = [
+    196, 202, 208, 214, 220, 226,   # red → yellow
+    190, 154, 118, 82,  46,          # yellow-green → green
+    51,  45,  39,  33,  27,          # cyan → blue
+    99,  129, 165, 201,              # purple → magenta
+    197,                             # back to red
+]
+_SPARKLE_CHARS = list("✦✧⋆★✸·✺✼❋*◦")
+
+
+def _ansi_col(code: int, text: str, bold: bool = True) -> str:
+    b = "1;" if bold else ""
+    return f"\033[{b}38;5;{code}m{text}\033[0m"
+
+
+def _rainbow(line: str, offset: int) -> str:
+    pal, out, idx = _BANNER_PALETTE, [], 0
+    for ch in line:
+        if ch != " ":
+            out.append(_ansi_col(pal[(idx + offset) % len(pal)], ch))
+            idx += 1
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _with_spinner(title: str, fn, *, spinner: str = "dot"):
@@ -618,21 +645,49 @@ def _with_spinner(title: str, fn, *, spinner: str = "dot"):
 
 def _show_startup_title():
     os.system("cls" if os.name == "nt" else "clear")
+
+    # Phase 1: sparkle burst — flash then clear
+    for _ in range(3):
+        row = "  "
+        for _ in range(56):
+            row += _ansi_col(random.choice(_BANNER_PALETTE), random.choice(_SPARKLE_CHARS))
+        sys.stdout.write(row + "\n")
+    sys.stdout.flush()
+    time.sleep(0.15)
+    os.system("cls" if os.name == "nt" else "clear")
+
+    # Phase 2: rainbow banner, line by line
+    sys.stdout.write("\n")
+    offset = 0
+    for line in _TITLE:
+        if line:
+            sys.stdout.write("  " + _rainbow(line, offset) + "\n")
+            offset = (offset + 4) % len(_BANNER_PALETTE)
+        else:
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+        time.sleep(0.025)
+
+    # Phase 3: sparkle trail beneath the banner
+    trail = "  "
+    for _ in range(56):
+        if random.random() < 0.45:
+            trail += _ansi_col(random.choice(_BANNER_PALETTE), random.choice(_SPARKLE_CHARS), bold=False)
+        else:
+            trail += " "
+    sys.stdout.write(trail + "\n\n")
+    sys.stdout.flush()
+    time.sleep(0.2)
+
+    # Subtitle
     if _gum_ok():
-        _gprint("\n".join(_TITLE[:6]),  fg=_G_YELLOW, bold=True, padding="0 0", margin="1 0")
-        _gprint("\n".join(_TITLE[7:]),  fg=_G_GREEN,  bold=True, padding="0 0", margin="0 0")
         _gprint(
             "  Copilot Studio  ·  DirectLine 3.0  ·  Entra ID Auth",
             fg=_G_DIM, padding="0 0", margin="0 1",
         )
     else:
-        console.print()
-        for i, line in enumerate(_TITLE):
-            colour = "bold yellow" if i < 6 else "bold green"
-            console.print(f"[{colour}]{line}[/{colour}]")
-        console.print()
-        console.print(Rule("[dim]Copilot Studio · DirectLine · Entra ID Auth[/dim]", style="dim yellow"))
-        console.print()
+        sys.stdout.write(f"  \033[2m  Copilot Studio  ·  DirectLine 3.0  ·  Entra ID Auth\033[0m\n\n")
+        sys.stdout.flush()
 
 
 def _user_auth_required() -> bool:
