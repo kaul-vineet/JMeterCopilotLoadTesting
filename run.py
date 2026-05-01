@@ -617,16 +617,11 @@ def _rainbow(line: str, offset: int) -> str:
 
 
 def _section_header(title: str):
-    """Rainbow sparkle-bordered section header — replaces drab gum style boxes."""
-    rng   = random.Random(hash(title) & 0xFFFF)
-    width = max(len(title) + 10, 44)
-    border = "  " + "".join(
-        _ansi_col(rng.choice(_BANNER_PALETTE), rng.choice(_SPARKLE_CHARS), bold=False)
-        for _ in range(width)
-    )
-    sys.stdout.write("\n" + border + "\n")
-    sys.stdout.write("  " + _rainbow(f"  {title}  ", 0) + "\n")
-    sys.stdout.write(border + "\n\n")
+    """Clean vivid section header — single-color border, bold cyan title."""
+    width  = max(len(title) + 10, 44)
+    border = "  " + _ansi_col(99, "─" * width, bold=False)
+    label  = "  " + _ansi_col(14, f"  {title}  ", bold=True)
+    sys.stdout.write("\n" + border + "\n" + label + "\n" + border + "\n\n")
     sys.stdout.flush()
 
 
@@ -1317,11 +1312,9 @@ def run_wizard():
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
-        rng = random.Random(99)
-        w   = 58
-        bdr = "  " + "".join(_ansi_col(rng.choice(_BANNER_PALETTE), "═") for _ in range(w))
+        bdr = "  " + _ansi_col(99, "═" * 58, bold=False)
         sys.stdout.write("\n" + bdr + "\n")
-        sys.stdout.write("  " + _rainbow("  ✦  COPILOT STUDIO  ·  LOAD TEST  ·  SETUP WIZARD  ✦", 0) + "\n")
+        sys.stdout.write("  " + _ansi_col(14, "  ✦  COPILOT STUDIO  ·  LOAD TEST  ·  SETUP WIZARD  ✦", bold=True) + "\n")
         sys.stdout.write("  " + _ansi_col(240, "     Saves credentials to Windows Credential Manager.", bold=False) + "\n")
         sys.stdout.write(bdr + "\n\n")
         sys.stdout.flush()
