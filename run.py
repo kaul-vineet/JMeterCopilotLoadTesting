@@ -592,11 +592,10 @@ _GUM_ENV = {**os.environ, "PYTHONUTF8": "1"}   # ensure UTF-8 I/O on Windows
 # ── Banner animation helpers ──────────────────────────────────────────────────
 
 _BANNER_PALETTE = [
-    196, 202, 208, 214, 220, 226,   # red → yellow
-    190, 154, 118, 82,  46,          # yellow-green → green
-    51,  45,  39,  33,  27,          # cyan → blue
-    99,  129, 165, 201,              # purple → magenta
-    197,                             # back to red
+    255, 253, 251, 15,               # bright white
+    14,  51,  45,  39,               # cyan
+    33,  27,  99,  129,              # blue → purple
+    165, 201, 213, 219,              # magenta → pink → back to white
 ]
 _SPARKLE_CHARS = list("✦✧⋆★✸·✺✼❋*◦")
 
@@ -655,17 +654,10 @@ def _dim_line(label: str, note: str = ""):
 
 
 def _celebrate(msg: str):
-    """Sparkle flash then big rainbow success message."""
+    """Sparkle trail + big rainbow success message."""
     rng = random.Random()
-    for _ in range(2):
-        row = "  "
-        for _ in range(55):
-            row += _ansi_col(rng.choice(_BANNER_PALETTE), rng.choice(_SPARKLE_CHARS))
-        sys.stdout.write(row + "\n")
-    sys.stdout.flush()
-    time.sleep(0.12)
-    sys.stdout.write("\033[2A\033[J")
-    sys.stdout.write("\n  " + _rainbow(f"  {msg}  ", 5) + "\n")
+    print()
+    sys.stdout.write("  " + _rainbow(f"  {msg}  ", 5) + "\n")
     row = "  "
     for _ in range(55):
         row += _ansi_col(rng.choice(_BANNER_PALETTE), rng.choice(_SPARKLE_CHARS), bold=False)
@@ -674,12 +666,12 @@ def _celebrate(msg: str):
 
 
 def _wizard_rocket_float():
-    """Bouncing rocket animation shown before the setup wizard."""
+    """Floating rocket animation shown before the setup wizard."""
     def _stars(seed: int) -> str:
         rng = random.Random(seed)
         s = "  "
         for _ in range(55):
-            s += (_ansi_col(rng.choice([255, 251, 15, 14, 51, 99, 201]),
+            s += (_ansi_col(rng.choice(_BANNER_PALETTE),
                             rng.choice(_SPARKLE_CHARS), bold=False)
                   if rng.random() < 0.11 else " ")
         return s
@@ -697,19 +689,29 @@ def _wizard_rocket_float():
         ("   ~ ~ ~ ~ ~ ~   ", 202, False),
         ("  ~ ~ ~ ~ ~ ~ ~  ", 196, False),
     ]
+    FRAME_H = 2 + 2 + len(ROCKET) + 2  # stars + offset space + rocket + stars
 
-    for seed, offset in [(1,2),(2,1),(3,2),(4,1),(5,0),(6,1),(7,0)]:
-        os.system("cls" if os.name == "nt" else "clear")
-        sys.stdout.write("\n" + _stars(seed) + "\n" + _stars(seed + 50) + "\n")
-        for _ in range(offset):
-            sys.stdout.write("\n")
-        for text, col, bold in ROCKET:
-            sys.stdout.write("  " + _ansi_col(col, text, bold=bold) + "\n")
-        sys.stdout.write(_stars(seed + 100) + "\n" + _stars(seed + 150) + "\n")
+    os.system("cls" if os.name == "nt" else "clear")
+    sys.stdout.write("\033[?25l")  # hide cursor
+    sys.stdout.flush()
+    try:
+        first = True
+        for seed, offset in [(1,2),(2,1),(3,1),(4,0),(5,1),(6,0)]:
+            if not first:
+                sys.stdout.write(f"\033[{FRAME_H + offset + 1}A")
+            first = False
+            sys.stdout.write("\n" + _stars(seed) + "\n" + _stars(seed + 50) + "\n")
+            for _ in range(offset):
+                sys.stdout.write("\n")
+            for text, col, bold in ROCKET:
+                sys.stdout.write("  " + _ansi_col(col, text, bold=bold) + "\n")
+            sys.stdout.write(_stars(seed + 100) + "\n" + _stars(seed + 150) + "\n")
+            sys.stdout.flush()
+            time.sleep(0.12)
+        time.sleep(0.2)
+    finally:
+        sys.stdout.write("\033[?25h")  # restore cursor
         sys.stdout.flush()
-        time.sleep(0.10)
-
-    time.sleep(0.25)
     os.system("cls" if os.name == "nt" else "clear")
 
 
