@@ -1,0 +1,8 @@
+.env
+.claude/
+profiles/.tokens/
+profiles/profiles.json
+__pycache__/
+*.pyc
+*.jtl
+report/

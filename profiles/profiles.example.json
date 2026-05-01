@@ -1,0 +1,11 @@
+[
+  {
+    "username": "loadtest.user1@yourcompany.com",
+    "display_name": "User 1",
+    "scenario": "it_support"
+  },
+  {
+    "username": "loadtest.user2@yourcompany.com",
+    "display_name": "User 2"
+  }
+]
