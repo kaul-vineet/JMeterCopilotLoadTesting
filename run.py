@@ -593,9 +593,9 @@ def _check_credentials() -> str:
         _row(True, "Token Endpoint URL", "(both set — Token Endpoint takes priority)")
     elif secret_val:
         _row(True,  "DirectLine Secret")
-        console.print(f"  [dim]─[/dim]  {'Token Endpoint URL':<35} [dim](not set)[/dim]")
+        console.print(f"  [dim]─[/dim]  {'Token Endpoint URL':<35} [dim](not needed — DirectLine Secret is used)[/dim]")
     elif endpt_val:
-        console.print(f"  [dim]─[/dim]  {'DirectLine Secret':<35} [dim](not set — using Token Endpoint)[/dim]")
+        console.print(f"  [dim]─[/dim]  {'DirectLine Secret':<35} [dim](not needed — Token Endpoint is used)[/dim]")
         _row(True,  "Token Endpoint URL")
     else:
         _row(False, "DirectLine Secret",  "(need Secret or Token Endpoint)")
