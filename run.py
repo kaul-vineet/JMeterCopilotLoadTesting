@@ -555,10 +555,14 @@ def _gconfirm(prompt: str, *, default: bool = False) -> bool:
     """Yes/No prompt via `gum confirm`. Returns True for Yes."""
     cmd = [
         "gum", "confirm", prompt,
-        "--affirmative",         "Yes",
-        "--negative",            "No",
-        "--selected.background", _G_CYAN,
-        "--selected.foreground", _G_BLACK,
+        "--affirmative",              "Yes",
+        "--negative",                 "No",
+        "--prompt.foreground",        "255",
+        "--selected.background",      "213",
+        "--selected.foreground",      _G_BLACK,
+        "--unselected.foreground",    "252",
+        "--unselected.background",    "236",
+        "--no-show-help",
     ]
     if default:
         cmd.append("--default")
