@@ -617,12 +617,9 @@ def _rainbow(line: str, offset: int) -> str:
 
 
 def _section_header(title: str):
-    """Clean vivid section header — single-color border, bold cyan title."""
-    width  = max(len(title) + 10, 44)
-    border = "  " + _ansi_col(99, "─" * width, bold=False)
-    label  = "  " + _ansi_col(14, f"  {title}  ", bold=True)
-    sys.stdout.write("\n" + border + "\n" + label + "\n" + border + "\n\n")
-    sys.stdout.flush()
+    """Vivid section header via gum style (stable, no shimmer)."""
+    _gprint(f"  {title}", border="rounded", fg=_G_CYAN,
+            bold=True, padding="0 3", margin="1 0")
 
 
 def _ok_line(label: str, note: str = ""):
@@ -1312,12 +1309,12 @@ def run_wizard():
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
-        bdr = "  " + _ansi_col(99, "═" * 58, bold=False)
-        sys.stdout.write("\n" + bdr + "\n")
-        sys.stdout.write("  " + _ansi_col(14, "  ✦  COPILOT STUDIO  ·  LOAD TEST  ·  SETUP WIZARD  ✦", bold=True) + "\n")
-        sys.stdout.write("  " + _ansi_col(240, "     Saves credentials to Windows Credential Manager.", bold=False) + "\n")
-        sys.stdout.write(bdr + "\n\n")
-        sys.stdout.flush()
+        _gprint(
+            "  ✦  COPILOT STUDIO  ·  LOAD TEST  ·  SETUP WIZARD  ✦\n\n"
+            "  Saves credentials to Windows Credential Manager.",
+            border="double", fg=_G_CYAN, bold=True,
+            border_fg=_G_PURPLE, padding="1 3", margin="1 0",
+        )
 
         t_ok  = bool(state["tenant"]  and _GUID_RE.match(state["tenant"]))
         c_ok  = bool(state["client"]  and _GUID_RE.match(state["client"]))
