@@ -153,7 +153,6 @@ Before you start, make sure you have the following:
 |---|---|
 | **Windows 10/11 machine** | Required for Windows Credential Manager integration. Linux works with an extra step (see `TOKEN_ENCRYPTION_PASSWORD` in `.env.example`). |
 | **Python 3.10 or newer** | Download from python.org. During installation, tick "Add Python to PATH". Version 3.10 is the minimum — the tool uses type syntax introduced in that version. |
-| **A Microsoft 365 tenant** | The organisation whose Copilot Studio bot you are testing. |
 | **A published Copilot Studio bot** | The bot must be published and have the Direct Line channel enabled. |
 | **Two test user accounts** | Real Microsoft 365 accounts in your tenant (e.g. `loadtest.user1@yourcompany.com`). These accounts will be used as simulated users. They need a Copilot Studio licence or a Teams licence. |
 | **Azure portal access** | You need permission to register applications in Microsoft Entra ID. The "Application Developer" role is sufficient. |
