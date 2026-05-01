@@ -521,7 +521,7 @@ def _gstyle(text: str, *, border: str = "", fg: str = _G_WHITE,
     if bold:
         cmd += ["--bold"]
     cmd.append(text)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
     return r.stdout
 
 
@@ -547,7 +547,7 @@ def _ginput(placeholder: str = "", *, header: str = "", default: str = "",
         cmd += ["--value", default]
     if password:
         cmd += ["--password"]
-    r = subprocess.run(cmd, text=True, capture_output=True)
+    r = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
     return r.stdout.strip()
 
 
@@ -560,7 +560,7 @@ def _gconfirm(prompt: str, *, default: bool = False) -> bool:
         "--selected.background", _G_CYAN,
         "--selected.foreground", _G_BLACK,
         "--default",             "yes" if default else "no",
-    ], text=True)
+    ], text=True, encoding="utf-8")
     return r.returncode == 0
 
 
@@ -575,8 +575,11 @@ def _gchoose(*items: str, header: str = "", height: int = 12) -> str:
     if header:
         cmd += ["--header", header]
     cmd += list(items)
-    r = subprocess.run(cmd, text=True, capture_output=True)
+    r = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8")
     return r.stdout.strip()
+
+
+_GUM_ENV = {**os.environ, "PYTHONUTF8": "1"}   # ensure UTF-8 I/O on Windows
 
 
 def _with_spinner(title: str, fn, *, spinner: str = "dot"):
@@ -595,11 +598,12 @@ def _with_spinner(title: str, fn, *, spinner: str = "dot"):
     threading.Thread(target=_worker, daemon=True).start()
     spin = subprocess.Popen(
         ["gum", "spin",
-         "--spinner",          spinner,
-         "--title",            f"  {title}",
+         "--spinner",            spinner,
+         "--title",              f"  {title}",
          "--spinner.foreground", _G_CYAN,
-         "--title.foreground",  _G_WHITE],
+         "--title.foreground",   _G_WHITE],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=_GUM_ENV,
     )
     done.wait()
     spin.terminate()
