@@ -571,15 +571,14 @@ def _gconfirm(prompt: str, *, default: bool = False) -> bool:
 
 
 def _gchoose(*items: str, header: str = "", height: int = 12,
-             selected_fg: str = "213", item_fg: str = "252") -> str:
+             selected_fg: str = "213") -> str:
     """Arrow-key selection via `gum choose`. Returns chosen item or ''."""
     cmd = ["gum", "choose",
-           "--cursor.foreground",     _G_CYAN,
-           "--selected.foreground",   selected_fg,
-           "--unselected.foreground", item_fg,
-           "--header.foreground",     _G_PURPLE,
-           "--cursor",                "▸ ",
-           "--height",                str(height)]
+           "--cursor.foreground",   _G_CYAN,
+           "--selected.foreground", selected_fg,
+           "--header.foreground",   _G_PURPLE,
+           "--cursor",              "▸ ",
+           "--height",              str(height)]
     if header:
         cmd += ["--header", header]
     cmd += list(items)
@@ -779,10 +778,10 @@ def _show_startup_title():
     if _gum_ok():
         _gprint(
             "  Copilot Studio  ·  DirectLine 3.0  ·  Entra ID Auth",
-            fg=_G_DIM, padding="0 0", margin="0 1",
+            fg="219", bold=True, padding="0 0", margin="0 1",
         )
     else:
-        sys.stdout.write(f"  \033[2m  Copilot Studio  ·  DirectLine 3.0  ·  Entra ID Auth\033[0m\n\n")
+        sys.stdout.write(f"  \033[1;38;5;219m  Copilot Studio  ·  DirectLine 3.0  ·  Entra ID Auth\033[0m\n\n")
         sys.stdout.flush()
 
 
@@ -935,7 +934,7 @@ def _check_credentials() -> str:
     """
     if _gum_ok():
         _gprint("  CREDENTIAL CHECK", border="rounded", fg=_G_CYAN,
-                bold=True, padding="0 3", margin="1 0")
+                bold=True, padding="0 3", margin="1 0", border_fg=_G_PURPLE)
         print()
         tenant_val = _with_spinner("Entra Tenant ID…",            lambda: _load_credential("CS_TENANT_ID"))
         client_val = _with_spinner("App Registration Client ID…",  lambda: _load_credential("CS_CLIENT_ID"))
@@ -946,31 +945,19 @@ def _check_credentials() -> str:
         client_ok = bool(client_val and _GUID_RE.match(client_val))
         dl_ok     = bool(secret_val or endpt_val)
 
-        def _row(ok: bool, label: str, note: str = ""):
-            icon   = "✓" if ok else "✗"
-            status = "FOUND" if ok else "MISSING"
-            note_s = f"  {note}" if note else ""
-            _gprint(f"  {icon}  {label:<35} {status}{note_s}",
-                    fg=_G_GREEN if ok else _G_RED, padding="0 0")
-
-        def _dim_row(label: str, note: str = ""):
-            _gprint(f"  ─  {label:<35} {note}", fg=_G_DIM, padding="0 0")
-
-        _row(tenant_ok, "Entra Tenant ID")
-        _row(client_ok, "App Registration Client ID")
+        _ok_line("Entra Tenant ID",             "FOUND")    if tenant_ok else _fail_line("Entra Tenant ID",             "MISSING")
+        _ok_line("App Registration Client ID",  "FOUND")    if client_ok else _fail_line("App Registration Client ID",  "MISSING")
 
         if secret_val and endpt_val:
-            _row(True, "DirectLine Secret")
-            _row(True, "Token Endpoint URL", "(both set — Token Endpoint takes priority)")
+            _ok_line("DirectLine Secret",   "FOUND")
+            _ok_line("Token Endpoint URL",  "FOUND  (both set — Token Endpoint takes priority)")
         elif secret_val:
-            _row(True, "DirectLine Secret")
-            _dim_row("Token Endpoint URL", "(not needed — DirectLine Secret is used)")
+            _ok_line("DirectLine Secret",   "FOUND")
         elif endpt_val:
-            _dim_row("DirectLine Secret",   "(not needed — Token Endpoint is used)")
-            _row(True, "Token Endpoint URL")
+            _ok_line("Token Endpoint URL",  "FOUND")
         else:
-            _row(False, "DirectLine Secret",  "(need Secret or Token Endpoint)")
-            _row(False, "Token Endpoint URL", "(need Secret or Token Endpoint)")
+            _fail_line("DirectLine Secret",  "MISSING  (need Secret or Token Endpoint)")
+            _fail_line("Token Endpoint URL", "MISSING  (need Secret or Token Endpoint)")
 
         print()
 
@@ -1320,6 +1307,9 @@ def run_wizard():
         c_ok  = bool(state["client"]  and _GUID_RE.match(state["client"]))
         dl_ok = bool(state["secret"]  or  state["endpoint"])
 
+        # Token Endpoint is only shown when Secret is absent or Endpoint is already set
+        _show_endpoint = not state["secret"] or bool(state["endpoint"])
+
         items = [
             _mrow("Tenant ID",           _val(state["tenant"]),
                   t_ok if state["tenant"] else False),
@@ -1330,11 +1320,11 @@ def run_wizard():
             _mrow("DirectLine Secret",   _val(state["secret"], masked=True,
                   opt_note="(not set)"),
                   True if state["secret"] else (False if not state["endpoint"] else None)),
-            _mrow("Token Endpoint",      _val(state["endpoint"],
-                  opt_note="(not set — Secret is used)" if state["secret"] else "(not set)"),
-                  True if state["endpoint"] else None),
         ]
-        _N_CRED = len(items)   # must stay in sync with the rows above
+        if _show_endpoint:
+            items.append(_mrow("Token Endpoint", _val(state["endpoint"], opt_note="(not set)"),
+                               True if state["endpoint"] else None))
+        _N_CRED = len(items)
 
         for p in state["profiles"]:
             display  = p.get("display_name", p["username"])
@@ -1467,7 +1457,7 @@ def run_wizard():
             if v:
                 state["secret"] = v
 
-        elif idx == 4:
+        elif idx == 4 and _show_endpoint:
             os.system("cls" if os.name == "nt" else "clear")
             v = _ginput(
                 "https://…",
