@@ -10,10 +10,12 @@ Headless (pre-authenticate all profiles first):
 """
 
 # gevent monkey-patch must happen before any I/O library imports
+import gevent
 import gevent.monkey
 gevent.monkey.patch_all()
 
 import base64
+import collections
 import csv
 import hashlib
 import itertools
@@ -39,12 +41,16 @@ import websocket
 from cryptography.fernet import Fernet
 from flask import jsonify, request
 from locust import User, events, task
+from locust.env import Environment
 from locust.exception import StopUser
+from rich import box as rich_box
 from rich.console import Console
+from rich.live import Live
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
 from rich.table import Table
+from rich.text import Text
 
 log     = logging.getLogger(__name__)
 console = Console()
@@ -89,7 +95,12 @@ test_config: dict = {
     "think_max":     60,
     "p95_target_ms": 2000,
     "max_error_rate": 0.5,
+    "users":         10,
+    "spawn_rate":    2,
+    "run_time_mins": 5,
 }
+
+_active_dashboard: "Optional[_DashboardState]" = None
 
 # ── Credentials (read from Windows Credential Manager, fallback to env vars) ──
 
@@ -1271,6 +1282,8 @@ def run_wizard():
 
     _SAVE = "  ✓  Save & continue"
     _ADD  = "  +  Add profile"
+    _BACK = "  ←  Back"
+    _EXIT = "  ✕  Exit"
 
     def _val(v: str, *, masked: bool = False, opt_note: str = "") -> str:
         if not v:
@@ -1281,7 +1294,7 @@ def run_wizard():
 
     def _mrow(label: str, value: str, ok: bool | None = None) -> str:
         mark = "   ✓" if ok is True else ("   ✗" if ok is False else "")
-        return f"    {label:<28}  {value:<46}{mark}"
+        return f"      {label:<32}  {value:<50}{mark}"
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
@@ -1315,21 +1328,31 @@ def run_wizard():
                                True if state["endpoint"] else None))
         _N_CRED = len(items)
 
+        items.append("")
+        items.append("  ─  PROFILES  ─  Each profile is a real M365 account. Assign a scenario")
+        items.append("     to control which utterances it sends. Multiple profiles = more load.")
+
         for p in state["profiles"]:
             display  = p.get("display_name", p["username"])
             tok      = load_token(p["username"])
             ready    = bool(tok and is_token_valid(tok))
-            scenario = f"  [{p['scenario']}]" if p.get("scenario") else ""
+            scenario = f"  → {p['scenario']}" if p.get("scenario") else "  → (auto-assign)"
             items.append(_mrow(f"Profile: {display}",
                                p["username"] + scenario, ready))
 
-        items += ["", _ADD, _SAVE]
+        items += ["", _ADD, _SAVE, _BACK, _EXIT]
 
         choice = _gchoose(
             *items,
             header="\n  ↑ ↓  navigate     Enter  select\n",
             height=min(len(items) + 4, 26),
         )
+
+        if choice and choice.strip() == _EXIT.strip():
+            sys.exit(0)
+
+        if choice and choice.strip() == _BACK.strip():
+            return
 
         if not choice or choice.strip() == _SAVE.strip():
             errs = []
@@ -1353,38 +1376,40 @@ def run_wizard():
             break
 
         if choice.strip() == _ADD.strip():
-            os.system("cls" if os.name == "nt" else "clear")
-            _section_header("✦  ADD PROFILE  ✦")
+            while True:
+                os.system("cls" if os.name == "nt" else "clear")
+                _section_header("✦  ADD PROFILE  ✦")
 
-            uname = _ginput(
-                "loadtest.user@yourcompany.com",
-                header="Username (UPN) — the Microsoft 365 email for this test account",
-            )
-            if not uname:
-                continue
-            disp_def = uname.split("@")[0]
-            disp = _ginput(
-                disp_def,
-                header="Display name  (label shown in terminal — press Enter to accept default)",
-                default=disp_def,
-            ) or disp_def
-            available_csvs = sorted(p.stem for p in UTTERANCES_DIR.glob("*.csv"))
-            scenario = ""
-            if available_csvs:
-                csv_pick = _gchoose(
-                    "(none — auto assign)", *available_csvs,
-                    header=f"\n  Which scenario CSV does this profile use?\n"
-                           f"  Available: {', '.join(available_csvs)}\n",
-                    height=min(len(available_csvs) + 5, 12),
+                uname = _ginput(
+                    "loadtest.user@yourcompany.com",
+                    header="Username (UPN) — the Microsoft 365 email for this test account",
                 )
-                scenario = "" if csv_pick.startswith("(none") else csv_pick.strip()
-            new_p: dict = {"username": uname, "display_name": disp}
-            if scenario:
-                new_p["scenario"] = scenario
-            state["profiles"].append(new_p)
-            _gprint(f"  ✓  Added: {disp}  ({uname})",
-                    fg=_G_GREEN, bold=True, padding="0 2", margin="0 1")
-            time.sleep(0.8)
+                if not uname:
+                    break
+                disp_def = uname.split("@")[0]
+                disp = _ginput(
+                    disp_def,
+                    header="Display name  (label shown in terminal — press Enter to accept default)",
+                    default=disp_def,
+                ) or disp_def
+                available_csvs = sorted(p.stem for p in UTTERANCES_DIR.glob("*.csv"))
+                scenario = ""
+                if available_csvs:
+                    csv_pick = _gchoose(
+                        "(none — auto assign)", *available_csvs,
+                        header=f"\n  Which scenario CSV does this profile use?\n"
+                               f"  Available: {', '.join(available_csvs)}\n",
+                        height=min(len(available_csvs) + 5, 12),
+                    )
+                    scenario = "" if csv_pick.startswith("(none") else csv_pick.strip()
+                new_p: dict = {"username": uname, "display_name": disp}
+                if scenario:
+                    new_p["scenario"] = scenario
+                state["profiles"].append(new_p)
+                _gprint(f"  ✓  Added: {disp}  ({uname})",
+                        fg=_G_GREEN, bold=True, padding="0 2", margin="0 1")
+                if not _gconfirm("Add another profile?", default=False):
+                    break
             continue
 
         # ── Match choice back to item index ──────────────────────────────
@@ -1461,8 +1486,8 @@ def run_wizard():
                     default=state.get("endpoint_needs_auth", False),
                 )
 
-        elif _N_CRED <= idx < _N_CRED + len(state["profiles"]):
-            p_idx = idx - _N_CRED
+        elif _N_CRED + 3 <= idx < _N_CRED + 3 + len(state["profiles"]):
+            p_idx = idx - _N_CRED - 3
             p     = state["profiles"][p_idx]
             os.system("cls" if os.name == "nt" else "clear")
             _gprint(
@@ -1875,14 +1900,22 @@ class CopilotBaseUser(User):
             _log_request(profile_label, self.scenario_name,
                          self.conversation.id, utterance,
                          response.latency_ms, timed_out=True)
-            _fire_metric(self.environment, "Copilot Response", response.latency_ms,
+            _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms,
                          error=Exception("No bot reply received"))
+            if _active_dashboard is not None:
+                _active_dashboard.on_utterance(
+                    utterance, self.scenario_name, id(self), profile_label,
+                    self._idx, len(self.utterances), response.latency_ms, True)
             raise StopUser()
 
         _log_request(profile_label, self.scenario_name,
                      self.conversation.id, utterance,
                      response.latency_ms, timed_out=False)
         _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms)
+        if _active_dashboard is not None:
+            _active_dashboard.on_utterance(
+                utterance, self.scenario_name, id(self), profile_label,
+                self._idx, len(self.utterances), response.latency_ms, False)
         time.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
         # All utterances sent — close this conversation and open a fresh one
@@ -1925,6 +1958,340 @@ for _i, _csv in enumerate(_csv_files):
     globals()[_class_name] = _make_user_class(_class_name, _load_utterances(_csv), _scenario, _profile)
 
 
+# ── Live dashboard ────────────────────────────────────────────────────────────
+
+class _DashboardState:
+    def __init__(self, target_users: int, p95_target: int, profile_map: dict):
+        self._lock        = threading.Lock()
+        self.target_users = target_users
+        self.p95_target   = p95_target
+        self.profile_map  = profile_map          # scenario → display_name
+        self.start_time   = time.time()
+        self._times: dict[str, list[float]] = {}
+        self._tout:  dict[str, int]         = {}
+        self._ts:    list[tuple[float, float]] = []
+        self._errs:  list[tuple[float, bool]]  = []
+        self._utt_times: dict[str, list[float]] = {}
+        self._utt_tout:  dict[str, int]         = {}
+        self._users: dict[int, dict]            = {}  # user_id → {name, idx, total}
+        self.feed   = collections.deque(maxlen=8)
+
+    def on_request(self, **kwargs):
+        name      = kwargs.get("name", "")
+        rt        = float(kwargs.get("response_time") or 0)
+        exception = kwargs.get("exception")
+        if not name.startswith("Copilot Response"):
+            return
+        scenario = name.split(" — ", 1)[1] if " — " in name else "Unknown"
+        is_err   = exception is not None
+        elapsed  = time.time() - self.start_time
+        with self._lock:
+            self._times.setdefault(scenario, [])
+            self._tout.setdefault(scenario, 0)
+            if is_err:
+                self._tout[scenario] += 1
+            else:
+                self._times[scenario].append(rt)
+            self._ts.append((elapsed, rt))
+            self._errs.append((elapsed, is_err))
+
+    def on_utterance(self, utterance: str, scenario: str, user_id: int,
+                     display: str, idx: int, total: int,
+                     response_ms: float, timed_out: bool):
+        filled  = int((idx / max(1, total)) * 10)
+        bar     = "█" * filled + "░" * (10 - filled)
+        status  = "✗ timeout" if timed_out else f"✓ {int(response_ms)}ms"
+        with self._lock:
+            self._utt_times.setdefault(utterance, [])
+            self._utt_tout.setdefault(utterance, 0)
+            if timed_out:
+                self._utt_tout[utterance] += 1
+            else:
+                self._utt_times[utterance].append(response_ms)
+            self._users[user_id] = {"name": display, "idx": idx, "total": total}
+            self.feed.appendleft(f"  → {display:<20} [{bar}] {idx:>2}/{total}  {status}")
+
+    def add_feed(self, msg: str):
+        with self._lock:
+            self.feed.appendleft(msg)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "times":     {k: list(v) for k, v in self._times.items()},
+                "tout":      dict(self._tout),
+                "ts":        list(self._ts),
+                "errs":      list(self._errs),
+                "utt_times": {k: list(v) for k, v in self._utt_times.items()},
+                "utt_tout":  dict(self._utt_tout),
+                "feed":      list(self.feed),
+            }
+
+
+def _pct(values: list, p: float) -> int:
+    if not values:
+        return 0
+    s = sorted(values)
+    return int(s[min(int(len(s) * p), len(s) - 1)])
+
+
+def _sparkline(ts: list, width: int = 20, bucket_s: float = 30.0) -> str:
+    if not ts:
+        return "▁" * width
+    blocks  = "▁▂▃▄▅▆▇█"
+    max_t   = max(t for t, _ in ts)
+    n       = max(1, int(max_t / bucket_s) + 1)
+    buckets: list = [[] for _ in range(n)]
+    for t, v in ts:
+        buckets[min(int(t / bucket_s), n - 1)].append(v)
+    vals = [_pct(b, 0.95) if b else 0 for b in buckets]
+    mx   = max(vals) or 1
+    line = "".join(blocks[min(int(v / mx * 7), 7)] for v in vals)
+    return line[-width:].ljust(width, "▁")
+
+
+def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState") -> Table:
+    elapsed  = int(time.time() - state.start_time)
+    h, m, s  = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
+    target   = params["users"]
+    curr     = getattr(runner, "user_count", 0)
+    p95_tgt  = state.p95_target
+
+    all_times = [v for vlist in snap["times"].values() for v in vlist]
+    all_tout  = sum(snap["tout"].values())
+    all_reqs  = sum(len(v) for v in snap["times"].values()) + all_tout
+    all_p50   = _pct(all_times, 0.50)
+    all_p95   = _pct(all_times, 0.95)
+    all_p99   = _pct(all_times, 0.99)
+
+    err_rate = (all_tout / max(1, all_reqs)) * 100
+    recent   = [t for t, _ in snap["ts"] if t > elapsed - 30]
+    rps      = len(recent) / min(30.0, max(1.0, float(elapsed)))
+
+    if all_reqs == 0:
+        health, hcol = "● STARTING", "yellow"
+    elif all_p95 < p95_tgt * 0.8:
+        health, hcol = "● HEALTHY",  "green"
+    elif all_p95 < p95_tgt:
+        health, hcol = "● DEGRADED", "yellow"
+    else:
+        health, hcol = "● CRITICAL", "red"
+
+    filled    = int((curr / max(1, target)) * 10)
+    spawn_bar = "▓" * filled + "░" * (10 - filled)
+    p95_fill  = min(int((all_p95 / max(1, p95_tgt)) * 10), 10)
+    p95_bar   = "█" * p95_fill + "░" * (10 - p95_fill)
+    p95_warn  = " ⚠" if all_p95 > p95_tgt else ""
+
+    root = Table.grid(expand=True, padding=(0, 0))
+    root.add_column()
+
+    # ── Header box ───────────────────────────────────────────────────────────
+    hdr = Table.grid(expand=True, padding=(0, 2))
+    hdr.add_column(ratio=5)
+    hdr.add_column(ratio=3, justify="center")
+    hdr.add_column(ratio=2, justify="right")
+    hdr.add_row(
+        Text("  COPILOT STUDIO  ·  LOAD TEST  ·  LIVE", style="bold cyan"),
+        Text(health, style=f"bold {hcol}"),
+        Text(f"{h:02d}:{m:02d}:{s:02d}", style="bold white"),
+    )
+    root.add_row(Panel(hdr, border_style="cyan", padding=(0, 1)))
+
+    # ── Spawning bar (own line) ───────────────────────────────────────────────
+    root.add_row(Text(
+        f"  SPAWNING  {spawn_bar}  {curr} / {target} users",
+        style="bold white",
+    ))
+    # ── Stats summary (own line) ──────────────────────────────────────────────
+    root.add_row(Text(
+        f"  RPS: {rps:.1f}/s   Errors: {err_rate:.1f}%   "
+        f"p95: [{p95_bar}] {all_p95}ms / {p95_tgt}ms{p95_warn}",
+        style="bold white",
+    ))
+    root.add_row(Text(""))
+
+    # ── Profile stats ─────────────────────────────────────────────────────────
+    root.add_row(Text("  PROFILE STATS", style="bold cyan"))
+    tbl = Table(show_header=True, header_style="bold cyan",
+                box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=False)
+    tbl.add_column("User · Scenario", min_width=32)
+    tbl.add_column("Requests", justify="right", min_width=8)
+    tbl.add_column("p50",      justify="right", min_width=6)
+    tbl.add_column("p95",      justify="right", min_width=6)
+    tbl.add_column("p99",      justify="right", min_width=6)
+    tbl.add_column("T/O",      justify="right", min_width=5)
+    tbl.add_column("Trend",    min_width=22)
+
+    for scenario, times in sorted(snap["times"].items()):
+        tout    = snap["tout"].get(scenario, 0)
+        reqs    = len(times) + tout
+        p50_v   = _pct(times, 0.50)
+        p95_v   = _pct(times, 0.95)
+        p99_v   = _pct(times, 0.99)
+        rcol    = "bold red" if p95_v > p95_tgt else "white"
+        disp    = state.profile_map.get(scenario, "")
+        label   = f"{disp} · {scenario}" if disp else scenario
+        tbl.add_row(
+            Text(label, style=rcol),
+            Text(str(reqs),  style=rcol),
+            Text(str(p50_v)),
+            Text(str(p95_v), style=rcol),
+            Text(str(p99_v)),
+            Text(str(tout),  style="bold red" if tout > 0 else "white"),
+            Text(_sparkline(snap["ts"]), style="cyan"),
+        )
+
+    all_spark = _sparkline(snap["ts"])
+    tbl.add_row(
+        Text("ALL USERS", style="bold white"),
+        Text(str(all_reqs), style="bold white"),
+        Text(str(all_p50),  style="bold white"),
+        Text(str(all_p95),  style="bold red" if all_p95 > p95_tgt else "bold white"),
+        Text(str(all_p99),  style="bold white"),
+        Text(str(all_tout), style="bold red" if all_tout > 0 else "bold white"),
+        Text(all_spark,     style="bold cyan"),
+    )
+    root.add_row(tbl)
+
+    # ── Sparklines ────────────────────────────────────────────────────────────
+    err_ts = [(t, 1000.0 if e else 0.0) for t, e in snap["errs"]]
+    root.add_row(Text(f"  {_sparkline(snap['ts'])}  p95 trend",       style="cyan"))
+    root.add_row(Text(f"  {_sparkline(err_ts)}  error rate trend",   style="red"))
+    root.add_row(Text(""))
+
+    # ── Utterance tables ──────────────────────────────────────────────────────
+    utt_data = []
+    for utt, times in snap["utt_times"].items():
+        tout_u = snap["utt_tout"].get(utt, 0)
+        utt_data.append((utt, times, tout_u))
+
+    def _utt_table(title: str, rows: list, col: str):
+        root.add_row(Text(f"  {title}", style="bold cyan"))
+        ut = Table(show_header=True, header_style="bold cyan",
+                   box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=False)
+        ut.add_column("Utterance", min_width=36)
+        ut.add_column("p50",   justify="right", min_width=6)
+        ut.add_column("p95",   justify="right", min_width=6)
+        ut.add_column("Count", justify="right", min_width=6)
+        for utt, times, tout_u in rows[:8]:
+            p50_u = _pct(times, 0.50)
+            p95_u = _pct(times, 0.95)
+            cnt   = len(times) + tout_u
+            rcol  = col
+            label = (utt[:34] + "…") if len(utt) > 35 else utt
+            ut.add_row(Text(label, style=rcol), Text(str(p50_u), style=rcol),
+                       Text(str(p95_u), style=rcol), Text(str(cnt)))
+        root.add_row(ut)
+
+    if utt_data:
+        slowest = sorted(utt_data, key=lambda x: _pct(x[1], 0.95), reverse=True)
+        fastest = sorted(utt_data, key=lambda x: _pct(x[1], 0.95))
+        _utt_table("SLOWEST UTTERANCES  (top 8 by p95)", slowest, "bold red")
+        root.add_row(Text(""))
+        _utt_table("FASTEST UTTERANCES  (top 8 by p95)", fastest, "bold green")
+        root.add_row(Text(""))
+
+    # ── Live feed ─────────────────────────────────────────────────────────────
+    root.add_row(Text("  LIVE FEED", style="bold cyan"))
+    for entry in list(snap["feed"])[:8]:
+        style = "bold red" if "timeout" in entry else ("bold yellow" if "spawned" in entry else "white")
+        root.add_row(Text(entry, style=style))
+
+    root.add_row(Text(""))
+
+    # ── Acronym legend ────────────────────────────────────────────────────────
+    legend = (
+        "  p50 = median response   "
+        "p95 = 95% of requests faster than this   "
+        "p99 = 99th percentile   "
+        "T/O = Timeout   "
+        "RPS = Requests / second"
+    )
+    root.add_row(Panel(Text(legend, style="dim"), border_style="dim", padding=(0, 1)))
+
+    root.add_row(Text("  Press Q to stop test and go to New Run", style="dim"))
+    return root
+
+
+# ── Run parameters ────────────────────────────────────────────────────────────
+
+def _collect_run_params() -> dict:
+    """Show all run params with defaults pre-filled. User selects any to change."""
+    _START = "  ▶  Start test"
+    _EXIT  = "  ✕  Exit"
+
+    state = {
+        "users":    test_config["users"],
+        "spawn":    test_config["spawn_rate"],
+        "run_mins": test_config["run_time_mins"],
+        "think":    test_config["think_min"],
+        "timeout":  int(test_config["frame_timeout"]),
+    }
+
+    def _prow(label: str, value, unit: str, hint: str) -> str:
+        return f"    {label:<36}  {str(value):<6} {unit:<8}  {hint}"
+
+    while True:
+        os.system("cls" if os.name == "nt" else "clear")
+        _gprint(
+            "  ✦  RUN CONFIGURATION  ✦\n\n"
+            "  Select any setting to change it, then start the test.",
+            border="double", fg="213", bold=True,
+            border_fg="99", padding="1 4", margin="1 0 1 0",
+        )
+
+        items = [
+            _prow("Peak users",                    state["users"],    "users",   "how many hit the bot at the same time"),
+            _prow("Ramp-up rate",                  state["spawn"],    "users/s", "how fast new users join"),
+            _prow("Run time",                      state["run_mins"], "minutes", "how long the test runs"),
+            _prow("Wait between messages",         state["think"],    "seconds", "pause each user takes after a reply"),
+            _prow("Reply timeout",                 state["timeout"],  "seconds", "give up waiting after this long"),
+            _START,
+            _EXIT,
+        ]
+
+        choice = _gchoose(*items, header="\n  ↑ ↓  navigate     Enter  select\n",
+                          height=min(len(items) + 4, 16))
+
+        if not choice:
+            continue
+        if choice.strip() == _EXIT.strip():
+            sys.exit(0)
+        if choice.strip() == _START.strip():
+            break
+
+        idx = next((i for i, it in enumerate(items) if it.strip() == choice.strip()), -1)
+
+        def _edit(prompt: str, current) -> int:
+            v = _ginput(str(current), header=prompt, default=str(current))
+            try:
+                return int(v.strip()) if v and v.strip() else current
+            except ValueError:
+                return current
+
+        if idx == 0:
+            state["users"]    = _edit("How many users hit the bot at the same time? (peak concurrency)", state["users"])
+        elif idx == 1:
+            state["spawn"]    = _edit("How fast do new users join? (users per second)", state["spawn"])
+        elif idx == 2:
+            state["run_mins"] = _edit("How long should the test run? (minutes)", state["run_mins"])
+        elif idx == 3:
+            v = _edit("How long does each user pause between messages? (seconds, minimum 25)", state["think"])
+            state["think"] = max(25, v)
+        elif idx == 4:
+            state["timeout"]  = _edit("Give up waiting for a reply after how many seconds?", state["timeout"])
+
+    test_config["think_min"]     = state["think"]
+    test_config["think_max"]     = state["think"]
+    test_config["frame_timeout"] = float(state["timeout"])
+    test_config["users"]         = state["users"]
+    test_config["spawn_rate"]    = state["spawn"]
+    test_config["run_time_mins"] = state["run_mins"]
+
+    return {"users": state["users"], "spawn_rate": state["spawn"], "run_time": state["run_mins"] * 60}
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1958,19 +2325,91 @@ if __name__ == "__main__":
     if not _preflight_bot_check(_profiles):
         sys.exit(1)
 
-    _bomb_countdown()
-    console.print(Panel(
-        "[bold green]  🌐  TEST LAUNCHED — OPEN YOUR BROWSER  🌐[/bold green]\n\n"
-        "  [bold white]http://localhost:8089[/bold white]\n\n"
-        "  [dim]Fill in parameters and click [bold]Start[/bold] to begin[/dim]",
-        border_style="bold green",
-        title="[bold green]READY[/bold green]",
-    ))
-    console.print()
-
     os.environ["CS_SETUP_DONE"] = "1"
-    result = subprocess.run(
-        [sys.executable, "-m", "locust", "-f", __file__],
-        check=False,
-    )
-    sys.exit(result.returncode)
+
+    _user_classes = [v for k, v in globals().items()
+                     if isinstance(v, type) and issubclass(v, User)
+                     and v not in (User, CopilotBaseUser)]
+
+    while True:
+        _params = _collect_run_params()
+        _init_detail_log()
+
+        _profile_map = {
+            cls.scenario_name: cls.fixed_profile.get(
+                "display_name", cls.fixed_profile.get("username", cls.scenario_name)
+            )
+            for cls in _user_classes
+            if hasattr(cls, "scenario_name") and hasattr(cls, "fixed_profile")
+        }
+        _env    = Environment(user_classes=_user_classes)
+        _runner = _env.create_local_runner()
+        _dash   = _DashboardState(
+            target_users=_params["users"],
+            p95_target=test_config["p95_target_ms"],
+            profile_map=_profile_map,
+        )
+        global _active_dashboard
+        _active_dashboard = _dash
+        _env.events.request.add_listener(_dash.on_request)
+        _runner.start(user_count=_params["users"], spawn_rate=_params["spawn_rate"])
+
+        _stop_run   = [False]
+        _prev_users = [0]
+
+        def _keywatch():
+            if os.name == "nt":
+                import msvcrt as _m
+                while not _stop_run[0]:
+                    try:
+                        if _m.kbhit():
+                            if _m.getch() in (b"q", b"Q"):
+                                _stop_run[0] = True
+                                return
+                    except Exception:
+                        pass
+                    gevent.sleep(0.1)
+
+        _kw = gevent.spawn(_keywatch)
+
+        with Live(console=console, auto_refresh=False) as _live:
+            _deadline = time.time() + _params["run_time"]
+            while time.time() < _deadline and not _stop_run[0]:
+                _curr = getattr(_runner, "user_count", 0)
+                if _curr > _prev_users[0]:
+                    for _i in range(_prev_users[0] + 1, _curr + 1):
+                        _dash.add_feed(f"  ↑ User {_i} spawned")
+                    _prev_users[0] = _curr
+                _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
+                _live.refresh()
+                gevent.sleep(0.5)
+            _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
+            _live.refresh()
+
+        _stop_run[0] = True
+        _kw.kill()
+        _runner.quit()
+        _runner.greenlet.join()
+        _active_dashboard = None
+
+        gevent.sleep(0.3)
+        os.system("cls" if os.name == "nt" else "clear")
+        _celebrate("Test complete")
+
+        while True:
+            _post = _gchoose(
+                "  ▶  New Run",
+                "  ⚙  Edit Settings",
+                "  ✕  Exit",
+                header="\n  What next?\n",
+                height=7,
+            )
+            if not _post:
+                continue
+            if "Edit Settings" in _post:
+                run_wizard()
+                break
+            elif "Exit" in _post:
+                sys.exit(0)
+            else:
+                break  # New Run → outer loop continues

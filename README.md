@@ -29,7 +29,7 @@ This tool answers that question by:
 - **Simulating multiple users at once.** Each simulated user follows a script — a list of messages to send — and behaves like a real person (it pauses between messages the way a human would).
 - **Automating authentication.** Copilot Studio bots protected by Microsoft sign-in require a real user identity to respond. This tool authenticates each simulated user using a real Microsoft 365 account, the same way a browser would — but fully automated, so you can run 50 users without 50 browser windows.
 - **Measuring response time.** The tool records exactly how long the bot takes to reply to each message, from the moment the message is sent to the moment the first response arrives.
-- **Producing a report.** At the end of a test run, you get a dashboard showing requests per second, average response time, 95th-percentile response time, and error rate — the same metrics used in official Microsoft Copilot Studio performance benchmarks.
+- **Live terminal dashboard.** While the test runs, a real-time dashboard shows requests per second, percentile response times, per-scenario stats, and a live feed of user activity — all in the terminal, no browser required.
 
 ---
 
@@ -112,9 +112,9 @@ Profiles can be pinned to specific scenarios. If you have two profiles and two s
 
 ### 2.6 How Locust drives the test
 
-Locust is a Python-based load testing framework. This tool uses Locust as its execution engine. Here is what Locust does during a test:
+Locust is a Python-based load testing framework. This tool uses Locust as its execution engine — programmatically, without the Locust web interface. Here is what Locust does during a test:
 
-1. **Spawning:** You tell Locust to start, say, 10 users at a rate of 1 per second. Every second, Locust creates a new virtual user (called a "User" in Locust terminology) until there are 10.
+1. **Spawning:** You set peak users and a spawn rate in the Run Configuration menu. Every second, Locust creates new virtual users until the peak is reached.
 
 2. **Each user's lifecycle:**
    - **`on_start`:** The user opens a DirectLine conversation and WebSocket.
@@ -123,7 +123,7 @@ Locust is a Python-based load testing framework. This tool uses Locust as its ex
 
 3. **When all utterances are exhausted:** The user closes the current conversation and opens a fresh one, then starts cycling through the utterances again from the beginning.
 
-4. **Metrics:** Every time the tool receives a bot reply, it reports the latency to Locust using `events.request.fire()`. Locust aggregates these into statistics you can see in real time on its web dashboard.
+4. **Metrics:** Every time the tool receives a bot reply, it reports the latency to Locust internally. The live dashboard reads these events in real time.
 
 ### 2.7 The startup sequence
 
@@ -137,11 +137,11 @@ python run.py
     ├─ 3. Profile status (checks cached tokens are valid)
     ├─ 4. Authentication (device code flow for any profile that needs it)
     ├─ 5. Pre-flight bot check (sends "hi" to the bot, verifies it responds)
-    ├─ 6. Countdown animation
-    └─ 7. Launches Locust subprocess → web UI at http://localhost:8089
+    ├─ 6. Run Configuration menu (set users, spawn rate, run time)
+    └─ 7. Live terminal dashboard (real-time stats · press Q to stop)
 ```
 
-This design means the Locust web interface only appears after everything is confirmed working. You will not see "Starting web interface" until the bot has been verified.
+This design means the live dashboard only appears after everything is confirmed working. You will not see the dashboard until the bot has been verified and you have confirmed the test parameters.
 
 ---
 
@@ -153,11 +153,11 @@ Before you start, make sure you have the following:
 |---|---|
 | **Windows 10/11 machine** | Required for Windows Credential Manager integration. Linux works with an extra step (see `TOKEN_ENCRYPTION_PASSWORD` in `.env.example`). |
 | **Python 3.10 or newer** | Download from python.org. During installation, tick "Add Python to PATH". Version 3.10 is the minimum — the tool uses type syntax introduced in that version. |
+| **Charm Gum CLI** | Required for the interactive TUI menus. Install with `winget install charmbracelet.gum` (see Section 6.3). |
 | **A published Copilot Studio bot** | The bot must be published and have the Direct Line channel enabled. |
 | **Two test user accounts** | Real Microsoft 365 accounts in your tenant (e.g. `loadtest.user1@yourcompany.com`). These accounts will be used as simulated users. They need a Copilot Studio licence or a Teams licence. |
 | **Azure portal access** | You need permission to register applications in Microsoft Entra ID. The "Application Developer" role is sufficient. |
 | **The bot's DirectLine Secret or Token Endpoint URL** | From Copilot Studio → Settings → Channels → Direct Line. |
-| **The bot's OAuth Connection Name** | Visible in Copilot Studio → Settings → Security → Authentication. Only needed if the bot uses authentication. |
 
 ---
 
@@ -298,10 +298,22 @@ This installs:
 - **websocket-client** — used to receive bot replies over WebSocket
 - **cryptography** — Fernet encryption for token storage
 - **keyring** — reads/writes Windows Credential Manager
-- **rich** — the coloured terminal output
+- **rich** — the coloured terminal output and live dashboard
 - **colorama** — Windows console colour compatibility
 
-### 6.4 Create your utterance files
+### 6.4 Install Charm Gum (TUI menus)
+
+The interactive wizard and run configuration menus use [Charm Gum](https://github.com/charmbracelet/gum). Install it once:
+
+```
+winget install charmbracelet.gum
+```
+
+Or with Scoop: `scoop install charm-gum`
+
+Gum is a standalone binary — it does not affect Python or your virtual environment.
+
+### 6.5 Create your utterance files
 
 Before running the wizard, put at least one CSV file in the `utterances/` folder. See Section 8 for the format. There is an example file `utterances/it_support.csv` already included.
 
@@ -319,22 +331,30 @@ The first time you run this (or if not configured), the setup wizard opens autom
 
 ### 7.1 The wizard menu
 
-The wizard shows a numbered list of settings:
+The wizard uses arrow-key navigation. Each row is a setting — navigate to it and press Enter to edit:
 
 ```
-  [1]  Tenant ID                          (not set)
-  [2]  App Registration Client ID         (not set)
-  [3]  Bot Client ID (SSO)                (not set — SSO disabled)
-  [4]  DirectLine Secret                  (not set)
-  [5]  Token Endpoint URL                 (not set)
-  [6]  Add profile
+      Tenant ID                          72f988bf-…                      ✓
+      Client ID                          cea29e59-…                      ✓
+      Bot Client ID (SSO)                (optional — blank = SSO disabled)
+      DirectLine Secret                  ●●●●●●●● (saved)                ✓
+
+  ─  PROFILES  ─  Each profile is a real M365 account. Assign a scenario
+     to control which utterances it sends. Multiple profiles = more load.
+
+      Profile: User 1                    loadtest.user1@…  → it_support   ✓
+
+  +  Add profile
+  ✓  Save & continue
+  ←  Back
+  ✕  Exit
 ```
 
-Type a number and press Enter to edit that field. Press Enter with no number to save and continue.
+Navigate up/down with arrow keys. Press Enter to edit a field or take an action. Press **← Back** to leave without saving, **✕ Exit** to quit the tool.
 
 ### 7.2 Field-by-field guide
 
-**[1] Tenant ID**
+**Tenant ID**
 The unique identifier for your Microsoft 365 organisation in Azure.
 
 Where to find it: Azure portal → Microsoft Entra ID → Overview → Tenant ID.
@@ -343,28 +363,23 @@ It looks like: `72f988bf-86f1-41af-91ab-2d7cd011db47`
 
 ---
 
-**[2] App Registration Client ID**
+**Client ID**
 The identifier of the load test client app you created in Section 4.3.
 
 Where to find it: Azure portal → App registrations → [your app] → Application (client) ID.
 
-It looks like: `cea29e59-7415-4281-9c05-8fefbac4f1b1`
-
 ---
 
-**[3] Bot Client ID (SSO)**
+**Bot Client ID (SSO)**
 The identifier of the bot's resource app (the one Copilot Studio created automatically).
 
 Where to find it: Copilot Studio → Settings → Security → Authentication → Client ID.
-Alternatively: Azure portal → App registrations → All applications → search for your bot's auth app → Application (client) ID.
-
-It looks like: `a172951c-2123-4f0a-9a63-3c5477d034d5`
 
 Leave this blank if your bot does not use authentication.
 
 ---
 
-**[4] DirectLine Secret**
+**DirectLine Secret**
 The secret key that gives this tool permission to talk to your bot.
 
 Where to find it: Copilot Studio → Settings → Channels → Direct Line → Secret keys → Show.
@@ -373,7 +388,7 @@ The value is a long string of random characters. It is masked as you type it.
 
 ---
 
-**[5] Token Endpoint URL**
+**Token Endpoint URL**
 An alternative to the DirectLine Secret. Some organisations use a Token Endpoint — a URL on their own server that vends temporary DirectLine tokens without exposing the raw secret.
 
 Where to find it: Copilot Studio → Settings → Channels → Direct Line → Token Endpoint URL.
@@ -383,31 +398,33 @@ If you set this, leave the DirectLine Secret blank (or vice versa). If both are 
 ---
 
 **Profiles**
-After the credential fields, you will be prompted to add at least one profile. A profile is a test user account.
+After the credential fields, you can add profiles. A profile is a test user account.
 
 For each profile you need:
 - **Username (UPN):** The full email address of the test account, e.g. `loadtest.user1@yourcompany.com`
 - **Display name:** A short label shown in the terminal (e.g. `User 1`). Press Enter to accept the default (the part before @).
 - **Scenario (CSV name):** The name of the CSV file (without `.csv`) this profile will use. Leave blank to auto-assign.
 
-After adding profiles, the wizard asks whether to add more. When done, press Enter with no number to save.
+After adding a profile, the wizard asks whether to add another.
 
 ### 7.3 Authentication
 
 After saving, the wizard checks whether each profile already has a valid cached token. For any that do not, it starts the device code flow:
 
 ```
-  1. Open:  https://login.microsoft.com/device
-  2. Enter: EL4LXCF6H
+  ╭──────────────────────────────────╮
+  │  EL4LXCF6H                       │
+  ╰──────────────────────────────────╯
+  Go to:  https://microsoft.com/devicelogin
 
-  Waiting for sign-in...
+  Waiting for sign-in…
 ```
 
 Open a browser, go to that URL, enter the code shown, and sign in with the test user account. The tool waits. When sign-in completes, the token is saved encrypted to `profiles/.tokens/`. You will not need to do this again for that account until the refresh token expires (typically 90 days).
 
 ### 7.4 Pre-flight check
 
-Before showing the Locust web interface, the tool sends "hi" to the bot and waits for a reply (up to 15 seconds). This confirms the credentials work and the bot is reachable. If this fails, an error message explains what to check.
+Before showing the run configuration, the tool sends "hi" to the bot and waits for a reply (up to 15 seconds). This confirms the credentials work and the bot is reachable. If this fails, an error message explains what to check.
 
 > **Note:** The pre-flight check sends one real message to your bot. If you are testing a production bot, this will appear in the bot's analytics as one conversation. This is unavoidable and harmless — it is a single "hi" message sent once at startup.
 
@@ -456,79 +473,137 @@ With the virtual environment active:
 python run.py
 ```
 
-If already configured, the wizard is skipped. The tool checks credentials, verifies profile tokens, runs the pre-flight check, then opens the Locust web interface.
+If already configured, the wizard is skipped. The tool checks credentials, verifies profile tokens, and runs the pre-flight check, then shows the **Run Configuration** menu.
 
-Open your browser and go to: **http://localhost:8089**
+### 9.2 Run Configuration menu
 
-### 9.2 The Locust web interface
+All test parameters are shown with their current values. Navigate to any row and press Enter to edit it:
 
-At the top of the page you will see a "Copilot Studio Test Configuration" panel with these fields:
+```
+  ✦  RUN CONFIGURATION  ✦
 
-**DirectLine Connection:**
-- **DirectLine Secret / Token Endpoint URL:** Pre-filled from your saved configuration. You can override them per-run here without re-running the wizard.
+  Select any setting to change it, then start the test.
 
-**Timing:**
-- **Response Timeout (seconds):** How long the tool waits for a bot reply before recording an error. Default: 10 seconds. Increase this if your bot is slow.
-- **Think Time Min/Max (seconds):** The pause between messages. The tool picks a random wait between Min and Max. Default: 30–60 seconds. Microsoft Copilot Studio performance guidelines recommend 30–60 seconds of think time to simulate realistic usage.
+▸   Peak users                           10     users     how many hit the bot at the same time
+    Ramp-up rate                         2      users/s   how fast new users join
+    Run time                             5      minutes   how long the test runs
+    Wait between messages                30     seconds   pause each user takes after a reply
+    Reply timeout                        10     seconds   give up waiting after this long
+    ▶  Start test
+    ✕  Exit
+```
 
-**Success Criteria:**
-- **95th Percentile Target (ms):** The response time benchmark you are testing against. Microsoft's published baseline is 2000ms (2 seconds) at the 95th percentile.
-- **Max Error Rate (%):** The acceptable failure rate. Microsoft's baseline is 0.5%.
+Select **▶ Start test** when ready.
 
-**The standard test parameters (scroll down):**
-- **Number of users:** How many simulated users to run concurrently.
-- **Spawn rate:** How many new users to start per second.
-- **Host:** Leave this as the default or blank — the tool fills it automatically.
-
-### 9.3 Starting the test
-
-Set the number of users and spawn rate, then click **Start swarming**. The configuration panel settings are sent to the tool first, then the test begins.
-
-**What "number of users" means:** This is the number of concurrent users at peak — the maximum number of simultaneous open conversations. It is not the number of messages per second. With think time set to 30–60 seconds, 10 concurrent users will generate approximately 10 ÷ 45 ≈ **0.2 requests per second**. To get 1 request per second, you need roughly 45 concurrent users. This is intentional — Microsoft's Copilot Studio performance guidance assumes human-paced conversations, not continuous bombardment.
+**What "peak users" means:** This is the number of concurrent users at peak — the maximum number of simultaneous open conversations. It is not the number of messages per second. With think time set to 30 seconds, 10 concurrent users will generate approximately 10 ÷ 30 ≈ **0.3 requests per second**. To get 1 request per second, you need roughly 30 concurrent users. This is intentional — Microsoft's Copilot Studio performance guidance assumes human-paced conversations.
 
 **Recommended approach for first runs:**
 1. Start with 1 user, confirm the bot responds correctly.
 2. Step up to 5 users, watch for errors.
 3. Step up to 10, 20, 50 users incrementally.
 
-### 9.4 Stopping the test
+### 9.3 Live dashboard
 
-Click **Stop** in the web interface. The tool will finish any in-flight requests and stop spawning new users.
+The test runs entirely in the terminal. A live dashboard updates every 0.5 seconds:
+
+```
+╭──────────────────────────────────────────────────────────────────────╮
+│  COPILOT STUDIO  ·  LOAD TEST  ·  LIVE        ● HEALTHY    00:02:14  │
+╰──────────────────────────────────────────────────────────────────────╯
+  SPAWNING  ▓▓▓▓▓▓▓▓▓░  9 / 10 users
+  RPS: 0.3/s   Errors: 0.0%   p95: [████████░░] 1820ms / 2000ms
+
+  PROFILE STATS
+   User · Scenario        Requests   p50   p95   p99   T/O   Trend
+   Alice · It Support        47      1340  1820  2100    0   ▁▂▂▃▃▄▃▄
+   ALL USERS                 47      1340  1820  2100    0   ▁▂▂▃▃▄▃▄
+
+  ▁▂▂▃▃▄▃▄  p95 trend
+  ▁▁▁▁▁▁▁▁  error rate trend
+
+  SLOWEST UTTERANCES  (top 8 by p95)
+   Utterance                        p50   p95   Count
+   How do I reset my password?      1620  2100      8
+
+  FASTEST UTTERANCES  (top 8 by p95)
+   Utterance                        p50   p95   Count
+   Hi, I need help                  1100  1400      9
+
+  LIVE FEED
+  → Alice               [████████░░]  8/10  ✓ 1620ms
+  ↑ User 9 spawned
+
+  ╭─────────────────────────────────────────────────────────────────╮
+  │  p50 = median response   p95 = 95th percentile   p99 = 99th    │
+  │  T/O = Timeout   RPS = Requests / second                        │
+  ╰─────────────────────────────────────────────────────────────────╯
+
+  Press Q to stop test and go to New Run
+```
+
+**Health indicator:**
+- `● HEALTHY` — p95 is below 80% of your target
+- `● DEGRADED` — p95 is between 80% and 100% of your target
+- `● CRITICAL` — p95 has exceeded your target
+
+Press **Q** at any time to stop the test early.
+
+### 9.4 After the test
+
+When the test ends (time expires or you press Q), a post-run menu appears:
+
+```
+  ▶  New Run         — go back to Run Configuration and start again
+  ⚙  Edit Settings   — open the setup wizard to change credentials or profiles
+  ✕  Exit            — close the tool
+```
+
+All results are automatically saved to `report/detail_YYYYMMDD_HHMMSS.csv`.
 
 ---
 
 ## 10. Reading the Results
 
-### 10.1 Real-time statistics table
+### 10.1 Live dashboard metrics
 
-The main table on the Locust dashboard shows one row per scenario (one per CSV file):
+| Section | What it shows |
+|---|---|
+| **Header** | Health status (HEALTHY / DEGRADED / CRITICAL) and elapsed time |
+| **SPAWNING** | Progress bar showing users spawned vs target |
+| **RPS / p95** | Requests per second, error rate, p95 progress bar vs your target |
+| **PROFILE STATS** | One row per scenario: request count, p50/p95/p99, timeouts, sparkline trend |
+| **ALL USERS** | Aggregate row across all scenarios |
+| **Sparklines** | 30-second buckets — rising line means latency is climbing |
+| **SLOWEST UTTERANCES** | The 8 utterances with the highest p95 — find bottlenecks |
+| **FASTEST UTTERANCES** | The 8 utterances with the lowest p95 — your baseline |
+| **LIVE FEED** | Last 8 events: user completions, timeouts, new users spawning |
+
+### 10.2 The detail CSV
+
+Every bot reply is recorded to `report/detail_YYYYMMDD_HHMMSS.csv`. One file per test run.
 
 | Column | What it means |
 |---|---|
-| **Name** | The scenario name (derived from the CSV filename). |
-| **# Requests** | Total number of bot replies received since the test started. |
-| **# Fails** | Number of requests that timed out or returned an error. |
-| **Median (ms)** | Half of all responses were faster than this. |
-| **90%ile (ms)** | 90% of responses were faster than this. |
-| **95%ile (ms)** | 95% of responses were faster than this. Compare this to your target (default 2000ms). |
-| **99%ile (ms)** | 99% of responses were faster than this. |
-| **Average (ms)** | Mean response time. Can be skewed by outliers; prefer the percentiles. |
-| **Current RPS** | Requests per second right now. |
+| `timestamp` | UTC time of the reply |
+| `profile` | Display name of the test user |
+| `scenario` | Scenario name (CSV filename without extension) |
+| `conversation_id` | DirectLine conversation ID |
+| `utterance` | The message that was sent |
+| `response_ms` | Response time in milliseconds |
+| `timed_out` | `1` if no reply was received within the timeout, `0` otherwise |
 
-### 10.2 The charts tab
-
-Click **Charts** to see response time and requests-per-second over time. A healthy run shows stable lines. Rising response times indicate the bot is becoming overwhelmed.
+You can open this file in Excel, Power BI, or any analysis tool to produce your own charts and summaries.
 
 ### 10.3 Interpreting results
 
 **The bot passes the performance test if:**
-- 95th-percentile response time stays below 2000ms (or your target)
-- Error rate stays below 0.5% (or your target)
+- 95th-percentile response time stays below 2000ms (or your configured target)
+- Error rate stays below 0.5% (or your configured target)
 
 **Signs of trouble:**
-- Response times climbing steadily → bot is under capacity pressure, needs more message capacity in Power Platform
+- Response times climbing steadily → bot is under capacity pressure; add message capacity in Power Platform
 - Error rate above 1% → bot may be throttling or returning errors; check Copilot Studio analytics
-- "No bot reply received" errors → bot is taking too long to respond; increase the Response Timeout or reduce the number of concurrent users
+- `T/O` count rising → bot is taking too long to respond; increase the Reply Timeout in Run Configuration or reduce peak users
 
 ---
 
@@ -577,7 +652,7 @@ Fix: In the wizard, either:
 
 The cached token has expired and could not be refreshed silently. This happens if the refresh token has expired (typically after 90 days of inactivity) or if the account's password was changed.
 
-Fix: Re-run the wizard and select the profile to re-authenticate: type the profile's number, then choose option `[2] Re-authenticate now`.
+Fix: Re-run the wizard, navigate to the profile, and choose "Re-authenticate now".
 
 ---
 
@@ -586,20 +661,20 @@ Fix: Re-run the wizard and select the profile to re-authenticate: type the profi
 The SSO token exchange is not completing. The tool sent an OAuthCard but the bot did not accept the token.
 
 Likely causes:
-1. `AGENT_APP_ID` is blank or wrong — the tool cannot acquire a token for the bot's scope.
+1. `Bot Client ID (SSO)` is blank or wrong — the tool cannot acquire a token for the bot's scope.
 2. The token scope does not match. The tool uses `api://<AGENT_APP_ID>/access_as_user`. Verify this scope exists in the bot's app registration (Azure portal → the bot's app → Expose an API).
 3. The Token Exchange URL in the bot's OAuth connection does not match the bot's app ID.
 
-Run `python test_connection.py` for a detailed step-by-step diagnostic.
+Run `python tools/test_connection.py` for a detailed step-by-step diagnostic.
 
 ---
 
-### `python test_connection.py` — what it checks
+### `python tools/test_connection.py` — what it checks
 
 This is a standalone diagnostic script. Run it at any time to verify each step of the connection:
 
 ```
-python test_connection.py
+python tools/test_connection.py
 ```
 
 It checks, in order:
@@ -613,12 +688,12 @@ It checks, in order:
 
 ---
 
-### Running `debug_oauth.py` — see the raw bot output
+### Running `python tools/debug_oauth.py` — see the raw bot output
 
 If you want to see exactly what the bot sends (including the OAuthCard details like connection name and token exchange URI), run:
 
 ```
-python debug_oauth.py
+python tools/debug_oauth.py
 ```
 
 This opens a conversation, sends "hi", and prints every activity the bot sends for 12 seconds without doing any token exchange. Useful for verifying bot configuration independently of the authentication code.
@@ -629,12 +704,13 @@ This opens a conversation, sends "hi", and prints every activity the bot sends f
 
 | File | Purpose |
 |---|---|
-| `run.py` | The main file. Contains everything: wizard, Locust user classes, DirectLine client, auth helpers. Run this to start the tool. |
-| `test_connection.py` | Standalone connection diagnostic. Run this to verify setup without starting a full test. |
-| `debug_oauth.py` | Raw activity inspector. Run this to see what the bot sends before any authentication processing. |
+| `run.py` | The main file. Run this to start the tool. Contains everything: wizard, live dashboard, Locust user classes, DirectLine client, auth helpers. |
 | `requirements.txt` | Python package dependencies. Install with `pip install -r requirements.txt`. |
 | `.env.example` | Template showing all supported environment variables. Copy to `.env` if not using the wizard (advanced use). |
-| `utterances/*.csv` | Test script files. One CSV per scenario. |
+| `utterances/*.csv` | Test script files. One CSV per scenario. Drop any CSV here and it becomes a scenario automatically. |
 | `profiles/profiles.json` | List of test user accounts (created/managed by the wizard). Not committed to version control. |
 | `profiles/.tokens/` | Encrypted cached tokens. One file per user account. Not committed to version control. |
 | `profiles/profiles.example.json` | Example of the profiles.json format, for reference. |
+| `tools/test_connection.py` | Standalone connection diagnostic. Run to verify setup without starting a full test. |
+| `tools/debug_oauth.py` | Raw activity inspector. Run to see what the bot sends before any authentication processing. |
+| `report/detail_*.csv` | Per-run detail logs. One CSV per test run. Not committed to version control. |
