@@ -2202,6 +2202,15 @@ class _DashboardState:
         self._utt_tout:    dict[str, int]                 = {}
         self._users:       dict[int, dict]                = {}
         self.feed          = collections.deque(maxlen=8)
+        # Ramp step tracking — keyed by user count
+        self._current_users: int                              = 0
+        self._step_times:    dict[int, list[float]]           = {}
+        self._step_tout:     dict[int, int]                   = {}
+        self._step_elapsed:  dict[int, list[float]]           = {}  # elapsed timestamps
+
+    def set_user_count(self, n: int):
+        with self._lock:
+            self._current_users = n
 
     def on_request(self, **kwargs):
         name      = kwargs.get("name", "")
@@ -2222,6 +2231,13 @@ class _DashboardState:
             self._ts.append((elapsed, rt))
             self._scenario_ts.setdefault(scenario, []).append((elapsed, rt))
             self._errs.append((elapsed, is_err))
+            # Step tracking
+            u = self._current_users
+            self._step_elapsed.setdefault(u, []).append(elapsed)
+            if is_err:
+                self._step_tout[u] = self._step_tout.get(u, 0) + 1
+            else:
+                self._step_times.setdefault(u, []).append(rt)
 
     def on_utterance(self, utterance: str, scenario: str, user_id: int,
                      display: str, idx: int, total: int,
@@ -2246,6 +2262,23 @@ class _DashboardState:
 
     def snapshot(self) -> dict:
         with self._lock:
+            steps = []
+            for u in sorted(self._step_elapsed.keys()):
+                ts      = self._step_elapsed[u]
+                ms      = self._step_times.get(u, [])
+                tout    = self._step_tout.get(u, 0)
+                count   = len(ms) + tout
+                dur     = (max(ts) - min(ts)) if len(ts) > 1 else 0
+                rps     = round(count / dur, 2) if dur > 0 else 0.0
+                steps.append({
+                    "users":   u,
+                    "count":   count,
+                    "rps":     rps,
+                    "p50":     _pct(ms, 0.50),
+                    "p95":     _pct(ms, 0.95),
+                    "p99":     _pct(ms, 0.99),
+                    "timeouts": tout,
+                })
             return {
                 "times":       {k: list(v) for k, v in self._times.items()},
                 "tout":        dict(self._tout),
@@ -2255,6 +2288,7 @@ class _DashboardState:
                 "utt_times":   {k: list(v) for k, v in self._utt_times.items()},
                 "utt_tout":    dict(self._utt_tout),
                 "feed":        list(self.feed),
+                "steps":       steps,
             }
 
 
@@ -2426,6 +2460,34 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         _utt_table("SLOWEST UTTERANCES  (top 8 by p95)", slowest, "bold red")
         root.add_row(Text(""))
         _utt_table("FASTEST UTTERANCES  (top 8 by p95)", fastest, "bold green")
+        root.add_row(Text(""))
+
+    # ── Ramp steps ────────────────────────────────────────────────────────────
+    steps = [s for s in snap.get("steps", []) if s["count"] >= 3]
+    if steps:
+        root.add_row(Text("  RAMP STEPS", style="bold cyan"))
+        st = Table(show_header=True, header_style="bold cyan",
+                   box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=False)
+        st.add_column("Users",    justify="right", min_width=6)
+        st.add_column("Requests", justify="right", min_width=8)
+        st.add_column("RPS",      justify="right", min_width=6)
+        st.add_column("p50",      justify="right", min_width=6)
+        st.add_column("p95",      justify="right", min_width=6)
+        st.add_column("p99",      justify="right", min_width=6)
+        st.add_column("T/O",      justify="right", min_width=5)
+        for s in steps:
+            p95c = "bold red" if s["p95"] > state.p95_target else "white"
+            toc  = "bold red" if s["timeouts"] > 0 else "white"
+            st.add_row(
+                Text(str(s["users"]),    style="bold cyan"),
+                Text(str(s["count"])),
+                Text(f'{s["rps"]:.1f}'),
+                Text(str(s["p50"])),
+                Text(str(s["p95"]),      style=p95c),
+                Text(str(s["p99"])),
+                Text(str(s["timeouts"]), style=toc),
+            )
+        root.add_row(st)
         root.add_row(Text(""))
 
     # ── Live feed ─────────────────────────────────────────────────────────────
@@ -2621,6 +2683,7 @@ if __name__ == "__main__":
                 if _curr > _prev_users[0]:
                     for _i in range(_prev_users[0] + 1, _curr + 1):
                         _dash.add_feed(f"  ↑ User {_i} spawned")
+                    _dash.set_user_count(_curr)
                     _prev_users[0] = _curr
                 _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
                 _live.refresh()
