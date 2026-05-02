@@ -624,38 +624,21 @@ def _section_header(title: str):
 
 
 def _ok_line(label: str, note: str = ""):
-    check = _ansi_col(82,  "  ✓  ", bold=True)
-    lbl   = _ansi_col(255, f"{label:<30} ", bold=False)
-    nt    = _ansi_col(82,  note, bold=False) if note else ""
-    sys.stdout.write(check + lbl + nt + "\n")
-    sys.stdout.flush()
+    _gprint(f"  ✓  {label:<32} {note}", fg=_G_GREEN, bold=True, padding="0 0")
 
 
 def _fail_line(label: str, detail: str = ""):
-    check = _ansi_col(196, "  ✗  ", bold=True)
-    lbl   = _ansi_col(255, f"{label:<30} ", bold=True)
-    dt    = _ansi_col(196, detail, bold=True) if detail else ""
-    sys.stdout.write(check + lbl + dt + "\n")
-    sys.stdout.flush()
+    _gprint(f"  ✗  {label:<32} {detail}", fg=_G_RED, bold=True, padding="0 0")
 
 
 def _dim_line(label: str, note: str = ""):
-    dash = _ansi_col(240, "  ─  ", bold=False)
-    lbl  = _ansi_col(240, f"{label:<30} {note}", bold=False)
-    sys.stdout.write(dash + lbl + "\n")
-    sys.stdout.flush()
+    _gprint(f"  ─  {label:<32} {note}", fg=_G_DIM, padding="0 0")
 
 
 def _celebrate(msg: str):
-    """Sparkle trail + big rainbow success message."""
-    rng = random.Random()
-    print()
-    sys.stdout.write("  " + _rainbow(f"  {msg}  ", 5) + "\n")
-    row = "  "
-    for _ in range(55):
-        row += _ansi_col(rng.choice(_BANNER_PALETTE), rng.choice(_SPARKLE_CHARS), bold=False)
-    sys.stdout.write(row + "\n\n")
-    sys.stdout.flush()
+    """Clean success box."""
+    _gprint(f"  ✓  {msg}", border="rounded", fg=_G_GREEN,
+            bold=True, padding="1 3", margin="1 0", border_fg=_G_GREEN)
 
 
 def _wizard_rocket_float():
@@ -818,43 +801,47 @@ def _show_profile_status(profiles: list[dict]) -> list[str]:
 
 def _rocket_auth(username: str) -> bool:
     if _gum_ok():
+        # ── Step header ───────────────────────────────────────────────────
         _gprint(
-            f"  SIGN IN REQUIRED\n  {username}",
+            f"  Authentication Required\n\n  {username}",
             border="rounded", fg=_G_YELLOW, bold=True,
             padding="1 3", margin="1 0", border_fg=_G_YELLOW,
         )
         try:
             app, flow = _start_device_flow()
         except RuntimeError as exc:
-            _gprint(f"  ✗  {exc}", fg=_G_RED, bold=True, padding="0 2", margin="0 1")
+            _fail_line("Device flow failed", str(exc))
             return False
+
+        # ── Prominent device code ─────────────────────────────────────────
         _gprint(
-            f"  1.  Open   →  {flow['verification_uri']}\n"
-            f"  2.  Enter  →  {flow['user_code']}",
-            border="double", fg=_G_CYAN, bold=True,
-            padding="1 4", margin="0 1", border_fg=_G_PURPLE,
+            f"  {flow['user_code']}",
+            border="rounded", fg=_G_GREEN, bold=True,
+            padding="1 6", margin="0 1", border_fg=_G_GREEN,
+        )
+        _gprint(
+            f"  Go to:  {flow['verification_uri']}",
+            fg=_G_CYAN, padding="0 2", margin="0 0",
         )
         print()
+
         result = _with_spinner(
-            f"Waiting for sign-in…  (browser tab open, enter code above)",
+            "Waiting for sign-in…",
             lambda: app.acquire_token_by_device_flow(flow),
             spinner="moon",
         )
         if "access_token" not in result:
-            _gprint(
-                f"  ✗  Auth failed — {result.get('error_description', result.get('error', 'unknown'))}",
-                fg=_G_RED, bold=True, padding="0 2", margin="0 1",
-            )
+            _fail_line("Auth failed", result.get("error_description", result.get("error", "unknown")))
             return False
+
         save_token(username, {
             "access_token":  result["access_token"],
             "refresh_token": result.get("refresh_token", ""),
             "expires_on":    int(result.get("expires_on") or (time.time() + result.get("expires_in", 3600))),
             "username":      username,
         })
-        _gprint(f"  ✓  Signed in  —  {username}",
-                fg=_G_GREEN, bold=True, padding="0 2", margin="0 1")
-        time.sleep(0.5)
+        _ok_line("Signed in", username)
+        time.sleep(0.4)
         return True
 
     # ── Fallback: original Rich/rocket animation ───────────────────────────
@@ -1075,8 +1062,8 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
         return _with_spinner(title, fn, spinner="globe") if _gum_ok() else fn()
 
     # ── Per-profile token check ───────────────────────────────────────────
-    sys.stdout.write("  " + _rainbow("  Profile tokens", 1) + "\n\n")
-    sys.stdout.flush()
+    _gprint("  Profile tokens", fg=_G_WHITE, bold=True, padding="0 1", margin="0 0")
+    print()
 
     aad_token_for_bot = None
     if _user_auth_required():
@@ -1091,8 +1078,8 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
             except Exception as e:
                 _fail_line(display, f"FAILED — {e}")
                 print()
-                sys.stdout.write("  " + _ansi_col(214, "  Re-run setup and re-authenticate profiles.", bold=False) + "\n\n")
-                sys.stdout.flush()
+                _gprint("  Re-run setup and re-authenticate profiles.",
+                        fg=_G_YELLOW, padding="0 2", margin="0 1")
                 return False
     else:
         for profile in profiles:
@@ -1101,8 +1088,8 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
     print()
 
     # ── Bot connectivity ping ─────────────────────────────────────────────
-    sys.stdout.write("  " + _rainbow("  Bot connectivity", 8) + "\n\n")
-    sys.stdout.flush()
+    _gprint("  Bot connectivity", fg=_G_WHITE, bold=True, padding="0 1", margin="0 0")
+    print()
 
     try:
         dl_token = _spin("Fetching DirectLine token…",
@@ -1163,8 +1150,8 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
     if response.timed_out:
         _fail_line("Bot response", "NO REPLY (15s timeout)")
         print()
-        sys.stdout.write("  " + _ansi_col(214, "  The bot did not respond. Check it is published and the channel is configured.", bold=False) + "\n\n")
-        sys.stdout.flush()
+        _gprint("  The bot did not respond. Check it is published and the channel is configured.",
+                fg=_G_YELLOW, padding="0 2", margin="0 1")
         return False
 
     first_reply = response.activities[0].get("text", "").strip()
