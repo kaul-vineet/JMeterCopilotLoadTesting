@@ -98,7 +98,7 @@ test_config: dict = {
     "users":         10,
     "spawn_rate":    5,
     "run_time_mins": 5,
-    "transport":     "websocket",  # "websocket" | "http"
+    "transport":     os.environ.get("GRUNTMASTER_TRANSPORT", "websocket").lower(),
 }
 
 _active_dashboard: "Optional[_DashboardState]" = None
@@ -2156,7 +2156,8 @@ for _i, _csv in enumerate(_csv_files):
         _profile = _profiles_list[_i % len(_profiles_list)]
     else:
         _profile = {}
-    globals()[_class_name] = _make_user_class(_class_name, _load_utterances(_csv), _scenario, _profile)
+    _factory = _make_http_user_class if test_config["transport"] == "http" else _make_user_class
+    globals()[_class_name] = _factory(_class_name, _load_utterances(_csv), _scenario, _profile)
 
 
 # ── Live dashboard ────────────────────────────────────────────────────────────
@@ -2458,7 +2459,10 @@ def _collect_run_params() -> dict:
             _prow("Run time",                      state["run_mins"], "minutes", "how long the test runs"),
             _prow("Wait between messages",         state["think"],    "seconds", "pause each user takes after a reply"),
             _prow("Reply timeout",                 state["timeout"],  "seconds", "give up waiting after this long"),
-            _prow("Protocol",                      "WebSocket",       "",        "🔒 HTTP polling coming soon"),
+            _prow("Protocol",
+                  "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket",
+                  "",
+                  "set by GRUNTMASTER_TRANSPORT env var" if test_config["transport"] == "http" else "🔒 HTTP polling coming soon"),
             _START,
             _EXIT,
         ]
