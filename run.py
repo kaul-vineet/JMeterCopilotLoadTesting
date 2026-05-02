@@ -2417,6 +2417,10 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         Text(all_spark,     style="bold cyan"),
     )
     root.add_row(tbl)
+    root.add_row(Text(
+        "  Trend column: each bar = p95 latency in a 30s window  ·  taller bar = slower responses  ·  ▁ low  █ high",
+        style=f"color({_G_DIM})",
+    ))
 
     # ── Sparklines ────────────────────────────────────────────────────────────
     err_ts = [(t, 1000.0 if e else 0.0) for t, e in snap["errs"]]
