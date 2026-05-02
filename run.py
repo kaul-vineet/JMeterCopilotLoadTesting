@@ -540,7 +540,8 @@ def _ginput(placeholder: str = "", *, header: str = "", default: str = "",
            "--prompt.foreground",    _G_CYAN,
            "--cursor.foreground",    _G_CYAN,
            "--header.foreground",    _G_DIM,
-           "--width",                str(width)]
+           "--width",                str(width),
+           "--no-show-help"]
     if header:
         cmd += ["--header", f"\n  {header}\n"]
     if default:
@@ -578,7 +579,8 @@ def _gchoose(*items: str, header: str = "", height: int = 12,
            "--selected.foreground", selected_fg,
            "--header.foreground",   _G_PURPLE,
            "--cursor",              "▸ ",
-           "--height",              str(height)]
+           "--height",              str(height),
+           "--no-show-help"]
     if header:
         cmd += ["--header", header]
     cmd += list(items)
@@ -1291,8 +1293,8 @@ def run_wizard():
         return (v[:44] + "…") if len(v) > 45 else v
 
     def _mrow(label: str, value: str, ok: bool | None = None) -> str:
-        mark = "  ✓" if ok is True else ("  ✗" if ok is False else "")
-        return f"  {label:<26}  {value:<46}{mark}"
+        mark = "   ✓" if ok is True else ("   ✗" if ok is False else "")
+        return f"    {label:<28}  {value:<46}{mark}"
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
@@ -1334,12 +1336,12 @@ def run_wizard():
             items.append(_mrow(f"Profile: {display}",
                                p["username"] + scenario, ready))
 
-        items += [_ADD, _SAVE]
+        items += ["", _ADD, _SAVE]
 
         choice = _gchoose(
             *items,
             header="\n  ↑ ↓  navigate     Enter  select\n",
-            height=min(len(items) + 6, 24),
+            height=min(len(items) + 4, 26),
         )
 
         if not choice or choice.strip() == _SAVE.strip():
