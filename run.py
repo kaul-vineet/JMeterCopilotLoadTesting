@@ -102,6 +102,8 @@ test_config: dict = {
 }
 
 _active_dashboard: "Optional[_DashboardState]" = None
+_spawn_counters: dict[str, int] = {}   # class_name → spawn sequence number
+_spawn_lock     = threading.Lock()
 
 # ── Credentials (read from Windows Credential Manager, fallback to env vars) ──
 
@@ -670,7 +672,7 @@ def _wizard_rocket_float():
         ("      / 🔥 \\        ", 220, True),
         ("     /______\\       ", 214, True),
         ("    /        \\      ", 255, False),
-        ("   /  COPILOT \\     ", 51,  True),
+        ("   / GM-6000  \\     ", 51,  True),
         ("  /____________\\    ", 214, True),
         ("       |  |         ", 255, False),
         ("       |  |         ", 255, False),
@@ -748,19 +750,35 @@ def _show_startup_title():
     time.sleep(0.15)
     os.system("cls" if os.name == "nt" else "clear")
 
-    # Phase 2: rainbow banner, line by line
-    sys.stdout.write("\n")
-    offset = 0
-    for line in _TITLE:
-        if line:
-            sys.stdout.write("  " + _rainbow(line, offset) + "\n")
-            offset = (offset + 4) % len(_BANNER_PALETTE)
-        else:
-            sys.stdout.write("\n")
-        sys.stdout.flush()
-        time.sleep(0.025)
+    if _gum_ok():
+        # Styled title block via gum — no ASCII art needed
+        subprocess.run(
+            ["gum", "style",
+             "--border",            "double",
+             "--border-foreground", "99",
+             "--foreground",        "213",
+             "--bold",
+             "--padding",           "1 8",
+             "--margin",            "1 2",
+             "--align",             "center",
+             "--width",             "58",
+             "GRUNTMASTER 6000"],
+            env=_GUM_ENV,
+        )
+    else:
+        # ASCII art fallback
+        sys.stdout.write("\n")
+        offset = 0
+        for line in _TITLE:
+            if line:
+                sys.stdout.write("  " + _rainbow(line, offset) + "\n")
+                offset = (offset + 4) % len(_BANNER_PALETTE)
+            else:
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+            time.sleep(0.025)
 
-    # Phase 3: sparkle trail beneath the banner
+    # Sparkle trail
     trail = "  "
     for _ in range(56):
         if random.random() < 0.45:
@@ -774,11 +792,11 @@ def _show_startup_title():
     # Subtitle
     if _gum_ok():
         _gprint(
-            "  Copilot Studio  ·  DirectLine 3.0  ·  Entra ID Auth",
+            "  DirectLine 3.0  ·  Entra ID Auth  ·  Copilot Studio",
             fg="219", bold=True, padding="0 0", margin="0 1",
         )
     else:
-        sys.stdout.write(f"  \033[1;38;5;219m  Copilot Studio  ·  DirectLine 3.0  ·  Entra ID Auth\033[0m\n\n")
+        sys.stdout.write(f"  \033[1;38;5;219m  DirectLine 3.0  ·  Entra ID Auth  ·  Copilot Studio\033[0m\n\n")
         sys.stdout.flush()
 
 
@@ -1830,6 +1848,10 @@ class CopilotBaseUser(User):
         self.ws           = None
         self.conversation = None
         self._idx         = 0
+        with _spawn_lock:
+            key = self.__class__.__name__
+            _spawn_counters[key] = _spawn_counters.get(key, 0) + 1
+            self._spawn_num = _spawn_counters[key]
         self._open_conversation()
 
     def _open_conversation(self):
@@ -1897,7 +1919,8 @@ class CopilotBaseUser(User):
             _fire_metric(self.environment, "Copilot Response", 0, error=e)
             raise StopUser()
 
-        profile_label = self.profile.get("display_name", self.profile.get("username", ""))
+        _base_label   = self.profile.get("display_name", self.profile.get("username", ""))
+        profile_label = f"{_base_label} #{self._spawn_num}"
 
         if response.timed_out:
             log.warning("No bot reply received for activity %s", activity_id)
@@ -2093,7 +2116,8 @@ class CopilotHttpUser(CopilotBaseUser):
             _fire_metric(self.environment, "Copilot Response", 0, error=e)
             raise StopUser()
 
-        profile_label = self.profile.get("display_name", self.profile.get("username", ""))
+        _base_label   = self.profile.get("display_name", self.profile.get("username", ""))
+        profile_label = f"{_base_label} #{self._spawn_num}"
 
         if response.timed_out:
             log.warning("No bot reply received for activity %s", activity_id)
@@ -2609,12 +2633,16 @@ if __name__ == "__main__":
         _runner.quit()
         _runner.greenlet.join()
         _active_dashboard = None
+        with _spawn_lock:
+            _spawn_counters.clear()
 
         gevent.sleep(0.3)
         _celebrate("Test complete")
 
         if _detail_log_path and _detail_log_path.exists():
             try:
+                sys.stdout.write("\n  ⏳  Generating report…\n")
+                sys.stdout.flush()
                 from report import generate_report as _gen_report
                 _rep = _with_spinner(
                     "Generating HTML report…",
