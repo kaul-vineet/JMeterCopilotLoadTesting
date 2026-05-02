@@ -96,7 +96,7 @@ test_config: dict = {
     "p95_target_ms": 2000,
     "max_error_rate": 0.5,
     "users":         10,
-    "spawn_rate":    2,
+    "spawn_rate":    5,
     "run_time_mins": 5,
 }
 
@@ -2251,7 +2251,7 @@ def _collect_run_params() -> dict:
 
         items = [
             _prow("Peak users",                    state["users"],    "users",   "how many hit the bot at the same time"),
-            _prow("Ramp-up rate",                  state["spawn"],    "users/s", "how fast new users join"),
+            _prow("Ramp-up rate",                  state["spawn"],    "users/m", "how many new users join per minute"),
             _prow("Run time",                      state["run_mins"], "minutes", "how long the test runs"),
             _prow("Wait between messages",         state["think"],    "seconds", "pause each user takes after a reply"),
             _prow("Reply timeout",                 state["timeout"],  "seconds", "give up waiting after this long"),
@@ -2281,7 +2281,7 @@ def _collect_run_params() -> dict:
         if idx == 0:
             state["users"]    = _edit("How many users hit the bot at the same time? (peak concurrency)", state["users"])
         elif idx == 1:
-            state["spawn"]    = _edit("How fast do new users join? (users per second)", state["spawn"])
+            state["spawn"]    = _edit("How many new users join per minute? (e.g. 5 = one new user every 12s, 1 = one per minute)", state["spawn"])
         elif idx == 2:
             state["run_mins"] = _edit("How long should the test run? (minutes)", state["run_mins"])
         elif idx == 3:
@@ -2359,7 +2359,7 @@ if __name__ == "__main__":
         )
         _active_dashboard = _dash
         _env.events.request.add_listener(_dash.on_request)
-        _runner.start(user_count=_params["users"], spawn_rate=_params["spawn_rate"])
+        _runner.start(user_count=_params["users"], spawn_rate=max(0.01, _params["spawn_rate"] / 60))
 
         _stop_run   = [False]
         _prev_users = [0]
