@@ -434,198 +434,6 @@ def close_websocket(ws: websocket.WebSocket):
         pass
 
 
-# ── HTTP polling transport (alternative to WebSocket) ────────────────────────
-# Polls GET /v3/directline/conversations/{id}/activities?watermark=...
-# until the bot replies to the given activity_id.
-# SSO/OAuthCard handling mirrors the WebSocket implementation in read_response().
-
-def read_response_http(
-    conversation: "Conversation",
-    activity_id: str,
-    timeout: float = 10.0,
-    aad_token: Optional[str] = None,
-) -> "Response":
-    matched: list[dict]    = []
-    last_match_time        = None
-    start_time             = time.time()
-    watermark: Optional[str] = None
-
-    while time.time() - start_time < timeout:
-        url = f"{DIRECTLINE_BASE}/v3/directline/conversations/{conversation.id}/activities"
-        if watermark is not None:
-            url += f"?watermark={watermark}"
-        try:
-            r = requests.get(
-                url,
-                headers={"Authorization": f"Bearer {conversation.token}"},
-                timeout=5,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            log.debug("HTTP poll error: %s", e)
-            gevent.sleep(0.5)
-            continue
-
-        watermark = data.get("watermark", watermark)
-
-        for activity in data.get("activities", []):
-            # SSO: bot sends signin/tokenExchange invoke
-            if (activity.get("type") == "invoke"
-                    and activity.get("name") == "signin/tokenExchange"
-                    and aad_token):
-                val = activity.get("value", {})
-                try:
-                    send_token_exchange(conversation, val.get("id", ""),
-                                        val.get("connectionName", ""), aad_token)
-                except Exception as e:
-                    log.warning("Token exchange (invoke) failed: %s", e)
-                continue
-
-            # SSO: bot sends message with OAuthCard attachment
-            if activity.get("type") == "message" and aad_token:
-                for attach in activity.get("attachments", []):
-                    if attach.get("contentType") == "application/vnd.microsoft.card.oauth":
-                        content   = attach.get("content", {})
-                        token_res = content.get("tokenExchangeResource", {})
-                        if token_res:
-                            try:
-                                send_token_exchange(
-                                    conversation,
-                                    token_res.get("id", ""),
-                                    content.get("connectionName", ""),
-                                    aad_token,
-                                )
-                            except Exception as e:
-                                log.warning("Token exchange (OAuthCard) failed: %s", e)
-                        break
-                else:
-                    if (activity.get("from", {}).get("role") == "bot"
-                            and activity.get("replyToId") == activity_id):
-                        matched.append(activity)
-                        last_match_time = time.time()
-                continue
-
-            if (activity.get("type") == "message"
-                    and activity.get("from", {}).get("role") == "bot"
-                    and activity.get("replyToId") == activity_id):
-                matched.append(activity)
-                last_match_time = time.time()
-
-        if matched:
-            break
-
-        gevent.sleep(0.5)
-
-    end_time   = last_match_time or time.time()
-    latency_ms = (end_time - start_time) * 1000
-    return Response(activities=matched, latency_ms=latency_ms, timed_out=len(matched) == 0)
-
-
-class CopilotHttpUser(CopilotBaseUser):  # type: ignore[misc]
-    """HTTP polling transport variant. Inherits all auth, logging, and metrics
-    from CopilotBaseUser — only _open_conversation and _send_and_measure differ."""
-
-    abstract = True
-
-    def _open_conversation(self):
-        self.ws = None
-        self.aad_token = None
-        if _user_auth_required():
-            try:
-                self.aad_token = get_valid_token(self.profile["username"])
-            except RuntimeError as e:
-                log.error("Auth failed for %s: %s", self.profile["username"], e)
-                raise StopUser()
-
-        try:
-            dl_token = fetch_directline_token(self.aad_token)
-        except Exception as e:
-            log.error("DirectLine token fetch failed: %s", e)
-            _fire_metric(self.environment, "Fetch Token", 0, error=e)
-            raise StopUser()
-
-        try:
-            self.conversation = start_conversation(dl_token)
-        except Exception as e:
-            log.error("Start conversation failed: %s", e)
-            _fire_metric(self.environment, "Start Conversation", 0, error=e)
-            raise StopUser()
-
-        self._idx = 0
-
-    def on_stop(self):
-        pass  # no WebSocket to close
-
-    def _send_and_measure(self):
-        utterance = self.utterances[self._idx]
-        self._idx += 1
-
-        try:
-            activity_id, send_time = send_utterance(self.conversation, utterance)
-        except Exception as e:
-            log.error("Send utterance failed: %s", e)
-            _fire_metric(self.environment, "Send Utterance", 0, error=e)
-            raise StopUser()
-
-        try:
-            response = read_response_http(
-                self.conversation, activity_id,
-                timeout=test_config.get("frame_timeout", 10.0),
-                aad_token=self.aad_token,
-            )
-        except Exception as e:
-            log.error("HTTP poll failed: %s", e)
-            _fire_metric(self.environment, "Copilot Response", 0, error=e)
-            raise StopUser()
-
-        profile_label = self.profile.get("display_name", self.profile.get("username", ""))
-
-        if response.timed_out:
-            log.warning("No bot reply received for activity %s", activity_id)
-            _log_request(profile_label, self._idx, self.scenario_name,
-                         self.conversation.id, utterance, "",
-                         send_time, response.latency_ms, timed_out=True)
-            _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}",
-                         response.latency_ms, error=Exception("No bot reply received"))
-            if _active_dashboard is not None:
-                _active_dashboard.on_utterance(
-                    utterance, self.scenario_name, id(self), profile_label,
-                    self._idx, len(self.utterances), response.latency_ms, True)
-            raise StopUser()
-
-        bot_text = " | ".join(
-            a.get("text", "").strip()
-            for a in response.activities
-            if a.get("text", "").strip()
-        )[:500]
-        _log_request(profile_label, self._idx, self.scenario_name,
-                     self.conversation.id, utterance, bot_text,
-                     send_time, response.latency_ms, timed_out=False)
-        _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms)
-        if _active_dashboard is not None:
-            _active_dashboard.on_utterance(
-                utterance, self.scenario_name, id(self), profile_label,
-                self._idx, len(self.utterances), response.latency_ms, False)
-        time.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
-
-        if self._idx >= len(self.utterances):
-            self._open_conversation()
-
-
-def _make_http_user_class(class_name: str, utterances: list[str], scenario: str, profile: dict) -> type:
-    def send(self):
-        self._send_and_measure()
-    send.__name__ = "send"
-    return type(class_name, (CopilotHttpUser,), {
-        "utterances":    utterances,
-        "scenario_name": scenario,
-        "fixed_profile": profile,
-        "weight":        1,
-        "send":          task(send),
-    })
-
-
 # ── Startup sequence (fires when Locust initialises in interactive mode) ──────
 
 _TITLE = [
@@ -2132,6 +1940,198 @@ def _make_user_class(class_name: str, utterances: list[str], scenario: str, prof
         self._send_and_measure()
     send.__name__ = "send"
     return type(class_name, (CopilotBaseUser,), {
+        "utterances":    utterances,
+        "scenario_name": scenario,
+        "fixed_profile": profile,
+        "weight":        1,
+        "send":          task(send),
+    })
+
+
+# ── HTTP polling transport (alternative to WebSocket) ────────────────────────
+# Polls GET /v3/directline/conversations/{id}/activities?watermark=...
+# until the bot replies to the given activity_id.
+# SSO/OAuthCard handling mirrors the WebSocket implementation in read_response().
+
+def read_response_http(
+    conversation: Conversation,
+    activity_id: str,
+    timeout: float = 10.0,
+    aad_token: Optional[str] = None,
+) -> Response:
+    matched: list[dict]       = []
+    last_match_time           = None
+    start_time                = time.time()
+    watermark: Optional[str]  = None
+
+    while time.time() - start_time < timeout:
+        url = f"{DIRECTLINE_BASE}/v3/directline/conversations/{conversation.id}/activities"
+        if watermark is not None:
+            url += f"?watermark={watermark}"
+        try:
+            r = requests.get(
+                url,
+                headers={"Authorization": f"Bearer {conversation.token}"},
+                timeout=5,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            log.debug("HTTP poll error: %s", e)
+            gevent.sleep(0.5)
+            continue
+
+        watermark = data.get("watermark", watermark)
+
+        for activity in data.get("activities", []):
+            # SSO: bot sends signin/tokenExchange invoke
+            if (activity.get("type") == "invoke"
+                    and activity.get("name") == "signin/tokenExchange"
+                    and aad_token):
+                val = activity.get("value", {})
+                try:
+                    send_token_exchange(conversation, val.get("id", ""),
+                                        val.get("connectionName", ""), aad_token)
+                except Exception as e:
+                    log.warning("Token exchange (invoke) failed: %s", e)
+                continue
+
+            # SSO: bot sends message with OAuthCard attachment
+            if activity.get("type") == "message" and aad_token:
+                for attach in activity.get("attachments", []):
+                    if attach.get("contentType") == "application/vnd.microsoft.card.oauth":
+                        content   = attach.get("content", {})
+                        token_res = content.get("tokenExchangeResource", {})
+                        if token_res:
+                            try:
+                                send_token_exchange(
+                                    conversation,
+                                    token_res.get("id", ""),
+                                    content.get("connectionName", ""),
+                                    aad_token,
+                                )
+                            except Exception as e:
+                                log.warning("Token exchange (OAuthCard) failed: %s", e)
+                        break
+                else:
+                    if (activity.get("from", {}).get("role") == "bot"
+                            and activity.get("replyToId") == activity_id):
+                        matched.append(activity)
+                        last_match_time = time.time()
+                continue
+
+            if (activity.get("type") == "message"
+                    and activity.get("from", {}).get("role") == "bot"
+                    and activity.get("replyToId") == activity_id):
+                matched.append(activity)
+                last_match_time = time.time()
+
+        if matched:
+            break
+
+        gevent.sleep(0.5)
+
+    end_time   = last_match_time or time.time()
+    latency_ms = (end_time - start_time) * 1000
+    return Response(activities=matched, latency_ms=latency_ms, timed_out=len(matched) == 0)
+
+
+class CopilotHttpUser(CopilotBaseUser):
+    """HTTP polling transport variant. Inherits all auth, logging, and metrics
+    from CopilotBaseUser — only _open_conversation and _send_and_measure differ."""
+
+    abstract = True
+
+    def _open_conversation(self):
+        self.ws = None
+        self.aad_token = None
+        if _user_auth_required():
+            try:
+                self.aad_token = get_valid_token(self.profile["username"])
+            except RuntimeError as e:
+                log.error("Auth failed for %s: %s", self.profile["username"], e)
+                raise StopUser()
+
+        try:
+            dl_token = fetch_directline_token(self.aad_token)
+        except Exception as e:
+            log.error("DirectLine token fetch failed: %s", e)
+            _fire_metric(self.environment, "Fetch Token", 0, error=e)
+            raise StopUser()
+
+        try:
+            self.conversation = start_conversation(dl_token)
+        except Exception as e:
+            log.error("Start conversation failed: %s", e)
+            _fire_metric(self.environment, "Start Conversation", 0, error=e)
+            raise StopUser()
+
+        self._idx = 0
+
+    def on_stop(self):
+        pass  # no WebSocket to close
+
+    def _send_and_measure(self):
+        utterance = self.utterances[self._idx]
+        self._idx += 1
+
+        try:
+            activity_id, send_time = send_utterance(self.conversation, utterance)
+        except Exception as e:
+            log.error("Send utterance failed: %s", e)
+            _fire_metric(self.environment, "Send Utterance", 0, error=e)
+            raise StopUser()
+
+        try:
+            response = read_response_http(
+                self.conversation, activity_id,
+                timeout=test_config.get("frame_timeout", 10.0),
+                aad_token=self.aad_token,
+            )
+        except Exception as e:
+            log.error("HTTP poll failed: %s", e)
+            _fire_metric(self.environment, "Copilot Response", 0, error=e)
+            raise StopUser()
+
+        profile_label = self.profile.get("display_name", self.profile.get("username", ""))
+
+        if response.timed_out:
+            log.warning("No bot reply received for activity %s", activity_id)
+            _log_request(profile_label, self._idx, self.scenario_name,
+                         self.conversation.id, utterance, "",
+                         send_time, response.latency_ms, timed_out=True)
+            _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}",
+                         response.latency_ms, error=Exception("No bot reply received"))
+            if _active_dashboard is not None:
+                _active_dashboard.on_utterance(
+                    utterance, self.scenario_name, id(self), profile_label,
+                    self._idx, len(self.utterances), response.latency_ms, True)
+            raise StopUser()
+
+        bot_text = " | ".join(
+            a.get("text", "").strip()
+            for a in response.activities
+            if a.get("text", "").strip()
+        )[:500]
+        _log_request(profile_label, self._idx, self.scenario_name,
+                     self.conversation.id, utterance, bot_text,
+                     send_time, response.latency_ms, timed_out=False)
+        _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms)
+        if _active_dashboard is not None:
+            _active_dashboard.on_utterance(
+                utterance, self.scenario_name, id(self), profile_label,
+                self._idx, len(self.utterances), response.latency_ms, False)
+        time.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
+
+        if self._idx >= len(self.utterances):
+            self._open_conversation()
+
+
+def _make_http_user_class(class_name: str, utterances: list[str], scenario: str, profile: dict) -> type:
+    def send(self):
+        self._send_and_measure()
+    send.__name__ = "send"
+    return type(class_name, (CopilotHttpUser,), {
         "utterances":    utterances,
         "scenario_name": scenario,
         "fixed_profile": profile,
