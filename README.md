@@ -17,6 +17,7 @@ A load testing tool for Microsoft Copilot Studio bots. It simulates many users h
 9. [Running the load test](#9-running-the-load-test)
 10. [Reading the results](#10-reading-the-results)
 11. [Troubleshooting](#11-troubleshooting)
+12. [Beta Testing](#beta-testing)
 
 ---
 
@@ -681,6 +682,42 @@ Likely causes:
 1. `Bot Client ID (SSO)` is blank or wrong — the tool cannot acquire a token for the bot's scope.
 2. The token scope does not match. The tool uses `api://<AGENT_APP_ID>/access_as_user`. Verify this scope exists in the bot's app registration (Azure portal → the bot's app → Expose an API).
 3. The Token Exchange URL in the bot's OAuth connection does not match the bot's app ID.
+
+---
+
+## Beta Testing
+
+### HTTP Transport (experimental)
+
+By default GRUNTMASTER 6000 receives bot replies over a persistent WebSocket connection. An alternative HTTP polling transport is implemented but not yet enabled in the UI — it polls the DirectLine REST endpoint for replies instead of reading from a WebSocket stream.
+
+To activate it for testing, set the `GRUNTMASTER_TRANSPORT` environment variable before running:
+
+**PowerShell:**
+```powershell
+$env:GRUNTMASTER_TRANSPORT = "http"
+python run.py
+```
+
+**Command Prompt:**
+```cmd
+set GRUNTMASTER_TRANSPORT=http
+python run.py
+```
+
+When active, the Run Configuration screen will show:
+
+```
+  Protocol                     HTTP ⚠ TEST MODE      set by GRUNTMASTER_TRANSPORT env var
+```
+
+To revert to WebSocket, unset the variable or open a new terminal:
+
+```powershell
+$env:GRUNTMASTER_TRANSPORT = ""
+```
+
+> The HTTP transport is not selectable through the normal UI. This env var is the only way to activate it. Once testing confirms it is stable, it will be promoted to a standard Run Configuration option.
 
 ---
 
