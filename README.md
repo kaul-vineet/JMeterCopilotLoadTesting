@@ -584,15 +584,32 @@ Every bot reply is recorded to `report/detail_YYYYMMDD_HHMMSS.csv`. One file per
 
 | Column | What it means |
 |---|---|
-| `timestamp` | UTC time of the reply |
 | `profile` | Display name of the test user |
+| `event_number` | Sequential event index for this user within the test run |
 | `scenario` | Scenario name (CSV filename without extension) |
 | `conversation_id` | DirectLine conversation ID |
 | `utterance` | The message that was sent |
-| `response_ms` | Response time in milliseconds |
+| `bot_response` | The bot's reply text (up to 500 characters; `|`-separated if multiple activities) |
+| `utterance_sent_at` | UTC ISO timestamp when the message was sent |
+| `response_received_at` | UTC ISO timestamp when the reply was received |
+| `response_ms` | Round-trip latency in milliseconds |
 | `timed_out` | `1` if no reply was received within the timeout, `0` otherwise |
 
 You can open this file in Excel, Power BI, or any analysis tool to produce your own charts and summaries.
+
+### 10.3 HTML report
+
+After every test run, an HTML report is automatically generated in `report/report_YYYYMMDD_HHMMSS.html`. It includes:
+
+- **Summary header** — request count, duration, error rate, p95 vs target (pass/fail badge)
+- **Profile summary table** — p50/p95/p99/error rate per scenario, rows highlighted red if p95 exceeds target
+- **Box/whisker chart** — latency distribution per scenario
+- **Latency heatmap** — response time over time (30-second buckets × utterance)
+- **Per-utterance table** — sortable breakdown by utterance: count, p50/p95/p99, anomaly flag, log-normal p99.9 projection
+- **Profile comparison** — percentage difference between any two scenarios side by side
+- **CSV download** — embedded link to download the raw detail CSV
+
+Requires `pandas` and `plotly` (included in `requirements.txt`). If not installed, report generation is silently skipped — the test still runs normally.
 
 ### 10.3 Interpreting results
 
@@ -665,39 +682,6 @@ Likely causes:
 2. The token scope does not match. The tool uses `api://<AGENT_APP_ID>/access_as_user`. Verify this scope exists in the bot's app registration (Azure portal → the bot's app → Expose an API).
 3. The Token Exchange URL in the bot's OAuth connection does not match the bot's app ID.
 
-Run `python tools/test_connection.py` for a detailed step-by-step diagnostic.
-
----
-
-### `python tools/test_connection.py` — what it checks
-
-This is a standalone diagnostic script. Run it at any time to verify each step of the connection:
-
-```
-python tools/test_connection.py
-```
-
-It checks, in order:
-1. AAD token can be acquired for the first profile
-2. DirectLine token can be fetched
-3. A new conversation can be started
-4. The WebSocket opens successfully
-5. "hi" can be sent to the bot
-6. The bot replies within 15 seconds
-7. The reply is not a sign-in prompt (which would indicate the token exchange failed)
-
----
-
-### Running `python tools/debug_oauth.py` — see the raw bot output
-
-If you want to see exactly what the bot sends (including the OAuthCard details like connection name and token exchange URI), run:
-
-```
-python tools/debug_oauth.py
-```
-
-This opens a conversation, sends "hi", and prints every activity the bot sends for 12 seconds without doing any token exchange. Useful for verifying bot configuration independently of the authentication code.
-
 ---
 
 ## File Reference
@@ -711,6 +695,6 @@ This opens a conversation, sends "hi", and prints every activity the bot sends f
 | `profiles/profiles.json` | List of test user accounts (created/managed by the wizard). Not committed to version control. |
 | `profiles/.tokens/` | Encrypted cached tokens. One file per user account. Not committed to version control. |
 | `profiles/profiles.example.json` | Example of the profiles.json format, for reference. |
-| `tools/test_connection.py` | Standalone connection diagnostic. Run to verify setup without starting a full test. |
-| `tools/debug_oauth.py` | Raw activity inspector. Run to see what the bot sends before any authentication processing. |
+| `report.py` | HTML report generator. Auto-runs after each test; also callable standalone: `python report.py`. |
 | `report/detail_*.csv` | Per-run detail logs. One CSV per test run. Not committed to version control. |
+| `report/report_*.html` | Auto-generated HTML reports. One file per test run. Not committed to version control. |

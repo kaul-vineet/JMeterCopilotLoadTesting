@@ -1752,22 +1752,25 @@ def _init_detail_log():
     _detail_log_path = REPORT_DIR / f"detail_{ts}.csv"
     with open(_detail_log_path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
-            "timestamp", "profile", "scenario",
-            "conversation_id", "utterance",
-            "response_ms", "timed_out",
+            "profile", "event_number", "scenario", "conversation_id",
+            "utterance", "bot_response",
+            "utterance_sent_at", "response_received_at", "response_ms",
+            "timed_out",
         ])
     log.info("Detail log → %s", _detail_log_path)
 
 
-def _log_request(profile: str, scenario: str, conv_id: str,
-                 utterance: str, response_ms: float, timed_out: bool):
+def _log_request(profile: str, event_number: int, scenario: str, conv_id: str,
+                 utterance: str, bot_response: str,
+                 send_time: float, response_ms: float, timed_out: bool):
     if not _detail_log_path:
         return
+    sent_at     = datetime.fromtimestamp(send_time, tz=timezone.utc).isoformat(timespec="milliseconds")
+    received_at = datetime.fromtimestamp(send_time + response_ms / 1000, tz=timezone.utc).isoformat(timespec="milliseconds")
     row = [
-        datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds"),
-        profile, scenario, conv_id,
-        utterance,
-        f"{response_ms:.0f}",
+        profile, event_number, scenario, conv_id,
+        utterance, bot_response,
+        sent_at, received_at, f"{response_ms:.0f}",
         "1" if timed_out else "0",
     ]
     with _detail_lock:
@@ -1874,7 +1877,7 @@ class CopilotBaseUser(User):
         self._idx += 1
 
         try:
-            activity_id, _ = send_utterance(self.conversation, utterance)
+            activity_id, send_time = send_utterance(self.conversation, utterance)
         except Exception as e:
             log.error("Send utterance failed: %s", e)
             _fire_metric(self.environment, "Send Utterance", 0, error=e)
@@ -1897,9 +1900,9 @@ class CopilotBaseUser(User):
 
         if response.timed_out:
             log.warning("No bot reply received for activity %s", activity_id)
-            _log_request(profile_label, self.scenario_name,
-                         self.conversation.id, utterance,
-                         response.latency_ms, timed_out=True)
+            _log_request(profile_label, self._idx, self.scenario_name,
+                         self.conversation.id, utterance, "",
+                         send_time, response.latency_ms, timed_out=True)
             _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms,
                          error=Exception("No bot reply received"))
             if _active_dashboard is not None:
@@ -1908,9 +1911,14 @@ class CopilotBaseUser(User):
                     self._idx, len(self.utterances), response.latency_ms, True)
             raise StopUser()
 
-        _log_request(profile_label, self.scenario_name,
-                     self.conversation.id, utterance,
-                     response.latency_ms, timed_out=False)
+        bot_text = " | ".join(
+            a.get("text", "").strip()
+            for a in response.activities
+            if a.get("text", "").strip()
+        )[:500]
+        _log_request(profile_label, self._idx, self.scenario_name,
+                     self.conversation.id, utterance, bot_text,
+                     send_time, response.latency_ms, timed_out=False)
         _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms)
         if _active_dashboard is not None:
             _active_dashboard.on_utterance(
@@ -2349,7 +2357,6 @@ if __name__ == "__main__":
             p95_target=test_config["p95_target_ms"],
             profile_map=_profile_map,
         )
-        global _active_dashboard
         _active_dashboard = _dash
         _env.events.request.add_listener(_dash.on_request)
         _runner.start(user_count=_params["users"], spawn_rate=_params["spawn_rate"])
@@ -2372,6 +2379,7 @@ if __name__ == "__main__":
 
         _kw = gevent.spawn(_keywatch)
 
+        os.system("cls" if os.name == "nt" else "clear")
         with Live(console=console, auto_refresh=False) as _live:
             _deadline = time.time() + _params["run_time"]
             while time.time() < _deadline and not _stop_run[0]:
@@ -2393,8 +2401,20 @@ if __name__ == "__main__":
         _active_dashboard = None
 
         gevent.sleep(0.3)
-        os.system("cls" if os.name == "nt" else "clear")
         _celebrate("Test complete")
+
+        if _detail_log_path and _detail_log_path.exists():
+            try:
+                from report import generate_report as _gen_report
+                _rep = _with_spinner(
+                    "Generating HTML report…",
+                    lambda: _gen_report(_detail_log_path, p95_target=test_config["p95_target_ms"]),
+                )
+                _gprint(f"  Report → {_rep}", fg=_G_CYAN, bold=True, padding="0 2", margin="0 1")
+            except ImportError:
+                pass
+            except Exception as _e:
+                log.debug("Report generation failed: %s", _e)
 
         while True:
             _post = _gchoose(
