@@ -2009,13 +2009,14 @@ class _DashboardState:
         filled  = int((idx / max(1, total)) * 10)
         bar     = "█" * filled + "░" * (10 - filled)
         status  = "✗ timeout" if timed_out else f"✓ {int(response_ms)}ms"
+        key = f"{scenario}||{utterance}"
         with self._lock:
-            self._utt_times.setdefault(utterance, [])
-            self._utt_tout.setdefault(utterance, 0)
+            self._utt_times.setdefault(key, [])
+            self._utt_tout.setdefault(key, 0)
             if timed_out:
-                self._utt_tout[utterance] += 1
+                self._utt_tout[key] += 1
             else:
-                self._utt_times[utterance].append(response_ms)
+                self._utt_times[key].append(response_ms)
             self._users[user_id] = {"name": display, "idx": idx, "total": total}
             self.feed.appendleft(f"  → {display:<20} [{bar}] {idx:>2}/{total}  {status}")
 
@@ -2170,31 +2171,37 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
 
     # ── Utterance tables ──────────────────────────────────────────────────────
     utt_data = []
-    for utt, times in snap["utt_times"].items():
-        tout_u = snap["utt_tout"].get(utt, 0)
-        utt_data.append((utt, times, tout_u))
+    for key, times in snap["utt_times"].items():
+        scenario_k, utt = key.split("||", 1) if "||" in key else ("", key)
+        profile_k = state.profile_map.get(scenario_k, scenario_k)
+        tout_u    = snap["utt_tout"].get(key, 0)
+        utt_data.append((utt, profile_k, times, tout_u))
 
     def _utt_table(title: str, rows: list, col: str):
         root.add_row(Text(f"  {title}", style="bold cyan"))
         ut = Table(show_header=True, header_style="bold cyan",
                    box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=False)
-        ut.add_column("Utterance", min_width=36)
+        ut.add_column("Profile",   min_width=16)
+        ut.add_column("Utterance", min_width=32)
         ut.add_column("p50",   justify="right", min_width=6)
         ut.add_column("p95",   justify="right", min_width=6)
         ut.add_column("Count", justify="right", min_width=6)
-        for utt, times, tout_u in rows[:8]:
-            p50_u = _pct(times, 0.50)
-            p95_u = _pct(times, 0.95)
-            cnt   = len(times) + tout_u
-            rcol  = col
-            label = (utt[:34] + "…") if len(utt) > 35 else utt
-            ut.add_row(Text(label, style=rcol), Text(str(p50_u), style=rcol),
-                       Text(str(p95_u), style=rcol), Text(str(cnt)))
+        for utt, profile_k, times, tout_u in rows[:8]:
+            p50_u  = _pct(times, 0.50)
+            p95_u  = _pct(times, 0.95)
+            cnt    = len(times) + tout_u
+            plabel = (profile_k[:14] + "…") if len(profile_k) > 15 else profile_k
+            ulabel = (utt[:30] + "…") if len(utt) > 31 else utt
+            ut.add_row(Text(plabel, style="cyan"),
+                       Text(ulabel, style=col),
+                       Text(str(p50_u), style=col),
+                       Text(str(p95_u), style=col),
+                       Text(str(cnt)))
         root.add_row(ut)
 
     if utt_data:
-        slowest = sorted(utt_data, key=lambda x: _pct(x[1], 0.95), reverse=True)
-        fastest = sorted(utt_data, key=lambda x: _pct(x[1], 0.95))
+        slowest = sorted(utt_data, key=lambda x: _pct(x[2], 0.95), reverse=True)
+        fastest = sorted(utt_data, key=lambda x: _pct(x[2], 0.95))
         _utt_table("SLOWEST UTTERANCES  (top 8 by p95)", slowest, "bold red")
         root.add_row(Text(""))
         _utt_table("FASTEST UTTERANCES  (top 8 by p95)", fastest, "bold green")
