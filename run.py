@@ -1975,14 +1975,15 @@ class _DashboardState:
         self.p95_target   = p95_target
         self.profile_map  = profile_map          # scenario → display_name
         self.start_time   = time.time()
-        self._times: dict[str, list[float]] = {}
-        self._tout:  dict[str, int]         = {}
-        self._ts:    list[tuple[float, float]] = []
-        self._errs:  list[tuple[float, bool]]  = []
-        self._utt_times: dict[str, list[float]] = {}
-        self._utt_tout:  dict[str, int]         = {}
-        self._users: dict[int, dict]            = {}  # user_id → {name, idx, total}
-        self.feed   = collections.deque(maxlen=8)
+        self._times:       dict[str, list[float]]         = {}
+        self._tout:        dict[str, int]                 = {}
+        self._ts:          list[tuple[float, float]]      = []
+        self._scenario_ts: dict[str, list[tuple[float, float]]] = {}
+        self._errs:        list[tuple[float, bool]]       = []
+        self._utt_times:   dict[str, list[float]]         = {}
+        self._utt_tout:    dict[str, int]                 = {}
+        self._users:       dict[int, dict]                = {}
+        self.feed          = collections.deque(maxlen=8)
 
     def on_request(self, **kwargs):
         name      = kwargs.get("name", "")
@@ -2001,6 +2002,7 @@ class _DashboardState:
             else:
                 self._times[scenario].append(rt)
             self._ts.append((elapsed, rt))
+            self._scenario_ts.setdefault(scenario, []).append((elapsed, rt))
             self._errs.append((elapsed, is_err))
 
     def on_utterance(self, utterance: str, scenario: str, user_id: int,
@@ -2027,13 +2029,14 @@ class _DashboardState:
     def snapshot(self) -> dict:
         with self._lock:
             return {
-                "times":     {k: list(v) for k, v in self._times.items()},
-                "tout":      dict(self._tout),
-                "ts":        list(self._ts),
-                "errs":      list(self._errs),
-                "utt_times": {k: list(v) for k, v in self._utt_times.items()},
-                "utt_tout":  dict(self._utt_tout),
-                "feed":      list(self.feed),
+                "times":       {k: list(v) for k, v in self._times.items()},
+                "tout":        dict(self._tout),
+                "ts":          list(self._ts),
+                "scenario_ts": {k: list(v) for k, v in self._scenario_ts.items()},
+                "errs":        list(self._errs),
+                "utt_times":   {k: list(v) for k, v in self._utt_times.items()},
+                "utt_tout":    dict(self._utt_tout),
+                "feed":        list(self.feed),
             }
 
 
@@ -2130,7 +2133,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
     tbl.add_column("p95",      justify="right", min_width=6)
     tbl.add_column("p99",      justify="right", min_width=6)
     tbl.add_column("T/O",      justify="right", min_width=5)
-    tbl.add_column("Trend",    min_width=22)
+    tbl.add_column("p95 / 30s buckets", min_width=22)
 
     for scenario, times in sorted(snap["times"].items()):
         tout    = snap["tout"].get(scenario, 0)
@@ -2148,7 +2151,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
             Text(str(p95_v), style=rcol),
             Text(str(p99_v)),
             Text(str(tout),  style="bold red" if tout > 0 else "white"),
-            Text(_sparkline(snap["ts"]), style="cyan"),
+            Text(_sparkline(snap["scenario_ts"].get(scenario, [])), style="cyan"),
         )
 
     all_spark = _sparkline(snap["ts"])
@@ -2165,8 +2168,8 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
 
     # ── Sparklines ────────────────────────────────────────────────────────────
     err_ts = [(t, 1000.0 if e else 0.0) for t, e in snap["errs"]]
-    root.add_row(Text(f"  {_sparkline(snap['ts'])}  p95 trend",       style="cyan"))
-    root.add_row(Text(f"  {_sparkline(err_ts)}  error rate trend",   style="red"))
+    root.add_row(Text(f"  {_sparkline(snap['ts'])}  overall p95  (each bar = 30s bucket)",  style="cyan"))
+    root.add_row(Text(f"  {_sparkline(err_ts)}  error rate   (bar height = errors in bucket)", style="red"))
     root.add_row(Text(""))
 
     # ── Utterance tables ──────────────────────────────────────────────────────
