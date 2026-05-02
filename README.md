@@ -1,4 +1,4 @@
-# Copilot Studio Load Test
+# GRUNTMASTER 6000
 
 A load testing tool for Microsoft Copilot Studio bots. It simulates many users having real conversations with your bot at the same time, measures how fast the bot responds, and tells you whether it can handle your target load.
 
@@ -508,7 +508,7 @@ The test runs entirely in the terminal. A live dashboard updates every 0.5 secon
 
 ```
 ╭──────────────────────────────────────────────────────────────────────╮
-│  COPILOT STUDIO  ·  LOAD TEST  ·  LIVE        ● HEALTHY    00:02:14  │
+│  GRUNTMASTER 6000  ·  LIVE                     ● HEALTHY    00:02:14  │
 ╰──────────────────────────────────────────────────────────────────────╯
   SPAWNING  ▓▓▓▓▓▓▓▓▓░  9 / 10 users
   RPS: 0.3/s   Errors: 0.0%   p95: [████████░░] 1820ms / 2000ms

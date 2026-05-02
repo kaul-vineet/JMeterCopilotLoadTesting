@@ -375,14 +375,14 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Copilot Load Test — {test_date_str}</title>
+  <title>GRUNTMASTER 6000 — {test_date_str}</title>
   <style>{_CSS}</style>
 </head>
 <body>
 <div class="wrap">
 
   <div class="hdr">
-    <h1>COPILOT STUDIO &nbsp;&middot;&nbsp; LOAD TEST REPORT</h1>
+    <h1>GRUNTMASTER 6000 &nbsp;&middot;&nbsp; LOAD TEST REPORT</h1>
     <div class="stat"><div class="v">{test_date_str}</div><div class="l">Test date</div></div>
     <div class="stat"><div class="v">{total_reqs:,}</div><div class="l">Requests</div></div>
     <div class="stat"><div class="v">{duration_str}</div><div class="l">Duration</div></div>
@@ -445,7 +445,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
 
   <footer>
     Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}
-    &nbsp;&middot;&nbsp; Copilot Studio Load Test
+    &nbsp;&middot;&nbsp; GRUNTMASTER 6000
   </footer>
 </div>
 <script>{_JS}</script>

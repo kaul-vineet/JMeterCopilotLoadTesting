@@ -1,5 +1,5 @@
 """
-run.py — Copilot Studio Load Test
+run.py — GRUNTMASTER 6000
 
 First run / reconfigure:
     python run.py           → setup wizard, then Locust web UI
@@ -1299,7 +1299,7 @@ def run_wizard():
     while True:
         os.system("cls" if os.name == "nt" else "clear")
         _gprint(
-            "  ✦  COPILOT STUDIO  ·  LOAD TEST  ·  SETUP WIZARD  ✦\n\n"
+            "  ✦  GRUNTMASTER 6000  ·  SETUP WIZARD  ✦\n\n"
             "  Saves credentials to Windows Credential Manager.",
             border="double", fg=_G_CYAN, bold=True,
             border_fg=_G_PURPLE, padding="1 3", margin="1 0",
@@ -2104,7 +2104,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
     hdr.add_column(ratio=3, justify="center")
     hdr.add_column(ratio=2, justify="right")
     hdr.add_row(
-        Text("  COPILOT STUDIO  ·  LOAD TEST  ·  LIVE", style="bold cyan"),
+        Text("  GRUNTMASTER 6000  ·  LIVE", style="bold cyan"),
         Text(health, style=f"bold {hcol}"),
         Text(f"{h:02d}:{m:02d}:{s:02d}", style="bold white"),
     )
