@@ -3408,7 +3408,7 @@ if __name__ == "__main__":
             _deadline = time.time() + _params["run_time"]
             while time.time() < _deadline and not _stop_run[0]:
                 _curr = getattr(_runner, "user_count", 0)
-                if _curr > _prev_users[0]:
+                if _curr != _prev_users[0]:
                     _dash.set_user_count(_curr)
                     _prev_users[0] = _curr
                 _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
