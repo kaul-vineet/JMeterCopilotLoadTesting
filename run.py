@@ -3022,6 +3022,7 @@ def _collect_run_params() -> dict:
             _prow("Run time",                      state["run_mins"], "minutes", "how long the test runs"),
             _prow("Wait between messages",         state["think"],    "seconds", "pause each user takes after a reply"),
             _prow("Reply timeout",                 state["timeout"],  "seconds", "wait this long for first reply (min 15s)"),
+            _prow("Silence window",               _SILENCE_TIMEOUT,  "seconds", "fixed — wait after last reply before declaring done"),
             _prow("Protocol",
                   "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket",
                   "",
@@ -3071,8 +3072,10 @@ def _collect_run_params() -> dict:
             v = _edit("How long to wait for the first bot reply? (seconds, minimum 15)", state["timeout"])
             state["timeout"] = max(15, v)
         elif idx == 5:
-            _gprint("  HTTP transport is not yet enabled — coming soon.", fg="yellow", padding="0 2")
+            _gprint(f"  Silence window is fixed at {int(_SILENCE_TIMEOUT)}s — not configurable.", fg=_G_DIM, padding="0 2")
         elif idx == 6:
+            _gprint("  HTTP transport is not yet enabled — coming soon.", fg="yellow", padding="0 2")
+        elif idx == 7:
             if _gum_ok():
                 notes = _gwrite(
                     "Describe this test run…",
