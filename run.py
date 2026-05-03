@@ -90,8 +90,8 @@ def _save_credential(key: str, value: str):
 # ── Shared config dict (read by Locust User classes) ─────────────────────────
 
 test_config: dict = {
-    "frame_timeout": 10.0,
-    "think_min":     30,
+    "response_timeout": 30.0,
+    "think_min":        30,
     "think_max":     60,
     "p95_target_ms": 2000,
     "max_error_rate": 0.5,
@@ -115,6 +115,8 @@ DL_SECRET           = _load_credential("CS_DIRECTLINE_SECRET")
 TOKEN_ENDPOINT      = _load_credential("CS_TOKEN_ENDPOINT")
 ENDPOINT_NEEDS_AUTH = _load_credential("CS_TOKEN_ENDPOINT_REQUIRES_AUTH").lower() == "true"
 DIRECTLINE_BASE = "https://directline.botframework.com"
+
+_SILENCE_TIMEOUT = 15.0   # seconds of silence after last bot reply before declaring response complete
 
 _GUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -350,20 +352,30 @@ def send_token_exchange(conversation: Conversation, invoke_id: str, connection_n
 def read_response(
     ws: websocket.WebSocket,
     activity_id: str,
-    frame_timeout: float = 10.0,
+    response_timeout: float = 30.0,
     conversation: Optional[Conversation] = None,
     aad_token: Optional[str] = None,
 ) -> Response:
     """
     Reads WebSocket frames until the bot replies to activity_id.
+    Waits up to response_timeout for the first reply, then _SILENCE_TIMEOUT
+    seconds after the last reply before declaring the response complete.
     When conversation + aad_token are provided, handles signin/tokenExchange
     invokes automatically so SSO-authenticated bots work without manual sign-in.
     """
     matched, last_match_time = [], None
     start_time = time.time()
-    ws.settimeout(frame_timeout)
 
     while True:
+        now       = time.time()
+        remaining = (
+            _SILENCE_TIMEOUT - (now - last_match_time)
+            if matched else
+            response_timeout - (now - start_time)
+        )
+        if remaining <= 0:
+            break
+        ws.settimeout(remaining)
         try:
             raw = ws.recv()
         except websocket.WebSocketTimeoutException:
@@ -1216,7 +1228,7 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
 
     try:
         response = _spin("Waiting for bot reply…",
-                         lambda: read_response(ws, activity_id, frame_timeout=15.0,
+                         lambda: read_response(ws, activity_id, response_timeout=30.0,
                                                conversation=conversation,
                                                aad_token=aad_token_for_bot))
     except Exception as e:
@@ -1656,7 +1668,7 @@ def _on_locust_init_ui(environment, **kwargs):
     @app.route("/cs-config", methods=["POST"])
     def set_cs_config():
         data = request.get_json(force=True, silent=True) or {}
-        test_config["frame_timeout"]  = float(data.get("frame_timeout", 10))
+        test_config["response_timeout"] = max(15.0, float(data.get("response_timeout", 30)))
         test_config["think_min"]      = int(data.get("think_min", 30))
         test_config["think_max"]      = int(data.get("think_max", 60))
         test_config["p95_target_ms"]  = int(data.get("p95_target_ms", 2000))
@@ -1717,8 +1729,8 @@ def _on_locust_init_ui(environment, **kwargs):
   <div class="cs-grid">
     <div class="cs-field">
       <label>Response Timeout (seconds)</label>
-      <input type="number" id="cs-frame-timeout" value="10" min="5" max="60">
-      <div class="cs-hint">Max wait for each bot frame</div>
+      <input type="number" id="cs-response-timeout" value="30" min="15" max="300">
+      <div class="cs-hint">Max wait for first bot reply (min 15s)</div>
     </div>
     <div class="cs-field">
       <label>Think Time Min (seconds)</label>
@@ -1771,7 +1783,7 @@ def _on_locust_init_ui(environment, **kwargs):
       var config = {{
         dl_secret:      document.getElementById('cs-dl-secret').value,
         token_endpoint: document.getElementById('cs-token-endpoint').value,
-        frame_timeout:  parseFloat(document.getElementById('cs-frame-timeout').value),
+        response_timeout: parseFloat(document.getElementById('cs-response-timeout').value),
         think_min:      parseInt(document.getElementById('cs-think-min').value),
         think_max:      parseInt(document.getElementById('cs-think-max').value),
         p95_target_ms:  parseInt(document.getElementById('cs-p95').value),
@@ -1994,11 +2006,11 @@ class CopilotBaseUser(User):
             _fire_metric(self.environment, "Send Utterance", 0, error=e)
             raise StopUser()
 
-        frame_timeout = test_config.get("frame_timeout", 10.0)
+        response_timeout = max(15.0, test_config.get("response_timeout", 30.0))
         try:
             response = read_response(
                 self.ws, activity_id,
-                frame_timeout=frame_timeout,
+                response_timeout=response_timeout,
                 conversation=self.conversation,
                 aad_token=self.aad_token,
             )
@@ -2078,7 +2090,7 @@ def _make_user_class(class_name: str, utterances: list[str], scenario: str, prof
 def read_response_http(
     conversation: Conversation,
     activity_id: str,
-    timeout: float = 10.0,
+    response_timeout: float = 30.0,
     aad_token: Optional[str] = None,
 ) -> Response:
     matched: list[dict]       = []
@@ -2086,7 +2098,7 @@ def read_response_http(
     start_time                = time.time()
     watermark: Optional[str]  = None
 
-    while time.time() - start_time < timeout:
+    while time.time() - start_time < response_timeout:
         url = f"{DIRECTLINE_BASE}/v3/directline/conversations/{conversation.id}/activities"
         if watermark is not None:
             url += f"?watermark={watermark}"
@@ -2211,7 +2223,7 @@ class CopilotHttpUser(CopilotBaseUser):
         try:
             response = read_response_http(
                 self.conversation, activity_id,
-                timeout=test_config.get("frame_timeout", 10.0),
+                response_timeout=max(15.0, test_config.get("response_timeout", 30.0)),
                 aad_token=self.aad_token,
             )
         except Exception as e:
@@ -2779,7 +2791,7 @@ def _collect_run_params() -> dict:
         "spawn":    test_config["spawn_rate"],
         "run_mins": test_config["run_time_mins"],
         "think":    test_config["think_min"],
-        "timeout":  int(test_config["frame_timeout"]),
+        "timeout":  int(test_config["response_timeout"]),
         "notes":    "",
     }
 
@@ -2801,7 +2813,7 @@ def _collect_run_params() -> dict:
             _prow("Ramp-up rate",                  state["spawn"],    "users/m", "how many new users join per minute"),
             _prow("Run time",                      state["run_mins"], "minutes", "how long the test runs"),
             _prow("Wait between messages",         state["think"],    "seconds", "pause each user takes after a reply"),
-            _prow("Reply timeout",                 state["timeout"],  "seconds", "give up waiting after this long"),
+            _prow("Reply timeout",                 state["timeout"],  "seconds", "wait this long for first reply (min 15s)"),
             _prow("Protocol",
                   "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket",
                   "",
@@ -2848,7 +2860,8 @@ def _collect_run_params() -> dict:
             v = _edit("How long does each user pause between messages? (seconds, minimum 25)", state["think"])
             state["think"] = max(25, v)
         elif idx == 4:
-            state["timeout"]  = _edit("Give up waiting for a reply after how many seconds?", state["timeout"])
+            v = _edit("How long to wait for the first bot reply? (seconds, minimum 15)", state["timeout"])
+            state["timeout"] = max(15, v)
         elif idx == 5:
             _gprint("  HTTP transport is not yet enabled — coming soon.", fg="yellow", padding="0 2")
         elif idx == 6:
@@ -2867,7 +2880,7 @@ def _collect_run_params() -> dict:
 
     test_config["think_min"]     = state["think"]
     test_config["think_max"]     = state["think"]
-    test_config["frame_timeout"] = float(state["timeout"])
+    test_config["response_timeout"] = max(15.0, float(state["timeout"]))
     test_config["users"]         = state["users"]
     test_config["spawn_rate"]    = state["spawn"]
     test_config["run_time_mins"] = state["run_mins"]
