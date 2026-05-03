@@ -2390,7 +2390,7 @@ for _csv in _csv_files:
 
 class _DashboardState:
     def __init__(self, target_users: int, p95_target: int, profile_map: dict):
-        self._lock        = threading.Lock()
+        self._lock        = threading.RLock()   # reentrant: on_event called from within on_request
         self.target_users = target_users
         self.p95_target   = p95_target
         self.profile_map  = profile_map          # scenario → display_name
@@ -2490,7 +2490,12 @@ class _DashboardState:
     def on_event(self, icon: str, message: str):
         ts = datetime.now().strftime("%H:%M:%S")
         with self._lock:
-            self.events.appendleft(f"  {ts}  {icon}  {message}")
+            self.events.appendleft({
+                "ts":    ts,
+                "icon":  icon,
+                "message": message,
+                "ramp":  self._cur_ramp_idx + 1,
+            })
 
     def on_429(self):
         with self._lock:
@@ -2654,6 +2659,12 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         st.add_column("p99",      justify="right", min_width=6)
         st.add_column("T/O",      justify="right", min_width=5)
         st.add_column("429",      justify="right", min_width=5)
+        # Group events by ramp number for sub-row insertion
+        _events_by_ramp: dict = {}
+        for _ev in snap.get("events", []):
+            if isinstance(_ev, dict):
+                _events_by_ramp.setdefault(_ev.get("ramp", 0), []).append(_ev)
+
         for s in ramps_disp:
             live  = s.get("active", False)
             p95c  = "bold red" if s["p95"] > state.p95_target else ("cyan" if live else "white")
@@ -2672,6 +2683,13 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
                 Text(str(s["timeouts"]), style=toc),
                 Text(str(s.get("rate_limited", 0)), style=rlc),
             )
+            for _ev in _events_by_ramp.get(s["ramp"], []):
+                _ic = _ev["icon"]
+                _es = "bold red" if _ic in ("⚡", "✗") else ("bold yellow" if _ic == "⚠" else "dim")
+                st.add_row(
+                    Text(f"    {_ev['ts']}  {_ic}  {_ev['message']}", style=_es),
+                    Text(""), Text(""), Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
+                )
         root.add_row(st)
         # ── Ramp trend — one line, one bar per ramp step ─────────────────────
         all_ramps = _finalized + _active
@@ -2818,7 +2836,13 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
     events = snap.get("events", [])
     if events:
         root.add_row(Text("  EVENTS", style="bold cyan"))
-        for entry in events[:8]:
+        for ev in events[:8]:
+            if isinstance(ev, dict):
+                icon  = ev.get("icon", "")
+                entry = f"  {ev['ts']}  R{ev['ramp']}  {icon}  {ev['message']}"
+            else:
+                icon  = ""
+                entry = ev
             if "⚡" in entry or "✗" in entry:
                 style = "bold red"
             elif "⚠" in entry:
