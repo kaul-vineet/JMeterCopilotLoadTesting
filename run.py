@@ -3195,8 +3195,6 @@ if __name__ == "__main__":
             while time.time() < _deadline and not _stop_run[0]:
                 _curr = getattr(_runner, "user_count", 0)
                 if _curr > _prev_users[0]:
-                    for _i in range(_prev_users[0] + 1, _curr + 1):
-                        _dash.add_feed(f"  ↑ User {_i} spawned")
                     _dash.set_user_count(_curr)
                     _prev_users[0] = _curr
                 _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
