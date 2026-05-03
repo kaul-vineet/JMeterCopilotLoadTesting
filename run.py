@@ -3184,9 +3184,10 @@ if __name__ == "__main__":
                                 return
                     except Exception:
                         pass
-                    gevent.sleep(0.1)
+                    time.sleep(0.05)
 
-        _kw = gevent.spawn(_keywatch)
+        _kw = threading.Thread(target=_keywatch, daemon=True)
+        _kw.start()
 
         os.system("cls" if os.name == "nt" else "clear")
         with Live(console=console, auto_refresh=False, screen=True) as _live:
@@ -3205,7 +3206,7 @@ if __name__ == "__main__":
             _live.refresh()
 
         _stop_run[0] = True
-        _kw.kill()
+        _kw.join(timeout=0.2)
         try:
             _runner.quit()
             _runner.greenlet.join(timeout=8)   # don't hang if a user greenlet is mid-sleep
