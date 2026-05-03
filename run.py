@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import queue as _queue
 import threading
 import time
 from dataclasses import dataclass
@@ -89,17 +90,37 @@ def _save_credential(key: str, value: str):
 
 # ── Shared config dict (read by Locust User classes) ─────────────────────────
 
-test_config: dict = {
+class _TestConfig(dict):
+    _BOUNDS: dict = {
+        "response_timeout": (15.0, 300.0),
+        "think_min":        (0, 3600),
+        "think_max":        (0, 3600),
+        "p95_target_ms":    (100, 60_000),
+        "max_error_rate":   (0.0, 1.0),
+        "users":            (1, 10_000),
+        "spawn_rate":       (1, 1_000),
+    }
+    def __setitem__(self, key: str, value) -> None:
+        if key in self._BOUNDS:
+            lo, hi = self._BOUNDS[key]
+            value = type(lo)(value)
+            if not (lo <= value <= hi):
+                raise ValueError(
+                    f"test_config['{key}'] = {value!r} out of range [{lo}, {hi}]"
+                )
+        super().__setitem__(key, value)
+
+test_config = _TestConfig({
     "response_timeout": 30.0,
     "think_min":        30,
-    "think_max":     60,
-    "p95_target_ms": 2000,
-    "max_error_rate": 0.5,
-    "users":         10,
-    "spawn_rate":    5,
-    "run_time_mins": 5,
-    "transport":     os.environ.get("GRUNTMASTER_TRANSPORT", "websocket").lower(),
-}
+    "think_max":        60,
+    "p95_target_ms":    2000,
+    "max_error_rate":   0.5,
+    "users":            10,
+    "spawn_rate":       5,
+    "run_time_mins":    5,
+    "transport":        os.environ.get("GRUNTMASTER_TRANSPORT", "websocket").lower(),
+})
 
 from requests.adapters import HTTPAdapter
 
@@ -115,7 +136,14 @@ def _init_session(user_count: int):
     _session.mount("https://", adapter)
     _session.mount("http://", adapter)
 
-_active_dashboard: "Optional[_DashboardState]" = None
+class _RunState:
+    __slots__ = ("dashboard", "circuit_open_until", "cpu_warn_ts")
+    def __init__(self) -> None:
+        self.dashboard: "Optional[_DashboardState]" = None
+        self.circuit_open_until: float = 0.0
+        self.cpu_warn_ts: float = 0.0
+
+_run_state = _RunState()
 _spawn_counters: dict[str, int] = {}   # class_name → spawn sequence number
 _spawn_lock     = threading.Lock()
 
@@ -414,14 +442,14 @@ def read_response(
         except websocket.WebSocketTimeoutException:
             break
         except websocket.WebSocketConnectionClosedException:
-            if _active_dashboard is not None:
-                _active_dashboard.on_event("⚠", "DirectLine closed WebSocket — reconnecting")
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("⚠", "DirectLine closed WebSocket — reconnecting")
             _log_event("⚠", "ws_closed", "DirectLine closed WebSocket")
             return Response(activities=[], latency_ms=(time.time()-start_time)*1000,
                             timed_out=True, ws_closed=True)
         except (websocket.WebSocketException, OSError) as _exc:
-            if _active_dashboard is not None:
-                _active_dashboard.on_event("⚠", f"Stream error ({type(_exc).__name__}) — reconnecting")
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("⚠", f"Stream error ({type(_exc).__name__}) — reconnecting")
             _log_event("⚠", "ws_error", f"Stream error: {type(_exc).__name__}")
             return Response(activities=[], latency_ms=(time.time()-start_time)*1000,
                             timed_out=True, ws_closed=True)
@@ -1625,24 +1653,39 @@ def run_wizard():
                 height=8,
             )
             if "Edit" in action:
-                uname = _ginput("", header="Username (UPN)",
-                                default=p["username"]) or p["username"]
-                disp_def = uname.split("@")[0]
-                disp = _ginput("", header="Display name",
-                               default=p.get("display_name", disp_def)) or disp_def
-                available_csvs = sorted(q.stem for q in UTTERANCES_DIR.glob("*.csv"))
-                scenario = p.get("scenario", "")
-                if available_csvs:
-                    csv_pick = _gchoose(
-                        "(none)", *available_csvs,
-                        header="\n  Scenario CSV\n",
-                        height=min(len(available_csvs) + 4, 10),
-                    )
-                    scenario = "" if csv_pick.strip() == "(none)" else csv_pick.strip()
-                new_p: dict = {"username": uname, "display_name": disp}
-                if scenario:
-                    new_p["scenario"] = scenario
-                state["profiles"][p_idx] = new_p
+                _edit_action = _gchoose(
+                    "  Edit username / UPN",
+                    "  Edit display name",
+                    "  Change scenario CSV",
+                    "  ← Back",
+                    header="\n  What would you like to edit?\n",
+                    height=8,
+                )
+                if "← Back" in _edit_action:
+                    pass   # return to profile menu without saving
+                else:
+                    uname = p["username"]
+                    disp  = p.get("display_name", uname.split("@")[0])
+                    if "username" in _edit_action.lower() or "upn" in _edit_action.lower():
+                        uname = _ginput("", header="Username (UPN)", default=uname) or uname
+                    if "display" in _edit_action.lower():
+                        disp_def = uname.split("@")[0]
+                        disp = _ginput("", header="Display name",
+                                       default=p.get("display_name", disp_def)) or disp_def
+                    scenario = p.get("scenario", "")
+                    if "scenario" in _edit_action.lower():
+                        available_csvs = sorted(q.stem for q in UTTERANCES_DIR.glob("*.csv"))
+                        if available_csvs:
+                            csv_pick = _gchoose(
+                                "(none)", *available_csvs,
+                                header="\n  Scenario CSV\n",
+                                height=min(len(available_csvs) + 4, 10),
+                            )
+                            scenario = "" if csv_pick.strip() == "(none)" else csv_pick.strip()
+                    new_p: dict = {"username": uname, "display_name": disp}
+                    if scenario:
+                        new_p["scenario"] = scenario
+                    state["profiles"][p_idx] = new_p
 
             elif "Re-authenticate" in action:
                 print()
@@ -1870,62 +1913,104 @@ def _on_locust_init(environment, **kwargs):
 # conversation_id, utterance, response_ms, timed_out.
 # File: report/detail_YYYYMMDD_HHMMSS.csv  (new file per test run)
 
-_detail_log_path: Path | None = None
-_events_log_path: Path | None = None
-_detail_lock = threading.Lock()
+class _CsvWriter:
+    """Background-thread CSV writer — non-blocking puts from Locust greenlets."""
+
+    def __init__(self) -> None:
+        self._q: _queue.Queue = _queue.Queue()
+        self.detail_path: Path | None = None
+        self.events_path: Path | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self, detail_path: Path, events_path: Path) -> None:
+        self.detail_path = detail_path
+        self.events_path = events_path
+        self._thread = threading.Thread(target=self._run, name="csv-writer", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._q.put(None)   # sentinel — drain then exit
+        if self._thread:
+            self._thread.join(timeout=8)
+
+    def write_detail(self, row: list) -> None:
+        self._q.put(("d", row))
+
+    def write_event(self, row: list) -> None:
+        self._q.put(("e", row))
+
+    def _run(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:
+                try:
+                    while True:
+                        item2 = self._q.get_nowait()
+                        if item2 is not None:
+                            self._flush(item2)
+                except _queue.Empty:
+                    pass
+                return
+            self._flush(item)
+
+    def _flush(self, item: tuple) -> None:
+        kind, row = item
+        path = self.detail_path if kind == "d" else self.events_path
+        if path:
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
 
 
-def _init_detail_log():
-    global _detail_log_path, _events_log_path
+_csv_writer = _CsvWriter()
+
+
+def _init_detail_log() -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    _detail_log_path = REPORT_DIR / f"detail_{ts}.csv"
-    _events_log_path = REPORT_DIR / f"events_{ts}.csv"
-    with open(_detail_log_path, "w", newline="", encoding="utf-8") as f:
+    detail_path = REPORT_DIR / f"detail_{ts}.csv"
+    events_path = REPORT_DIR / f"events_{ts}.csv"
+    with open(detail_path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
             "profile", "event_number", "scenario", "conversation_id",
             "utterance", "bot_response",
             "utterance_sent_at", "response_received_at", "response_ms",
             "timed_out", "user_count",
         ])
-    with open(_events_log_path, "w", newline="", encoding="utf-8") as f:
+    with open(events_path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow(["timestamp", "elapsed_s", "icon", "event_type", "message", "ramp"])
-    log.info("Detail log → %s", _detail_log_path)
+    _csv_writer.start(detail_path, events_path)
+    log.info("Detail log → %s", detail_path)
 
 
 def _log_request(profile: str, event_number: int, scenario: str, conv_id: str,
                  utterance: str, bot_response: str,
                  send_time: float, response_ms: float, timed_out: bool,
-                 user_count: int = 0):
-    if not _detail_log_path:
+                 user_count: int = 0) -> None:
+    if not _csv_writer.detail_path:
         return
     sent_at     = datetime.fromtimestamp(send_time, tz=timezone.utc).isoformat(timespec="milliseconds")
     received_at = datetime.fromtimestamp(send_time + response_ms / 1000, tz=timezone.utc).isoformat(timespec="milliseconds")
-    row = [
+    _csv_writer.write_detail([
         profile, event_number, scenario, conv_id,
         utterance, bot_response,
         sent_at, received_at, f"{response_ms:.0f}",
         "1" if timed_out else "0",
         str(user_count),
-    ]
-    with _detail_lock:
-        with open(_detail_log_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(row)
+    ])
 
 
-def _log_event(icon: str, event_type: str, message: str):
-    if not _events_log_path:
+def _log_event(icon: str, event_type: str, message: str) -> None:
+    if not _csv_writer.events_path:
         return
     ramp = 0
-    if _active_dashboard is not None:
-        with _active_dashboard._lock:
-            ramp = _active_dashboard._cur_ramp_idx + 1
+    if _run_state.dashboard is not None:
+        with _run_state.dashboard._lock:
+            ramp = _run_state.dashboard._cur_ramp_idx + 1
     elapsed = 0.0
-    if _active_dashboard is not None:
-        elapsed = round(time.time() - _active_dashboard.start_time, 1)
-    ts = datetime.now().strftime("%H:%M:%S")
-    with _detail_lock:
-        with open(_events_log_path, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([ts, elapsed, icon, event_type, message, ramp])
+    if _run_state.dashboard is not None:
+        elapsed = round(time.time() - _run_state.dashboard.start_time, 1)
+    _csv_writer.write_event([
+        datetime.now().strftime("%H:%M:%S"), elapsed, icon, event_type, message, ramp,
+    ])
 
 
 @events.test_start.add_listener
@@ -1980,31 +2065,24 @@ def _retry_call(fn, attempts: int = 3, base_delay: float = 1.0):
             gevent.sleep(delay)
 
 
-# Show a dashboard warning when Locust reports high CPU
-_cpu_warn_ts: float = 0.0
-
-_circuit_open_until: float = 0.0
-
 def _trip_circuit():
-    global _circuit_open_until
-    _circuit_open_until = time.time() + 60.0
-    if _active_dashboard is not None:
-        _active_dashboard.on_event("⚡", "429 rate limit hit — circuit open for 60s")
-        _active_dashboard.on_429()
+    _run_state.circuit_open_until = time.time() + 60.0
+    if _run_state.dashboard is not None:
+        _run_state.dashboard.on_event("⚡", "429 rate limit hit — circuit open for 60s")
+        _run_state.dashboard.on_429()
     _log_event("⚡", "rate_limit", "429 rate limit hit — circuit open for 60s")
     log.warning("Circuit breaker tripped — all users pausing 60s")
 
 def _is_circuit_open() -> bool:
-    return time.time() < _circuit_open_until
+    return time.time() < _run_state.circuit_open_until
 
 
 class _CpuWarnHandler(logging.Handler):
     def emit(self, record):
-        global _cpu_warn_ts
         if "CPU usage above" in self.format(record):
-            _cpu_warn_ts = time.time()
-            if _active_dashboard is not None:
-                _active_dashboard.on_event("⚠", "CPU >90% — latency readings may be distorted")
+            _run_state.cpu_warn_ts = time.time()
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("⚠", "CPU >90% — latency readings may be distorted")
             _log_event("⚠", "cpu_warn", "CPU >90% — latency readings may be distorted")
 
 _cpu_warn_handler = _CpuWarnHandler()
@@ -2012,15 +2090,92 @@ _cpu_warn_handler.setLevel(logging.WARNING)
 logging.getLogger("locust.runners").addHandler(_cpu_warn_handler)
 
 
+# ── Transport strategy ────────────────────────────────────────────────────────
+# _WsTransport and _HttpTransport encapsulate the stream-level differences
+# so CopilotBaseUser doesn't need to know which wire it's talking over.
+
+class _WsTransport:
+    """WebSocket stream transport for DirectLine."""
+
+    def __init__(self) -> None:
+        self._ws = None
+        self._opened_at: float = 0.0
+
+    def open(self, conversation: "Conversation", environment) -> None:
+        try:
+            self._ws = _retry_call(lambda: open_websocket(conversation.stream_url))
+            self._opened_at = time.time()
+        except Exception as e:
+            log.error("WebSocket open failed after retries: %s", e)
+            _fire_metric(environment, "Open WebSocket", 0, error=e)
+            raise StopUser()
+
+    def close(self) -> None:
+        if self._ws:
+            close_websocket(self._ws)
+            self._ws = None
+
+    def needs_refresh(self, response_timeout: float) -> bool:
+        threshold = max(10.0, 60.0 - response_timeout - 5.0)
+        return time.time() - self._opened_at > threshold
+
+    def refresh(self, conversation: "Conversation", environment) -> bool:
+        try:
+            self._ws = _retry_call(lambda: refresh_stream(conversation))
+            self._opened_at = time.time()
+            return True
+        except Exception as e:
+            _fire_metric(environment, "Refresh Stream", 0, error=e)
+            return False
+
+    def read(self, activity_id: str, response_timeout: float,
+             conversation: "Conversation", aad_token: Optional[str],
+             send_time: float) -> "Response":
+        return read_response(
+            self._ws, activity_id,
+            response_timeout=response_timeout,
+            conversation=conversation,
+            aad_token=aad_token,
+            send_time=send_time,
+        )
+
+
+class _HttpTransport:
+    """HTTP polling transport for DirectLine. Stateless — no stream to manage."""
+
+    def open(self, conversation, environment) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def needs_refresh(self, response_timeout: float) -> bool:
+        return False
+
+    def refresh(self, conversation, environment) -> bool:
+        return True
+
+    def read(self, activity_id: str, response_timeout: float,
+             conversation, aad_token: Optional[str],
+             send_time: float) -> "Response":
+        return read_response_http(
+            conversation, activity_id,
+            response_timeout=response_timeout,
+            aad_token=aad_token,
+            send_time=send_time,
+        )
+
+
 class CopilotBaseUser(User):
     abstract       = True
     utterances     = []   # class-level list, set per subclass — read-only
     scenario_name  = ""
     fixed_profile  = {}   # pinned at class creation time
+    _transport_cls = _WsTransport
 
     def on_start(self):
-        self.profile = self.__class__.fixed_profile
-        self.ws                    = None
+        self.profile     = self.__class__.fixed_profile
+        self._transport  = self.__class__._transport_cls()
         self.conversation          = None
         self._idx                  = 0
         self._consecutive_timeouts = 0
@@ -2031,10 +2186,8 @@ class CopilotBaseUser(User):
         self._open_conversation()
 
     def _open_conversation(self):
-        """Opens a fresh DirectLine conversation. Replaces any existing ws/conversation."""
-        if self.ws:
-            close_websocket(self.ws)
-            self.ws = None
+        """Opens a fresh DirectLine conversation. Replaces any existing stream."""
+        self._transport.close()
         self._consecutive_timeouts = 0
 
         self.aad_token = None
@@ -2059,28 +2212,16 @@ class CopilotBaseUser(User):
             _fire_metric(self.environment, "Start Conversation", 0, error=e)
             raise StopUser()
 
-        try:
-            self.ws = _retry_call(lambda: open_websocket(self.conversation.stream_url))
-        except Exception as e:
-            log.error("WebSocket open failed after retries: %s", e)
-            _fire_metric(self.environment, "Open WebSocket", 0, error=e)
-            raise StopUser()
-
         self._idx = 0
-        self._stream_opened_at = time.time()
+        self._transport.open(self.conversation, self.environment)
 
     def _refresh_stream(self):
-        """Refresh DirectLine token + stream URL — same conversation, bot context preserved."""
-        try:
-            self.ws = _retry_call(lambda: refresh_stream(self.conversation))
-            self._stream_opened_at = time.time()
-        except Exception as e:
-            _fire_metric(self.environment, "Refresh Stream", 0, error=e)
-            self._open_conversation()   # fallback: start fresh if refresh fails
+        """Refresh stream — same conversation, bot context preserved. Falls back to new conversation."""
+        if not self._transport.refresh(self.conversation, self.environment):
+            self._open_conversation()
 
     def on_stop(self):
-        if self.ws:
-            close_websocket(self.ws)
+        self._transport.close()
 
     def _send_and_measure(self):
         if self._idx >= len(self.utterances):
@@ -2088,19 +2229,14 @@ class CopilotBaseUser(User):
         utterance = self.utterances[self._idx]
         self._idx += 1
 
-        # Check circuit before sending
         if _is_circuit_open():
             gevent.sleep(1)
             return
 
-        # Refresh if stream age + response_timeout would exceed DirectLine's ~60s idle limit.
-        # threshold = 60s − response_timeout − 5s safety buffer, floor 10s.
         _rt = test_config.get("response_timeout", 30.0)
-        _refresh_threshold = max(10.0, 60.0 - _rt - 5.0)
-        if time.time() - getattr(self, "_stream_opened_at", 0) > _refresh_threshold:
+        if self._transport.needs_refresh(_rt):
             self._refresh_stream()
 
-        # Send with error classification
         for _attempt in range(2):
             try:
                 activity_id, send_time = send_utterance(self.conversation, utterance)
@@ -2110,7 +2246,7 @@ class CopilotBaseUser(User):
                     _trip_circuit()
                     _fire_metric(self.environment, "Send Utterance", 0, error=e)
                     gevent.sleep(1)
-                    return  # stay alive, circuit will clear in 60s
+                    return
                 if _attempt == 1:
                     log.error("Send utterance failed: %s", e)
                     _fire_metric(self.environment, "Send Utterance", 0, error=e)
@@ -2123,14 +2259,11 @@ class CopilotBaseUser(User):
                     raise StopUser()
                 gevent.sleep(1)
 
-        response_timeout = max(15.0, test_config.get("response_timeout", 30.0))
+        response_timeout = max(15.0, _rt)
         try:
-            response = read_response(
-                self.ws, activity_id,
-                response_timeout=response_timeout,
-                conversation=self.conversation,
-                aad_token=self.aad_token,
-                send_time=send_time,
+            response = self._transport.read(
+                activity_id, response_timeout,
+                self.conversation, self.aad_token, send_time,
             )
         except Exception as e:
             log.error("Read response failed: %s", e)
@@ -2139,35 +2272,31 @@ class CopilotBaseUser(User):
 
         _base_label   = self.profile.get("display_name", self.profile.get("username", ""))
         profile_label = f"{_base_label} #{self._spawn_num}"
-        # metric key includes base profile so each profile gets its own dashboard row
         _metric_name  = f"Copilot Response — {_base_label} · {self.scenario_name}"
 
-        _uc = _active_dashboard._current_users if _active_dashboard is not None else 0
+        _uc = _run_state.dashboard._current_users if _run_state.dashboard is not None else 0
         if response.timed_out:
             if response.ws_closed:
-                # Stream closed by DirectLine infrastructure — not a bot failure.
-                # Already logged to events CSV in read_response. Don't fire an error
-                # metric, don't write a timed_out row, don't touch consecutive_timeouts.
+                # DirectLine closed the stream — not a bot failure. Reconnect silently.
                 self._refresh_stream()
                 return
-            # Genuine bot timeout: bot received the message but did not reply in time.
             _log_request(profile_label, self._idx, self.scenario_name,
                          self.conversation.id, utterance, "",
                          send_time, response.latency_ms, timed_out=True,
                          user_count=_uc)
             _fire_metric(self.environment, _metric_name, response.latency_ms,
                          error=Exception("No bot reply received"))
-            if _active_dashboard is not None:
-                _active_dashboard.on_utterance(
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_utterance(
                     utterance, self.scenario_name, id(self), profile_label,
                     self._idx, len(self.utterances), response.latency_ms, True)
             self._consecutive_timeouts += 1
             if self._consecutive_timeouts >= 2:
-                if _active_dashboard is not None:
-                    _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
+                if _run_state.dashboard is not None:
+                    _run_state.dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
                 _log_event("✗", "timeout", f"2 consecutive timeouts — {profile_label}")
-                self._open_conversation()   # resets _idx and _consecutive_timeouts
-            return  # stay alive; advance to next utterance
+                self._open_conversation()
+            return
 
         bot_text = " | ".join(
             a.get("text", "").strip()
@@ -2180,8 +2309,8 @@ class CopilotBaseUser(User):
                      user_count=_uc)
         self._consecutive_timeouts = 0
         _fire_metric(self.environment, _metric_name, response.latency_ms)
-        if _active_dashboard is not None:
-            _active_dashboard.on_utterance(
+        if _run_state.dashboard is not None:
+            _run_state.dashboard.on_utterance(
                 utterance, self.scenario_name, id(self), profile_label,
                 self._idx, len(self.utterances), response.latency_ms, False,
                 bot_response=bot_text)
@@ -2198,7 +2327,8 @@ def _make_user_class(class_name: str, utterances: list[str], scenario: str, prof
     def send(self):
         self._send_and_measure()
     send.__name__ = "send"
-    return type(class_name, (CopilotBaseUser,), {
+    base = CopilotHttpUser if test_config["transport"] == "http" else CopilotBaseUser
+    return type(class_name, (base,), {
         "utterances":    utterances,
         "scenario_name": scenario,
         "fixed_profile": profile,
@@ -2297,144 +2427,9 @@ def read_response_http(
 
 
 class CopilotHttpUser(CopilotBaseUser):
-    """HTTP polling transport variant. Inherits all auth, logging, and metrics
-    from CopilotBaseUser — only _open_conversation and _send_and_measure differ."""
-
+    """HTTP polling transport. Inherits all auth, logging, and metrics from CopilotBaseUser."""
     abstract = True
-
-    def _open_conversation(self):
-        self.ws = None
-        self._consecutive_timeouts = 0
-        self.aad_token = None
-        if _user_auth_required():
-            try:
-                self.aad_token = get_valid_token(self.profile["username"])
-            except RuntimeError as e:
-                log.error("Auth failed for %s: %s", self.profile["username"], e)
-                raise StopUser()
-
-        try:
-            dl_token = _retry_call(lambda: fetch_directline_token(self.aad_token))
-        except Exception as e:
-            log.error("DirectLine token fetch failed after retries: %s", e)
-            _fire_metric(self.environment, "Fetch Token", 0, error=e)
-            raise StopUser()
-
-        try:
-            self.conversation = _retry_call(lambda: start_conversation(dl_token))
-        except Exception as e:
-            log.error("Start conversation failed after retries: %s", e)
-            _fire_metric(self.environment, "Start Conversation", 0, error=e)
-            raise StopUser()
-
-        self._idx = 0
-
-    def on_stop(self):
-        pass  # no WebSocket to close
-
-    def _send_and_measure(self):
-        if self._idx >= len(self.utterances):
-            raise StopUser()
-        utterance = self.utterances[self._idx]
-        self._idx += 1
-
-        # Check circuit before sending
-        if _is_circuit_open():
-            gevent.sleep(1)
-            return
-
-        # Send with error classification
-        for _attempt in range(2):
-            try:
-                activity_id, send_time = send_utterance(self.conversation, utterance)
-                break
-            except requests.exceptions.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
-                    _trip_circuit()
-                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
-                    gevent.sleep(1)
-                    return  # stay alive, circuit will clear in 60s
-                if _attempt == 1:
-                    log.error("Send utterance failed: %s", e)
-                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
-                    raise StopUser()
-                gevent.sleep(1)
-            except Exception as e:
-                if _attempt == 1:
-                    log.error("Send utterance failed: %s", e)
-                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
-                    raise StopUser()
-                gevent.sleep(1)
-
-        try:
-            response = read_response_http(
-                self.conversation, activity_id,
-                response_timeout=max(15.0, test_config.get("response_timeout", 30.0)),
-                aad_token=self.aad_token,
-                send_time=send_time,
-            )
-        except Exception as e:
-            log.error("HTTP poll failed: %s", e)
-            _fire_metric(self.environment, "Copilot Response", 0, error=e)
-            raise StopUser()
-
-        _base_label   = self.profile.get("display_name", self.profile.get("username", ""))
-        profile_label = f"{_base_label} #{self._spawn_num}"
-        _metric_name  = f"Copilot Response — {_base_label} · {self.scenario_name}"
-
-        _uc = _active_dashboard._current_users if _active_dashboard is not None else 0
-        if response.timed_out:
-            _log_request(profile_label, self._idx, self.scenario_name,
-                         self.conversation.id, utterance, "",
-                         send_time, response.latency_ms, timed_out=True,
-                         user_count=_uc)
-            _fire_metric(self.environment, _metric_name,
-                         response.latency_ms, error=Exception("No bot reply received"))
-            if _active_dashboard is not None:
-                _active_dashboard.on_utterance(
-                    utterance, self.scenario_name, id(self), profile_label,
-                    self._idx, len(self.utterances), response.latency_ms, True)
-            self._consecutive_timeouts += 1
-            if self._consecutive_timeouts >= 2:
-                if _active_dashboard is not None:
-                    _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
-                _log_event("✗", "timeout", f"2 consecutive timeouts — {profile_label}")
-                self._open_conversation()
-            return  # stay alive; advance to next utterance
-
-        bot_text = " | ".join(
-            a.get("text", "").strip()
-            for a in response.activities
-            if a.get("text", "").strip()
-        )[:500]
-        _log_request(profile_label, self._idx, self.scenario_name,
-                     self.conversation.id, utterance, bot_text,
-                     send_time, response.latency_ms, timed_out=False,
-                     user_count=_uc)
-        self._consecutive_timeouts = 0
-        _fire_metric(self.environment, _metric_name, response.latency_ms)
-        if _active_dashboard is not None:
-            _active_dashboard.on_utterance(
-                utterance, self.scenario_name, id(self), profile_label,
-                self._idx, len(self.utterances), response.latency_ms, False,
-                bot_response=bot_text)
-        gevent.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
-
-        if self._idx >= len(self.utterances):
-            raise StopUser()
-
-
-def _make_http_user_class(class_name: str, utterances: list[str], scenario: str, profile: dict) -> type:
-    def send(self):
-        self._send_and_measure()
-    send.__name__ = "send"
-    return type(class_name, (CopilotHttpUser,), {
-        "utterances":    utterances,
-        "scenario_name": scenario,
-        "fixed_profile": profile,
-        "weight":        1,
-        "send":          task(send),
-    })
+    _transport_cls = _HttpTransport
 
 
 # Strategy: one Locust user class per (CSV × profile) combination.
@@ -2444,7 +2439,6 @@ def _make_http_user_class(class_name: str, utterances: list[str], scenario: str,
 
 _pinned     = {p["scenario"]: p for p in _profiles_list if p.get("scenario")}
 _free       = [p for p in _profiles_list if not p.get("scenario")] or [{}]
-_factory    = _make_http_user_class if test_config["transport"] == "http" else _make_user_class
 
 for _csv in _csv_files:
     _scenario    = _csv.stem.replace("_", " ").title()
@@ -2461,7 +2455,7 @@ for _csv in _csv_files:
     for _pi, _profile in enumerate(_profiles_for_csv):
         # Unique class name: ScenarioUser if single profile, ScenarioUser_2 etc.
         _class_name = _base_name if _pi == 0 else f"{_base_name}_{_pi + 1}"
-        globals()[_class_name] = _factory(_class_name, _utterances, _scenario, _profile)
+        globals()[_class_name] = _make_user_class(_class_name, _utterances, _scenario, _profile)
 
 
 # ── Live dashboard ────────────────────────────────────────────────────────────
@@ -2671,9 +2665,9 @@ def _error_sparkline(errs: list, width: int = 20, bucket_s: float = 30.0) -> str
     return line[-width:].ljust(width, "▁")
 
 
-def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState") -> Table:
+def _compute_dashboard_vm(snap: dict, runner, params: dict, state: "_DashboardState") -> dict:
+    """Pure metrics computation. No Rich objects. Returns a view-model dict for _render_dashboard."""
     elapsed  = int(time.time() - state.start_time)
-    h, m, s  = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
     target   = params["users"]
     curr     = getattr(runner, "user_count", 0)
     p95_tgt  = state.p95_target
@@ -2704,6 +2698,118 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
     p95_bar   = "█" * p95_fill + "░" * (10 - p95_fill)
     p95_warn  = " ⚠" if all_p95 > p95_tgt else ""
 
+    _spawn_done = elapsed >= (target / max(1, params.get("spawn_rate", 1))) * 60
+    if _spawn_done and curr < target:
+        phase_label, phase_style = "FINISHING",  "bold yellow"
+    elif curr >= target:
+        phase_label, phase_style = "AT PEAK  ",  "bold green"
+    else:
+        phase_label, phase_style = "RAMPING UP", "bold white"
+
+    # Ramp data
+    ramps      = snap.get("ramps", [])
+    _finalized = [r for r in ramps if not r.get("active")]
+    _active_r  = [r for r in ramps if r.get("active")]
+    ramps_disp = (_finalized + _active_r)[-5:]
+    events_by_ramp: dict = {}
+    for _ev in snap.get("events", []):
+        if isinstance(_ev, dict):
+            events_by_ramp.setdefault(_ev.get("ramp", 0), []).append(_ev)
+    knee_ramp = -1
+    if len(_finalized) >= 3:
+        _knee_idx = _find_knee([r["rps"] for r in _finalized])
+        if _knee_idx >= 0 and _finalized[_knee_idx]["rps"] >= _DIRECTLINE_RPS_CAP * 0.75:
+            knee_ramp = _finalized[_knee_idx]["ramp"]
+
+    # Per-scenario rows for profile table
+    scenario_rows = []
+    for scenario, times in sorted(snap["times"].items()):
+        tout  = snap["tout"].get(scenario, 0)
+        reqs  = len(times) + tout
+        p50_v = _pct(times, 0.50)
+        p95_v = _pct(times, 0.95)
+        p99_v = _pct(times, 0.99)
+        rcol  = "bold red" if p95_v > p95_tgt else "white"
+        disp  = state.profile_map.get(scenario, "")
+        label = f"{disp} · {scenario}" if disp else scenario
+        spark = _sparkline(snap["scenario_ts"].get(scenario, []))
+        scenario_rows.append((label, reqs, p50_v, p95_v, p99_v, tout, rcol, spark))
+
+    all_spark = _sparkline(snap["ts"])
+    err_spark = _error_sparkline(snap["errs"])
+
+    # Utterance merging
+    _utt_merged: dict = {}
+    for key, times in snap["utt_times"].items():
+        parts = key.split("||", 2)
+        if len(parts) == 3:
+            profile_k, scenario_k, utt = parts
+        elif len(parts) == 2:
+            scenario_k, utt = parts
+            profile_k = state.profile_map.get(scenario_k, scenario_k)
+        else:
+            profile_k, scenario_k, utt = "", "", key
+        tout_u = snap["utt_tout"].get(key, 0)
+        mk = (scenario_k, utt)
+        if mk not in _utt_merged:
+            _utt_merged[mk] = {"times": [], "tout": 0,
+                                "worst_profile": profile_k, "worst_p95": 0, "worst_response": ""}
+        _utt_merged[mk]["times"].extend(times)
+        _utt_merged[mk]["tout"] += tout_u
+        inst_p95 = _pct(times, 0.95)
+        if inst_p95 > _utt_merged[mk]["worst_p95"]:
+            _utt_merged[mk]["worst_p95"]     = inst_p95
+            _utt_merged[mk]["worst_profile"] = profile_k
+            _utt_merged[mk]["worst_response"] = snap.get("utt_response", {}).get(key, "")
+    utt_data = [
+        (utt, d["worst_profile"], d["times"], d["tout"], d["worst_response"])
+        for (_sc, utt), d in _utt_merged.items()
+    ]
+
+    p_events = [ev for ev in snap.get("events", []) if isinstance(ev, dict) and ev.get("icon") != "▶"]
+
+    return {
+        "elapsed": elapsed, "h": elapsed // 3600, "m": (elapsed % 3600) // 60, "s": elapsed % 60,
+        "target": target, "curr": curr, "p95_tgt": p95_tgt,
+        "all_p50": all_p50, "all_p95": all_p95, "all_p99": all_p99,
+        "all_reqs": all_reqs, "all_tout": all_tout,
+        "err_rate": err_rate, "rps": rps,
+        "health": health, "hcol": hcol,
+        "spawn_bar": spawn_bar, "p95_bar": p95_bar, "p95_warn": p95_warn,
+        "phase_label": phase_label, "phase_style": phase_style,
+        "ramps": ramps, "ramps_disp": ramps_disp,
+        "finalized_count": len(_finalized),
+        "knee_ramp": knee_ramp, "events_by_ramp": events_by_ramp,
+        "scenario_rows": scenario_rows,
+        "all_spark": all_spark, "err_spark": err_spark,
+        "utt_data": utt_data,
+        "p_events": p_events,
+        "cpu_warn_active": time.time() - _run_state.cpu_warn_ts < 120,
+        "circuit_open": _is_circuit_open(),
+        "circuit_remaining": max(0, int(_run_state.circuit_open_until - time.time())),
+    }
+
+
+def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState") -> Table:
+    vm = _compute_dashboard_vm(snap, runner, params, state)
+    h, m, s   = vm["h"], vm["m"], vm["s"]
+    curr      = vm["curr"]
+    target    = vm["target"]
+    p95_tgt   = vm["p95_tgt"]
+    all_p95   = vm["all_p95"]
+    all_p50   = vm["all_p50"]
+    all_p99   = vm["all_p99"]
+    all_reqs  = vm["all_reqs"]
+    all_tout  = vm["all_tout"]
+    err_rate  = vm["err_rate"]
+    rps       = vm["rps"]
+    health    = vm["health"]
+    hcol      = vm["hcol"]
+    spawn_bar = vm["spawn_bar"]
+    p95_bar   = vm["p95_bar"]
+    p95_warn  = vm["p95_warn"]
+    elapsed   = vm["elapsed"]
+
     root = Table.grid(expand=True, padding=(0, 0))
     root.add_column()
 
@@ -2720,16 +2826,9 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
     root.add_row(Panel(hdr, border_style="cyan", padding=(0, 1)))
 
     # ── Spawning bar (own line) ───────────────────────────────────────────────
-    _spawn_done = elapsed >= (target / max(1, params.get("spawn_rate", 1))) * 60
-    if _spawn_done and curr < target:
-        _phase_label, _phase_style = "FINISHING", "bold yellow"
-    elif curr >= target:
-        _phase_label, _phase_style = "AT PEAK  ", "bold green"
-    else:
-        _phase_label, _phase_style = "RAMPING UP", "bold white"
     root.add_row(Text(
-        f"  {_phase_label}  {spawn_bar}  {curr} / {target} users",
-        style=_phase_style,
+        f"  {vm['phase_label']}  {spawn_bar}  {curr} / {target} users",
+        style=vm["phase_style"],
     ))
     # ── Config FYI ───────────────────────────────────────────────────────────
     root.add_row(Text(
@@ -2743,28 +2842,24 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         f"p95: [{p95_bar}] {all_p95}ms / {p95_tgt}ms{p95_warn}",
         style="bold white",
     ))
-    if time.time() - _cpu_warn_ts < 120:
+    if vm["cpu_warn_active"]:
         root.add_row(Text(
             "  ⚠ CPU >90%  —  Locust may give inaccurate latency readings; "
             "consider reducing users or spawning fewer per second",
             style="bold red",
         ))
-    if _is_circuit_open():
-        remaining = int(_circuit_open_until - time.time())
+    if vm["circuit_open"]:
         root.add_row(Text(
             f"  ⚡ CIRCUIT OPEN — DirectLine rate limit (429) hit — "
-            f"all users paused — resuming in {remaining}s",
+            f"all users paused — resuming in {vm['circuit_remaining']}s",
             style="bold red on dark_red",
         ))
 
     # ── Ramp steps ───────────────────────────────────────────────────────────
-    ramps = snap.get("ramps", [])
-    if ramps:
-        _finalized = [r for r in ramps if not r.get("active")]
-        _active    = [r for r in ramps if r.get("active")]
-        ramps_disp = (_finalized + _active)[-5:]   # last 5 rows total
+    ramps_disp = vm["ramps_disp"]
+    if vm["ramps"]:
         root.add_row(Text(
-            f"  RAMP STEPS  ({len(_finalized)} completed)",
+            f"  RAMP STEPS  ({vm['finalized_count']} completed)",
             style="bold cyan",
         ))
         st = Table(show_header=True, header_style="bold cyan",
@@ -2778,33 +2873,18 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         st.add_column("p99",      justify="right", min_width=6)
         st.add_column("T/O",      justify="right", min_width=5)
         st.add_column("Throttle", justify="right", min_width=8)
-        # Group events by ramp number for sub-row insertion
-        _events_by_ramp: dict = {}
-        for _ev in snap.get("events", []):
-            if isinstance(_ev, dict):
-                _events_by_ramp.setdefault(_ev.get("ramp", 0), []).append(_ev)
-
-        # Knee detection on all finalized ramps (need >= 3 to be meaningful)
-        _all_ramps = _finalized + _active
-        _knee_ramp = -1
-        if len(_finalized) >= 3:
-            _knee_idx = _find_knee([r["rps"] for r in _finalized])
-            if _knee_idx >= 0 and _finalized[_knee_idx]["rps"] >= _DIRECTLINE_RPS_CAP * 0.75:
-                _knee_ramp = _finalized[_knee_idx]["ramp"]
+        events_by_ramp = vm["events_by_ramp"]
+        knee_ramp      = vm["knee_ramp"]
 
         for s in ramps_disp:
-            live  = s.get("active", False)
-            is_knee = (s["ramp"] == _knee_ramp)
-            past_knee = (
-                _knee_ramp >= 0 and
-                s["ramp"] > _knee_ramp and
-                not live
-            )
-            p95c  = "bold red" if s["p95"] > state.p95_target else ("bold yellow" if is_knee else ("cyan" if live else "white"))
+            live      = s.get("active", False)
+            is_knee   = (s["ramp"] == knee_ramp)
+            past_knee = knee_ramp >= 0 and s["ramp"] > knee_ramp and not live
+            p95c  = "bold red" if s["p95"] > p95_tgt else ("bold yellow" if is_knee else ("cyan" if live else "white"))
             toc   = "bold red" if s["timeouts"] > 0 else ("cyan" if live else "white")
             rlc   = "bold red" if s.get("rate_limited", 0) > 0 else ("cyan" if live else "white")
             knee_marker = " ◀" if is_knee else ("  !" if past_knee else "")
-            rn    = f'▶ {s["ramp"]}' if live else f'{s["ramp"]}{knee_marker}'
+            rn     = f'▶ {s["ramp"]}' if live else f'{s["ramp"]}{knee_marker}'
             rstyle = "bold cyan" if live else ("bold yellow" if is_knee else "dim")
             st.add_row(
                 Text(rn,                 style="bold cyan" if live else ("bold yellow" if is_knee else "white")),
@@ -2817,17 +2897,16 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
                 Text(str(s["timeouts"]), style=toc),
                 Text(str(s.get("rate_limited", 0)), style=rlc),
             )
-            for _ev in _events_by_ramp.get(s["ramp"], []):
+            for _ev in events_by_ramp.get(s["ramp"], []):
                 _ic = _ev["icon"]
                 if _ic == "▶":
-                    continue   # ramp-start events belong in the EVENTS panel, not here
+                    continue
                 _es = "bold red" if _ic in ("⚡", "✗") else ("bold yellow" if _ic == "⚠" else "dim")
                 st.add_row(
                     Text(f"    {_ev['ts']}  {_ic}  {_ev['message']}", style=_es),
                     Text(""), Text(""), Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
                 )
         root.add_row(st)
-        # ── Ramp trend — one bar per row shown in the table above ────────────
         if len(ramps_disp) >= 2:
             def _ramp_spark(values: list) -> str:
                 blocks = "▁▂▃▄▅▆▇█"
@@ -2858,15 +2937,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
     tbl.add_column("T/O",      justify="right", min_width=5)
     tbl.add_column("p95 / 30s buckets", min_width=22)
 
-    for scenario, times in sorted(snap["times"].items()):
-        tout    = snap["tout"].get(scenario, 0)
-        reqs    = len(times) + tout
-        p50_v   = _pct(times, 0.50)
-        p95_v   = _pct(times, 0.95)
-        p99_v   = _pct(times, 0.99)
-        rcol    = "bold red" if p95_v > p95_tgt else "white"
-        disp    = state.profile_map.get(scenario, "")
-        label   = f"{disp} · {scenario}" if disp else scenario
+    for label, reqs, p50_v, p95_v, p99_v, tout, rcol, spark in vm["scenario_rows"]:
         tbl.add_row(
             Text(label, style=rcol),
             Text(str(reqs),  style=rcol),
@@ -2874,10 +2945,9 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
             Text(str(p95_v), style=rcol),
             Text(str(p99_v)),
             Text(str(tout),  style="bold red" if tout > 0 else "white"),
-            Text(_sparkline(snap["scenario_ts"].get(scenario, [])), style="cyan"),
+            Text(spark, style="cyan"),
         )
 
-    all_spark = _sparkline(snap["ts"])
     tbl.add_row(
         Text("ALL USERS", style="bold white"),
         Text(str(all_reqs), style="bold white"),
@@ -2885,47 +2955,18 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         Text(str(all_p95),  style="bold red" if all_p95 > p95_tgt else "bold white"),
         Text(str(all_p99),  style="bold white"),
         Text(str(all_tout), style="bold red" if all_tout > 0 else "bold white"),
-        Text(all_spark,     style="bold cyan"),
+        Text(vm["all_spark"], style="bold cyan"),
     )
     root.add_row(tbl)
     root.add_row(Text(
         "  Trend column: each bar = p95 latency in a 30s window  ·  taller bar = slower responses  ·  ▁ low  █ high",
         style=f"color({_G_DIM})",
     ))
-    root.add_row(Text(f"  {_error_sparkline(snap['errs'])}  error rate  (bar height = errors in bucket)", style="red"))
+    root.add_row(Text(f"  {vm['err_spark']}  error rate  (bar height = errors in bucket)", style="red"))
     root.add_row(Text(""))
-    # ── Utterance tables ──────────────────────────────────────────────────────
-    # Group by (scenario, utterance) across all profile instances.
-    # Track combined times/timeouts but surface the single worst-p95 instance
-    # in the Profile column so the user can see exactly who is lagging.
-    _utt_merged: dict = {}
-    for key, times in snap["utt_times"].items():
-        parts = key.split("||", 2)
-        if len(parts) == 3:
-            profile_k, scenario_k, utt = parts
-        elif len(parts) == 2:
-            scenario_k, utt = parts
-            profile_k = state.profile_map.get(scenario_k, scenario_k)
-        else:
-            profile_k, scenario_k, utt = "", "", key
-        tout_u = snap["utt_tout"].get(key, 0)
-        mk = (scenario_k, utt)
-        if mk not in _utt_merged:
-            _utt_merged[mk] = {"times": [], "tout": 0,
-                                "worst_profile": profile_k, "worst_p95": 0,
-                                "worst_response": ""}
-        _utt_merged[mk]["times"].extend(times)
-        _utt_merged[mk]["tout"] += tout_u
-        inst_p95 = _pct(times, 0.95)
-        if inst_p95 > _utt_merged[mk]["worst_p95"]:
-            _utt_merged[mk]["worst_p95"] = inst_p95
-            _utt_merged[mk]["worst_profile"] = profile_k
-            _utt_merged[mk]["worst_response"] = snap.get("utt_response", {}).get(key, "")
-    utt_data = [
-        (utt, d["worst_profile"], d["times"], d["tout"], d["worst_response"])
-        for (_sc, utt), d in _utt_merged.items()
-    ]
 
+    # ── Utterance tables ──────────────────────────────────────────────────────
+    utt_data = vm["utt_data"]
     if utt_data:
         slowest = sorted(utt_data, key=lambda x: _pct(x[2], 0.95), reverse=True)
         fastest = sorted(utt_data, key=lambda x: _pct(x[2], 0.95))
@@ -2955,41 +2996,30 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         ut.add_column("p95",          justify="right", min_width=6)
         ut.add_column("Count",        justify="right", min_width=6)
         ut.add_column("Bot Response", min_width=40)
-        ut.add_row(
-            Text("── slowest ──", style="dim"),
-            Text("", style="dim"), Text("", style="dim"),
-            Text("", style="dim"), Text("", style="dim"),
-            Text("", style="dim"),
-        )
+        ut.add_row(Text("── slowest ──", style="dim"),
+                   Text(""), Text(""), Text(""), Text(""), Text(""))
         _utt_rows(ut, slowest, "bold red")
-        ut.add_row(
-            Text("── fastest ──", style="dim"),
-            Text("", style="dim"), Text("", style="dim"),
-            Text("", style="dim"), Text("", style="dim"),
-            Text("", style="dim"),
-        )
+        ut.add_row(Text("── fastest ──", style="dim"),
+                   Text(""), Text(""), Text(""), Text(""), Text(""))
         _utt_rows(ut, fastest, "bold green")
         root.add_row(ut)
 
-
     # ── Events feed ───────────────────────────────────────────────────────────
-    events = snap.get("events", [])
-    p_events = [ev for ev in events if isinstance(ev, dict) and ev.get("icon") != "▶"]
-    if p_events:
+    if vm["p_events"]:
         root.add_row(Text("  EVENTS", style="bold cyan"))
-        for ev in p_events[:8]:
+        for ev in vm["p_events"][:8]:
             icon = ev.get("icon", "")
             if icon == "⚡":
-                prefix = "[P0] "
-                style  = "bold red"
+                prefix, style = "[P0] ", "bold red"
             elif icon in ("✗", "⚠"):
                 prefix = "[P1] "
                 style  = "bold yellow" if icon == "⚠" else "red"
             else:
-                prefix = ""
-                style  = "dim"
-            entry = f"  {ev['ts']}  R{ev['ramp']}  {icon}  {prefix}{ev['message']}"
-            root.add_row(Text(entry, style=style))
+                prefix, style = "", "dim"
+            root.add_row(Text(
+                f"  {ev['ts']}  R{ev['ramp']}  {icon}  {prefix}{ev['message']}",
+                style=style,
+            ))
 
     # ── Acronym legend ────────────────────────────────────────────────────────
     legend = (
@@ -3449,7 +3479,6 @@ if __name__ == "__main__":
 
     while True:
         _params = _collect_run_params()
-        _init_detail_log()
 
         _profile_map = {
             cls.scenario_name: cls.fixed_profile.get(
@@ -3465,7 +3494,7 @@ if __name__ == "__main__":
             p95_target=test_config["p95_target_ms"],
             profile_map=_profile_map,
         )
-        _active_dashboard = _dash
+        _run_state.dashboard = _dash
         _env.events.request.add_listener(_dash.on_request)
         _init_session(_params["users"])
         _runner.start(user_count=_params["users"], spawn_rate=max(0.01, _params["spawn_rate"] / 60))
@@ -3516,6 +3545,9 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+        # Flush CSV writer before reading files for audit / report
+        _csv_writer.stop()
+
         # Restore logging now that the live display is gone
         logging.root.setLevel(_prev_log_level)
         logging.root.removeHandler(_null_handler)
@@ -3523,14 +3555,16 @@ if __name__ == "__main__":
         # Print final dashboard snapshot to normal screen — options appear below it
         _final_snap = _dash.snapshot()
         console.print(_render_dashboard(_final_snap, _runner, _params, _dash))
-        if _detail_log_path and _detail_log_path.exists():
-            _audit(_detail_log_path, _final_snap)
+        _detail_path = _csv_writer.detail_path
+        _events_path = _csv_writer.events_path
+        if _detail_path and _detail_path.exists():
+            _audit(_detail_path, _final_snap)
 
-        _active_dashboard = None
+        _run_state.dashboard = None
         with _spawn_lock:
             _spawn_counters.clear()
 
-        if _detail_log_path and _detail_log_path.exists():
+        if _detail_path and _detail_path.exists():
             try:
                 sys.stdout.write("\n  ⏳  Generating report…\n")
                 sys.stdout.flush()
@@ -3539,12 +3573,12 @@ if __name__ == "__main__":
                 _rep = _with_spinner(
                     "Generating HTML report…",
                     lambda: _gen_report(
-                        _detail_log_path,
+                        _detail_path,
                         p95_target=test_config["p95_target_ms"],
                         notes=_run_notes,
                         response_timeout=test_config["response_timeout"],
                         silence_timeout=_SILENCE_TIMEOUT,
-                        events_csv=_events_log_path,
+                        events_csv=_events_path,
                     ),
                 )
                 _gprint(f"  Report → {_rep}", fg=_G_CYAN, bold=True, padding="0 2", margin="0 1")
