@@ -1926,6 +1926,8 @@ class _CpuWarnHandler(logging.Handler):
         global _cpu_warn_ts
         if "CPU usage above" in self.format(record):
             _cpu_warn_ts = time.time()
+            if _active_dashboard is not None:
+                _active_dashboard.on_event("⚠", "CPU >90% — latency readings may be distorted")
 
 _cpu_warn_handler = _CpuWarnHandler()
 _cpu_warn_handler.setLevel(logging.WARNING)
@@ -2038,8 +2040,10 @@ class CopilotBaseUser(User):
                     utterance, self.scenario_name, id(self), profile_label,
                     self._idx, len(self.utterances), response.latency_ms, True)
             self._consecutive_timeouts += 1
-            if self._consecutive_timeouts >= 3:
-                log.warning("3 consecutive timeouts — reopening conversation for %s", profile_label)
+            if self._consecutive_timeouts >= 2:
+                log.warning("2 consecutive timeouts — reopening conversation for %s", profile_label)
+                if _active_dashboard is not None:
+                    _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
                 self._open_conversation()   # resets _idx and _consecutive_timeouts
             return  # stay alive; advance to next utterance
 
@@ -2249,8 +2253,10 @@ class CopilotHttpUser(CopilotBaseUser):
                     utterance, self.scenario_name, id(self), profile_label,
                     self._idx, len(self.utterances), response.latency_ms, True)
             self._consecutive_timeouts += 1
-            if self._consecutive_timeouts >= 3:
-                log.warning("3 consecutive timeouts — reopening conversation for %s", profile_label)
+            if self._consecutive_timeouts >= 2:
+                log.warning("2 consecutive timeouts — reopening conversation for %s", profile_label)
+                if _active_dashboard is not None:
+                    _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
                 self._open_conversation()
             return  # stay alive; advance to next utterance
 
@@ -2334,7 +2340,7 @@ class _DashboardState:
         self._utt_tout:    dict[str, int]                 = {}
         self._utt_response: dict[str, str]               = {}  # worst-instance bot reply per key
         self._users:       dict[int, dict]                = {}
-        self.feed          = collections.deque(maxlen=8)
+        self.events        = collections.deque(maxlen=20)
         # Ramp tracking — one row per 60-second window, added when next window starts
         self._current_users:    int         = 0
         self._ramp_window:      float       = 60.0
@@ -2387,6 +2393,7 @@ class _DashboardState:
                 self._cur_ramp_ms    = []
                 self._cur_ramp_tout  = 0
                 self._cur_ramp_users = self._current_users
+                self.on_event("▶", f"Ramp {self._cur_ramp_idx} started — {self._current_users} users")
             self._cur_ramp_users = self._current_users
             if is_err:
                 self._cur_ramp_tout += 1
@@ -2412,11 +2419,11 @@ class _DashboardState:
                 if len(prev) == 1 or response_ms >= max(prev[:-1]):
                     self._utt_response[key] = bot_response
             self._users[user_id] = {"name": display, "idx": idx, "total": total}
-            self.feed.appendleft(f"  → {display:<20} [{bar}] {idx:>2}/{total}  {status}")
 
-    def add_feed(self, msg: str):
+    def on_event(self, icon: str, message: str):
+        ts = datetime.now().strftime("%H:%M:%S")
         with self._lock:
-            self.feed.appendleft(msg)
+            self.events.appendleft(f"  {ts}  {icon}  {message}")
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -2448,7 +2455,7 @@ class _DashboardState:
                 "utt_times":    {k: list(v) for k, v in self._utt_times.items()},
                 "utt_tout":     dict(self._utt_tout),
                 "utt_response": dict(self._utt_response),
-                "feed":         list(self.feed),
+                "events":       list(self.events),
                 "ramps":       ramps,
             }
 
@@ -2547,7 +2554,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
             style="bold red",
         ))
 
-    # ── Ramp steps — cap display so LIVE FEED stays visible ──────────────────
+    # ── Ramp steps ───────────────────────────────────────────────────────────
     ramps = snap.get("ramps", [])
     if ramps:
         _finalized = [r for r in ramps if not r.get("active")]
@@ -2725,11 +2732,18 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         root.add_row(ut)
 
 
-    # ── Live feed ─────────────────────────────────────────────────────────────
-    root.add_row(Text("  LIVE FEED", style="bold cyan"))
-    for entry in list(snap["feed"])[:5]:
-        style = "bold red" if "timeout" in entry else ("bold yellow" if "spawned" in entry else "white")
-        root.add_row(Text(entry, style=style))
+    # ── Events feed ───────────────────────────────────────────────────────────
+    events = snap.get("events", [])
+    if events:
+        root.add_row(Text("  EVENTS", style="bold cyan"))
+        for entry in events[:8]:
+            if "⚡" in entry or "✗" in entry:
+                style = "bold red"
+            elif "⚠" in entry:
+                style = "bold yellow"
+            else:
+                style = "dim"
+            root.add_row(Text(entry, style=style))
 
     # ── Acronym legend ────────────────────────────────────────────────────────
     legend = (
