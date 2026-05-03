@@ -419,8 +419,10 @@ def read_response(
             _log_event("⚠", "ws_closed", "DirectLine closed WebSocket")
             return Response(activities=[], latency_ms=(time.time()-start_time)*1000,
                             timed_out=True, ws_closed=True)
-        except (websocket.WebSocketException, OSError):
-            _log_event("⚠", "ws_error", "Unexpected stream error — reconnecting")
+        except (websocket.WebSocketException, OSError) as _exc:
+            if _active_dashboard is not None:
+                _active_dashboard.on_event("⚠", f"Stream error ({type(_exc).__name__}) — reconnecting")
+            _log_event("⚠", "ws_error", f"Stream error: {type(_exc).__name__}")
             return Response(activities=[], latency_ms=(time.time()-start_time)*1000,
                             timed_out=True, ws_closed=True)
 
@@ -2139,6 +2141,13 @@ class CopilotBaseUser(User):
 
         _uc = _active_dashboard._current_users if _active_dashboard is not None else 0
         if response.timed_out:
+            if response.ws_closed:
+                # Stream closed by DirectLine infrastructure — not a bot failure.
+                # Already logged to events CSV in read_response. Don't fire an error
+                # metric, don't write a timed_out row, don't touch consecutive_timeouts.
+                self._refresh_stream()
+                return
+            # Genuine bot timeout: bot received the message but did not reply in time.
             _log_request(profile_label, self._idx, self.scenario_name,
                          self.conversation.id, utterance, "",
                          send_time, response.latency_ms, timed_out=True,
@@ -2149,16 +2158,12 @@ class CopilotBaseUser(User):
                 _active_dashboard.on_utterance(
                     utterance, self.scenario_name, id(self), profile_label,
                     self._idx, len(self.utterances), response.latency_ms, True)
-            if response.ws_closed:
-                # DirectLine terminated the stream — refresh token+stream, keep conversation context
-                self._refresh_stream()
-            else:
-                self._consecutive_timeouts += 1
-                if self._consecutive_timeouts >= 2:
-                    if _active_dashboard is not None:
-                        _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
-                    _log_event("✗", "timeout", f"2 consecutive timeouts — {profile_label}")
-                    self._open_conversation()   # resets _idx and _consecutive_timeouts
+            self._consecutive_timeouts += 1
+            if self._consecutive_timeouts >= 2:
+                if _active_dashboard is not None:
+                    _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
+                _log_event("✗", "timeout", f"2 consecutive timeouts — {profile_label}")
+                self._open_conversation()   # resets _idx and _consecutive_timeouts
             return  # stay alive; advance to next utterance
 
         bot_text = " | ".join(
