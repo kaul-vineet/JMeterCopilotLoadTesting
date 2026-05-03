@@ -2993,6 +2993,8 @@ def _audit(csv_path: Path, snapshot: dict):
     all_ok = True
 
     # ── 1. Timestamp recheck ─────────────────────────────────────────
+    # NOTE: response_received_at is derived from send_time + response_ms/1000 (see _log_request).
+    # This check verifies that CSV serialisation round-trips cleanly, not measurement independence.
     try:
         import pandas as pd
         df = pd.read_csv(csv_path)
@@ -3000,19 +3002,19 @@ def _audit(csv_path: Path, snapshot: dict):
             sent = pd.to_datetime(df["utterance_sent_at"], utc=True, errors="coerce")
             recv = pd.to_datetime(df["response_received_at"], utc=True, errors="coerce")
             df["_recomputed_ms"] = (recv - sent).dt.total_seconds() * 1000
-            df["_delta"] = (df["_recomputed_ms"] - df["response_ms"]).abs()
+            df["_delta"] = (df["_recomputed_ms"] - df["response_ms"].astype(float)).abs()
             bad = (df["_delta"] > 10).sum()
             max_delta = int(df["_delta"].max())
             total = len(df)
             if bad == 0:
-                console.print(Text(f"  Timestamp recheck      {total} / {total} rows agree  (max delta: {max_delta}ms)   ✓", style="green"))
+                console.print(Text(f"  Timestamp round-trip   {total} / {total} rows agree  (max delta: {max_delta}ms)   ✓  [derived — not independent]", style="green"))
             else:
-                console.print(Text(f"  Timestamp recheck      {bad} / {total} rows diverge >10ms  (max delta: {max_delta}ms)   ✗", style="bold red"))
+                console.print(Text(f"  Timestamp round-trip   {bad} / {total} rows diverge >10ms  (max delta: {max_delta}ms)   ✗", style="bold red"))
                 all_ok = False
         else:
-            console.print(Text("  Timestamp recheck      skipped — CSV missing timestamp columns", style="dim"))
+            console.print(Text("  Timestamp round-trip   skipped — CSV missing timestamp columns", style="dim"))
     except Exception as e:
-        console.print(Text(f"  Timestamp recheck      error: {e}", style="dim"))
+        console.print(Text(f"  Timestamp round-trip   error: {e}", style="dim"))
 
     # ── 2. Count reconciliation ──────────────────────────────────────
     try:
@@ -3065,6 +3067,63 @@ def _audit(csv_path: Path, snapshot: dict):
             console.print(Text("  Profile sum check      skipped — CSV missing profile column", style="dim"))
     except Exception as e:
         console.print(Text(f"  Profile sum check      error: {e}", style="dim"))
+
+    # ── 5. WS closure vs timeout classification ──────────────────────
+    # ws_closed events must be a strict subset of timed_out rows.
+    # If ws_closed > timed_out, a closure was not recorded as a timeout — counting bug.
+    _events_csv = csv_path.parent / csv_path.name.replace("detail_", "events_")
+    if _events_csv.exists():
+        try:
+            import pandas as pd
+            edf = pd.read_csv(_events_csv)
+            ws_closed_count = int((edf["event_type"] == "ws_closed").sum())
+            ddf = pd.read_csv(csv_path)
+            timed_out_count = int((ddf["timed_out"].astype(str) == "1").sum()) if "timed_out" in ddf.columns else 0
+            if ws_closed_count <= timed_out_count:
+                console.print(Text(
+                    f"  WS close vs T/O        ws_closed={ws_closed_count} ≤ timed_out={timed_out_count}   ✓",
+                    style="green"))
+            else:
+                console.print(Text(
+                    f"  WS close vs T/O        ws_closed={ws_closed_count} > timed_out={timed_out_count}  ← ws_close not counted as T/O   ✗",
+                    style="bold red"))
+                all_ok = False
+        except Exception as e:
+            console.print(Text(f"  WS close vs T/O        error: {e}", style="dim"))
+    else:
+        console.print(Text("  WS close vs T/O        skipped — events CSV not found", style="dim"))
+
+    # ── 6. Response time bounds sanity ───────────────────────────────
+    # Non-timeout rows must be < (response_timeout + silence_timeout + 2s buffer).
+    # Timeout rows must be ≥ response_timeout. Both must be > 0.
+    try:
+        import pandas as pd
+        ddf = pd.read_csv(csv_path) if "ddf" not in dir() else ddf
+        if "response_ms" in ddf.columns and "timed_out" in ddf.columns:
+            _rt_ms    = test_config.get("response_timeout", 30.0) * 1000
+            _ceiling  = _rt_ms + _SILENCE_TIMEOUT * 1000 + 2000
+            ms        = ddf["response_ms"].astype(float)
+            is_to     = ddf["timed_out"].astype(str) == "1"
+            neg       = int((ms < 0).sum())
+            over_ceil = int((ms > _ceiling).sum())
+            to_too_fast = int((is_to & (ms < _rt_ms * 0.9)).sum())
+            if neg == 0 and over_ceil == 0 and to_too_fast == 0:
+                console.print(Text(
+                    f"  Response time bounds   all {len(ddf)} rows in [0, {int(_ceiling)}ms]   ✓",
+                    style="green"))
+            else:
+                parts = []
+                if neg:          parts.append(f"{neg} negative")
+                if over_ceil:    parts.append(f"{over_ceil} > ceiling {int(_ceiling)}ms")
+                if to_too_fast:  parts.append(f"{to_too_fast} T/O rows faster than 90% of timeout")
+                console.print(Text(
+                    f"  Response time bounds   anomalies: {', '.join(parts)}   ✗",
+                    style="bold red"))
+                all_ok = False
+        else:
+            console.print(Text("  Response time bounds   skipped — CSV missing required columns", style="dim"))
+    except Exception as e:
+        console.print(Text(f"  Response time bounds   error: {e}", style="dim"))
 
     console.print(Text("  " + "─" * 65, style="dim"))
     if not all_ok:
