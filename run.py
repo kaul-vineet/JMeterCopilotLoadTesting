@@ -753,7 +753,7 @@ def _wizard_rocket_float():
     os.system("cls" if os.name == "nt" else "clear")
 
 
-def _with_spinner(title: str, fn, *, spinner: str = "dot"):
+def _with_spinner(title: str, fn, *, spinner: str = "dot", timeout: float = 120.0):
     """Run fn() while showing a gum spinner. Returns fn's result, re-raises exceptions."""
     done  = threading.Event()
     box   = [None, None]   # [result, exception]
@@ -769,17 +769,17 @@ def _with_spinner(title: str, fn, *, spinner: str = "dot"):
     threading.Thread(target=_worker, daemon=True).start()
     spin = subprocess.Popen(
         ["gum", "spin",
-         "--spinner",            spinner,
-         "--title",              f"  {title}",
-         "--spinner.foreground", _G_CYAN,
-         "--title.foreground",   _G_WHITE],
+         "--spinner", spinner,
+         "--title",   f"  {title}"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         env=_GUM_ENV,
     )
-    done.wait()
+    finished = done.wait(timeout=timeout)
     spin.terminate()
     spin.wait()
     print()
+    if not finished:
+        raise TimeoutError(f"'{title}' did not complete within {int(timeout)}s")
     if box[1]:
         raise box[1]
     return box[0]
@@ -1894,6 +1894,32 @@ def _fire_metric(environment, name: str, latency_ms: float, error: Exception = N
     )
 
 
+def _retry_call(fn, attempts: int = 3, base_delay: float = 1.0):
+    """Call fn() up to `attempts` times with exponential back-off + jitter (gevent-safe)."""
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if i == attempts - 1:
+                raise
+            delay = base_delay * (2 ** i) + random.uniform(0, 1)
+            gevent.sleep(delay)
+
+
+# Show a dashboard warning when Locust reports high CPU
+_cpu_warn_ts: float = 0.0
+
+class _CpuWarnHandler(logging.Handler):
+    def emit(self, record):
+        global _cpu_warn_ts
+        if "CPU usage above" in self.format(record):
+            _cpu_warn_ts = time.time()
+
+_cpu_warn_handler = _CpuWarnHandler()
+_cpu_warn_handler.setLevel(logging.WARNING)
+logging.getLogger("locust.runners").addHandler(_cpu_warn_handler)
+
+
 class CopilotBaseUser(User):
     abstract       = True
     utterances     = []   # class-level list, set per subclass — read-only
@@ -1902,9 +1928,10 @@ class CopilotBaseUser(User):
 
     def on_start(self):
         self.profile = self.__class__.fixed_profile
-        self.ws           = None
-        self.conversation = None
-        self._idx         = 0
+        self.ws                    = None
+        self.conversation          = None
+        self._idx                  = 0
+        self._consecutive_timeouts = 0
         with _spawn_lock:
             key = self.__class__.__name__
             _spawn_counters[key] = _spawn_counters.get(key, 0) + 1
@@ -1916,6 +1943,7 @@ class CopilotBaseUser(User):
         if self.ws:
             close_websocket(self.ws)
             self.ws = None
+        self._consecutive_timeouts = 0
 
         self.aad_token = None
         if _user_auth_required():
@@ -1926,23 +1954,23 @@ class CopilotBaseUser(User):
                 raise StopUser()
 
         try:
-            dl_token = fetch_directline_token(self.aad_token)
+            dl_token = _retry_call(lambda: fetch_directline_token(self.aad_token))
         except Exception as e:
-            log.error("DirectLine token fetch failed: %s", e)
+            log.error("DirectLine token fetch failed after retries: %s", e)
             _fire_metric(self.environment, "Fetch Token", 0, error=e)
             raise StopUser()
 
         try:
-            self.conversation = start_conversation(dl_token)
+            self.conversation = _retry_call(lambda: start_conversation(dl_token))
         except Exception as e:
-            log.error("Start conversation failed: %s", e)
+            log.error("Start conversation failed after retries: %s", e)
             _fire_metric(self.environment, "Start Conversation", 0, error=e)
             raise StopUser()
 
         try:
-            self.ws = open_websocket(self.conversation.stream_url)
+            self.ws = _retry_call(lambda: open_websocket(self.conversation.stream_url))
         except Exception as e:
-            log.error("WebSocket open failed: %s", e)
+            log.error("WebSocket open failed after retries: %s", e)
             _fire_metric(self.environment, "Open WebSocket", 0, error=e)
             raise StopUser()
 
@@ -1957,7 +1985,10 @@ class CopilotBaseUser(User):
         self._idx += 1
 
         try:
-            activity_id, send_time = send_utterance(self.conversation, utterance)
+            activity_id, send_time = _retry_call(
+                lambda: send_utterance(self.conversation, utterance),
+                attempts=2, base_delay=1.0,
+            )
         except Exception as e:
             log.error("Send utterance failed: %s", e)
             _fire_metric(self.environment, "Send Utterance", 0, error=e)
@@ -1994,7 +2025,11 @@ class CopilotBaseUser(User):
                 _active_dashboard.on_utterance(
                     utterance, self.scenario_name, id(self), profile_label,
                     self._idx, len(self.utterances), response.latency_ms, True)
-            raise StopUser()
+            self._consecutive_timeouts += 1
+            if self._consecutive_timeouts >= 3:
+                log.warning("3 consecutive timeouts — reopening conversation for %s", profile_label)
+                self._open_conversation()   # resets _idx and _consecutive_timeouts
+            return  # stay alive; advance to next utterance
 
         bot_text = " | ".join(
             a.get("text", "").strip()
@@ -2005,6 +2040,7 @@ class CopilotBaseUser(User):
                      self.conversation.id, utterance, bot_text,
                      send_time, response.latency_ms, timed_out=False,
                      user_count=_uc)
+        self._consecutive_timeouts = 0
         _fire_metric(self.environment, _metric_name, response.latency_ms)
         if _active_dashboard is not None:
             _active_dashboard.on_utterance(
@@ -2130,6 +2166,7 @@ class CopilotHttpUser(CopilotBaseUser):
 
     def _open_conversation(self):
         self.ws = None
+        self._consecutive_timeouts = 0
         self.aad_token = None
         if _user_auth_required():
             try:
@@ -2139,16 +2176,16 @@ class CopilotHttpUser(CopilotBaseUser):
                 raise StopUser()
 
         try:
-            dl_token = fetch_directline_token(self.aad_token)
+            dl_token = _retry_call(lambda: fetch_directline_token(self.aad_token))
         except Exception as e:
-            log.error("DirectLine token fetch failed: %s", e)
+            log.error("DirectLine token fetch failed after retries: %s", e)
             _fire_metric(self.environment, "Fetch Token", 0, error=e)
             raise StopUser()
 
         try:
-            self.conversation = start_conversation(dl_token)
+            self.conversation = _retry_call(lambda: start_conversation(dl_token))
         except Exception as e:
-            log.error("Start conversation failed: %s", e)
+            log.error("Start conversation failed after retries: %s", e)
             _fire_metric(self.environment, "Start Conversation", 0, error=e)
             raise StopUser()
 
@@ -2162,7 +2199,10 @@ class CopilotHttpUser(CopilotBaseUser):
         self._idx += 1
 
         try:
-            activity_id, send_time = send_utterance(self.conversation, utterance)
+            activity_id, send_time = _retry_call(
+                lambda: send_utterance(self.conversation, utterance),
+                attempts=2, base_delay=1.0,
+            )
         except Exception as e:
             log.error("Send utterance failed: %s", e)
             _fire_metric(self.environment, "Send Utterance", 0, error=e)
@@ -2196,7 +2236,11 @@ class CopilotHttpUser(CopilotBaseUser):
                 _active_dashboard.on_utterance(
                     utterance, self.scenario_name, id(self), profile_label,
                     self._idx, len(self.utterances), response.latency_ms, True)
-            raise StopUser()
+            self._consecutive_timeouts += 1
+            if self._consecutive_timeouts >= 3:
+                log.warning("3 consecutive timeouts — reopening conversation for %s", profile_label)
+                self._open_conversation()
+            return  # stay alive; advance to next utterance
 
         bot_text = " | ".join(
             a.get("text", "").strip()
@@ -2207,6 +2251,7 @@ class CopilotHttpUser(CopilotBaseUser):
                      self.conversation.id, utterance, bot_text,
                      send_time, response.latency_ms, timed_out=False,
                      user_count=_uc)
+        self._consecutive_timeouts = 0
         _fire_metric(self.environment, _metric_name, response.latency_ms)
         if _active_dashboard is not None:
             _active_dashboard.on_utterance(
@@ -2483,6 +2528,12 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         f"p95: [{p95_bar}] {all_p95}ms / {p95_tgt}ms{p95_warn}",
         style="bold white",
     ))
+    if time.time() - _cpu_warn_ts < 120:
+        root.add_row(Text(
+            "  ⚠ CPU >90%  —  Locust may give inaccurate latency readings; "
+            "consider reducing users or spawning fewer per second",
+            style="bold red",
+        ))
 
     # ── Ramp steps — cap display so LIVE FEED stays visible ──────────────────
     ramps = snap.get("ramps", [])
@@ -2938,12 +2989,14 @@ if __name__ == "__main__":
             _runner.greenlet.join(timeout=8)   # don't hang if a user greenlet is mid-sleep
         except Exception:
             pass
+
+        # Print final dashboard snapshot to normal screen — options appear below it
+        _final_snap = _dash.snapshot()
+        console.print(_render_dashboard(_final_snap, _runner, _params, _dash))
+
         _active_dashboard = None
         with _spawn_lock:
             _spawn_counters.clear()
-
-        os.system("cls" if os.name == "nt" else "clear")
-        _celebrate("Test complete")
 
         if _detail_log_path and _detail_log_path.exists():
             try:
