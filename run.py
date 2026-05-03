@@ -386,6 +386,7 @@ def read_response(
     response_timeout: float = 30.0,
     conversation: Optional[Conversation] = None,
     aad_token: Optional[str] = None,
+    send_time: Optional[float] = None,
 ) -> Response:
     """
     Reads WebSocket frames until the bot replies to activity_id.
@@ -393,9 +394,10 @@ def read_response(
     seconds after the last reply before declaring the response complete.
     When conversation + aad_token are provided, handles signin/tokenExchange
     invokes automatically so SSO-authenticated bots work without manual sign-in.
+    send_time: wall-clock time when send_utterance fired the POST (for true e2e latency).
     """
     matched, last_match_time = [], None
-    start_time = time.time()
+    start_time = send_time or time.time()
 
     while True:
         now       = time.time()
@@ -406,15 +408,19 @@ def read_response(
         )
         if remaining <= 0:
             break
-        ws.settimeout(remaining)
         try:
+            ws.settimeout(remaining)
             raw = ws.recv()
         except websocket.WebSocketTimeoutException:
             break
         except websocket.WebSocketConnectionClosedException:
             if _active_dashboard is not None:
-                _active_dashboard.on_event("⚠", f"DirectLine closed WebSocket mid-reply — reconnecting")
-            _log_event("⚠", "ws_closed", "DirectLine closed WebSocket mid-reply")
+                _active_dashboard.on_event("⚠", "DirectLine closed WebSocket — reconnecting")
+            _log_event("⚠", "ws_closed", "DirectLine closed WebSocket")
+            return Response(activities=[], latency_ms=(time.time()-start_time)*1000,
+                            timed_out=True, ws_closed=True)
+        except (websocket.WebSocketException, OSError):
+            _log_event("⚠", "ws_error", "Unexpected stream error — reconnecting")
             return Response(activities=[], latency_ms=(time.time()-start_time)*1000,
                             timed_out=True, ws_closed=True)
 
@@ -2119,6 +2125,7 @@ class CopilotBaseUser(User):
                 response_timeout=response_timeout,
                 conversation=self.conversation,
                 aad_token=self.aad_token,
+                send_time=send_time,
             )
         except Exception as e:
             log.error("Read response failed: %s", e)
@@ -2202,10 +2209,11 @@ def read_response_http(
     activity_id: str,
     response_timeout: float = 30.0,
     aad_token: Optional[str] = None,
+    send_time: Optional[float] = None,
 ) -> Response:
     matched: list[dict]       = []
     last_match_time           = None
-    start_time                = time.time()
+    start_time                = send_time or time.time()
     watermark: Optional[str]  = None
 
     while time.time() - start_time < response_timeout:
@@ -2355,6 +2363,7 @@ class CopilotHttpUser(CopilotBaseUser):
                 self.conversation, activity_id,
                 response_timeout=max(15.0, test_config.get("response_timeout", 30.0)),
                 aad_token=self.aad_token,
+                send_time=send_time,
             )
         except Exception as e:
             log.error("HTTP poll failed: %s", e)
