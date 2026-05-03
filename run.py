@@ -130,7 +130,8 @@ TOKEN_ENDPOINT      = _load_credential("CS_TOKEN_ENDPOINT")
 ENDPOINT_NEEDS_AUTH = _load_credential("CS_TOKEN_ENDPOINT_REQUIRES_AUTH").lower() == "true"
 DIRECTLINE_BASE = "https://directline.botframework.com"
 
-_SILENCE_TIMEOUT = 15.0   # seconds of silence after last bot reply before declaring response complete
+_SILENCE_TIMEOUT    = 15.0    # seconds of silence after last bot reply before declaring response complete
+_DIRECTLINE_RPS_CAP = 133.0   # 8000 RPM hard ceiling — knee only meaningful above 75% of this
 
 _GUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -283,7 +284,8 @@ class Conversation:
 class Response:
     activities: list[dict]
     latency_ms: float
-    timed_out: bool
+    timed_out:  bool
+    ws_closed:  bool = False   # DirectLine terminated the stream before bot replied
 
 
 def fetch_directline_token(aad_token: Optional[str] = None) -> str:
@@ -316,6 +318,21 @@ def start_conversation(dl_token: str) -> Conversation:
     resp.raise_for_status()
     data = resp.json()
     return Conversation(id=data["conversationId"], token=data["token"], stream_url=data["streamUrl"])
+
+
+def refresh_stream(conversation: Conversation) -> websocket.WebSocket:
+    """Renew the DirectLine token and reconnect the WebSocket on the same conversation.
+    Bot context is preserved — only the stream URL changes."""
+    resp = _session.post(
+        f"{DIRECTLINE_BASE}/v3/directline/tokens/refresh",
+        headers={"Authorization": f"Bearer {conversation.token}"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    conversation.token      = data["token"]
+    conversation.stream_url = data["streamUrl"]
+    return _retry_call(lambda: open_websocket(conversation.stream_url))
 
 
 def open_websocket(stream_url: str) -> websocket.WebSocket:
@@ -395,8 +412,11 @@ def read_response(
         except websocket.WebSocketTimeoutException:
             break
         except websocket.WebSocketConnectionClosedException:
-            log.warning("WebSocket connection closed by DirectLine")
-            break
+            if _active_dashboard is not None:
+                _active_dashboard.on_event("⚠", f"DirectLine closed WebSocket mid-reply — reconnecting")
+            _log_event("⚠", "ws_closed", "DirectLine closed WebSocket mid-reply")
+            return Response(activities=[], latency_ms=(time.time()-start_time)*1000,
+                            timed_out=True, ws_closed=True)
 
         if not raw:
             continue
@@ -1843,13 +1863,15 @@ def _on_locust_init(environment, **kwargs):
 # File: report/detail_YYYYMMDD_HHMMSS.csv  (new file per test run)
 
 _detail_log_path: Path | None = None
+_events_log_path: Path | None = None
 _detail_lock = threading.Lock()
 
 
 def _init_detail_log():
-    global _detail_log_path
+    global _detail_log_path, _events_log_path
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     _detail_log_path = REPORT_DIR / f"detail_{ts}.csv"
+    _events_log_path = REPORT_DIR / f"events_{ts}.csv"
     with open(_detail_log_path, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerow([
             "profile", "event_number", "scenario", "conversation_id",
@@ -1857,6 +1879,8 @@ def _init_detail_log():
             "utterance_sent_at", "response_received_at", "response_ms",
             "timed_out", "user_count",
         ])
+    with open(_events_log_path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(["timestamp", "elapsed_s", "icon", "event_type", "message", "ramp"])
     log.info("Detail log → %s", _detail_log_path)
 
 
@@ -1878,6 +1902,22 @@ def _log_request(profile: str, event_number: int, scenario: str, conv_id: str,
     with _detail_lock:
         with open(_detail_log_path, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(row)
+
+
+def _log_event(icon: str, event_type: str, message: str):
+    if not _events_log_path:
+        return
+    ramp = 0
+    if _active_dashboard is not None:
+        with _active_dashboard._lock:
+            ramp = _active_dashboard._cur_ramp_idx + 1
+    elapsed = 0.0
+    if _active_dashboard is not None:
+        elapsed = round(time.time() - _active_dashboard.start_time, 1)
+    ts = datetime.now().strftime("%H:%M:%S")
+    with _detail_lock:
+        with open(_events_log_path, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([ts, elapsed, icon, event_type, message, ramp])
 
 
 @events.test_start.add_listener
@@ -1943,6 +1983,7 @@ def _trip_circuit():
     if _active_dashboard is not None:
         _active_dashboard.on_event("⚡", "429 rate limit hit — circuit open for 60s")
         _active_dashboard.on_429()
+    _log_event("⚡", "rate_limit", "429 rate limit hit — circuit open for 60s")
     log.warning("Circuit breaker tripped — all users pausing 60s")
 
 def _is_circuit_open() -> bool:
@@ -1956,6 +1997,7 @@ class _CpuWarnHandler(logging.Handler):
             _cpu_warn_ts = time.time()
             if _active_dashboard is not None:
                 _active_dashboard.on_event("⚠", "CPU >90% — latency readings may be distorted")
+            _log_event("⚠", "cpu_warn", "CPU >90% — latency readings may be distorted")
 
 _cpu_warn_handler = _CpuWarnHandler()
 _cpu_warn_handler.setLevel(logging.WARNING)
@@ -2017,12 +2059,24 @@ class CopilotBaseUser(User):
             raise StopUser()
 
         self._idx = 0
+        self._stream_opened_at = time.time()
+
+    def _refresh_stream(self):
+        """Refresh DirectLine token + stream URL — same conversation, bot context preserved."""
+        try:
+            self.ws = _retry_call(lambda: refresh_stream(self.conversation))
+            self._stream_opened_at = time.time()
+        except Exception as e:
+            _fire_metric(self.environment, "Refresh Stream", 0, error=e)
+            self._open_conversation()   # fallback: start fresh if refresh fails
 
     def on_stop(self):
         if self.ws:
             close_websocket(self.ws)
 
     def _send_and_measure(self):
+        if self._idx >= len(self.utterances):
+            raise StopUser()
         utterance = self.utterances[self._idx]
         self._idx += 1
 
@@ -2030,6 +2084,10 @@ class CopilotBaseUser(User):
         if _is_circuit_open():
             gevent.sleep(1)
             return
+
+        # Proactively refresh stream if it is older than 45s — before it expires mid-reply
+        if time.time() - getattr(self, "_stream_opened_at", 0) > 45:
+            self._refresh_stream()
 
         # Send with error classification
         for _attempt in range(2):
@@ -2074,7 +2132,6 @@ class CopilotBaseUser(User):
 
         _uc = _active_dashboard._current_users if _active_dashboard is not None else 0
         if response.timed_out:
-            log.warning("No bot reply received for activity %s", activity_id)
             _log_request(profile_label, self._idx, self.scenario_name,
                          self.conversation.id, utterance, "",
                          send_time, response.latency_ms, timed_out=True,
@@ -2085,12 +2142,16 @@ class CopilotBaseUser(User):
                 _active_dashboard.on_utterance(
                     utterance, self.scenario_name, id(self), profile_label,
                     self._idx, len(self.utterances), response.latency_ms, True)
-            self._consecutive_timeouts += 1
-            if self._consecutive_timeouts >= 2:
-                log.warning("2 consecutive timeouts — reopening conversation for %s", profile_label)
-                if _active_dashboard is not None:
-                    _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
-                self._open_conversation()   # resets _idx and _consecutive_timeouts
+            if response.ws_closed:
+                # DirectLine terminated the stream — refresh token+stream, keep conversation context
+                self._refresh_stream()
+            else:
+                self._consecutive_timeouts += 1
+                if self._consecutive_timeouts >= 2:
+                    if _active_dashboard is not None:
+                        _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
+                    _log_event("✗", "timeout", f"2 consecutive timeouts — {profile_label}")
+                    self._open_conversation()   # resets _idx and _consecutive_timeouts
             return  # stay alive; advance to next utterance
 
         bot_text = " | ".join(
@@ -2111,9 +2172,8 @@ class CopilotBaseUser(User):
                 bot_response=bot_text)
         gevent.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
-        # All utterances sent — close this conversation and open a fresh one
         if self._idx >= len(self.utterances):
-            self._open_conversation()
+            raise StopUser()
 
 
 # Dynamically create one User class per CSV file found in utterances/.
@@ -2257,6 +2317,8 @@ class CopilotHttpUser(CopilotBaseUser):
         pass  # no WebSocket to close
 
     def _send_and_measure(self):
+        if self._idx >= len(self.utterances):
+            raise StopUser()
         utterance = self.utterances[self._idx]
         self._idx += 1
 
@@ -2305,7 +2367,6 @@ class CopilotHttpUser(CopilotBaseUser):
 
         _uc = _active_dashboard._current_users if _active_dashboard is not None else 0
         if response.timed_out:
-            log.warning("No bot reply received for activity %s", activity_id)
             _log_request(profile_label, self._idx, self.scenario_name,
                          self.conversation.id, utterance, "",
                          send_time, response.latency_ms, timed_out=True,
@@ -2318,9 +2379,9 @@ class CopilotHttpUser(CopilotBaseUser):
                     self._idx, len(self.utterances), response.latency_ms, True)
             self._consecutive_timeouts += 1
             if self._consecutive_timeouts >= 2:
-                log.warning("2 consecutive timeouts — reopening conversation for %s", profile_label)
                 if _active_dashboard is not None:
                     _active_dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
+                _log_event("✗", "timeout", f"2 consecutive timeouts — {profile_label}")
                 self._open_conversation()
             return  # stay alive; advance to next utterance
 
@@ -2343,7 +2404,7 @@ class CopilotHttpUser(CopilotBaseUser):
         gevent.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
         if self._idx >= len(self.utterances):
-            self._open_conversation()
+            raise StopUser()
 
 
 def _make_http_user_class(class_name: str, utterances: list[str], scenario: str, profile: dict) -> type:
@@ -2460,7 +2521,7 @@ class _DashboardState:
                 self._cur_ramp_tout  = 0
                 self._cur_ramp_429   = 0
                 self._cur_ramp_users = self._current_users
-                self.on_event("▶", f"Ramp {self._cur_ramp_idx} started — {self._current_users} users")
+                self.on_event("▶", f"Ramp {self._cur_ramp_idx + 1} — {self._current_users} users")
             self._cur_ramp_users = self._current_users
             if is_err:
                 self._cur_ramp_tout += 1
@@ -2544,6 +2605,25 @@ def _pct(values: list, p: float) -> int:
     return int(s[min(int(len(s) * p), len(s) - 1)])
 
 
+def _find_knee(values: list) -> int:
+    """Return index of the knee point using perpendicular distance from the line start→end.
+    Returns -1 if too few points to detect a knee."""
+    n = len(values)
+    if n < 3:
+        return -1
+    x0, y0 = 0.0, float(values[0])
+    x1, y1 = float(n - 1), float(values[n - 1])
+    dx, dy = x1 - x0, y1 - y0
+    length = (dx * dx + dy * dy) ** 0.5
+    if length == 0:
+        return -1
+    distances = [
+        abs(dy * i - dx * float(values[i]) + x1 * y0 - y1 * x0) / length
+        for i in range(n)
+    ]
+    return distances.index(max(distances))
+
+
 def _sparkline(ts: list, width: int = 20, bucket_s: float = 30.0) -> str:
     if not ts:
         return "▁" * width
@@ -2608,9 +2688,16 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
     root.add_row(Panel(hdr, border_style="cyan", padding=(0, 1)))
 
     # ── Spawning bar (own line) ───────────────────────────────────────────────
+    _spawn_done = elapsed >= (target / max(1, params.get("spawn_rate", 1))) * 60
+    if _spawn_done and curr < target:
+        _phase_label, _phase_style = "FINISHING", "bold yellow"
+    elif curr >= target:
+        _phase_label, _phase_style = "AT PEAK  ", "bold green"
+    else:
+        _phase_label, _phase_style = "RAMPING UP", "bold white"
     root.add_row(Text(
-        f"  SPAWNING  {spawn_bar}  {curr} / {target} users",
-        style="bold white",
+        f"  {_phase_label}  {spawn_bar}  {curr} / {target} users",
+        style=_phase_style,
     ))
     # ── Config FYI ───────────────────────────────────────────────────────────
     root.add_row(Text(
@@ -2658,22 +2745,37 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         st.add_column("p95",      justify="right", min_width=6)
         st.add_column("p99",      justify="right", min_width=6)
         st.add_column("T/O",      justify="right", min_width=5)
-        st.add_column("429",      justify="right", min_width=5)
+        st.add_column("Throttle", justify="right", min_width=8)
         # Group events by ramp number for sub-row insertion
         _events_by_ramp: dict = {}
         for _ev in snap.get("events", []):
             if isinstance(_ev, dict):
                 _events_by_ramp.setdefault(_ev.get("ramp", 0), []).append(_ev)
 
+        # Knee detection on all finalized ramps (need >= 3 to be meaningful)
+        _all_ramps = _finalized + _active
+        _knee_ramp = -1
+        if len(_finalized) >= 3:
+            _knee_idx = _find_knee([r["rps"] for r in _finalized])
+            if _knee_idx >= 0 and _finalized[_knee_idx]["rps"] >= _DIRECTLINE_RPS_CAP * 0.75:
+                _knee_ramp = _finalized[_knee_idx]["ramp"]
+
         for s in ramps_disp:
             live  = s.get("active", False)
-            p95c  = "bold red" if s["p95"] > state.p95_target else ("cyan" if live else "white")
+            is_knee = (s["ramp"] == _knee_ramp)
+            past_knee = (
+                _knee_ramp >= 0 and
+                s["ramp"] > _knee_ramp and
+                not live
+            )
+            p95c  = "bold red" if s["p95"] > state.p95_target else ("bold yellow" if is_knee else ("cyan" if live else "white"))
             toc   = "bold red" if s["timeouts"] > 0 else ("cyan" if live else "white")
             rlc   = "bold red" if s.get("rate_limited", 0) > 0 else ("cyan" if live else "white")
-            rn    = f'▶ {s["ramp"]}' if live else str(s["ramp"])
-            rstyle = "bold cyan" if live else "dim"
+            knee_marker = " ◀" if is_knee else ("  !" if past_knee else "")
+            rn    = f'▶ {s["ramp"]}' if live else f'{s["ramp"]}{knee_marker}'
+            rstyle = "bold cyan" if live else ("bold yellow" if is_knee else "dim")
             st.add_row(
-                Text(rn,                 style="bold cyan" if live else "white"),
+                Text(rn,                 style="bold cyan" if live else ("bold yellow" if is_knee else "white")),
                 Text(str(s["users"]),    style=rstyle),
                 Text(str(s["requests"]), style=rstyle),
                 Text(f'{s["rps"]:.2f}',  style=rstyle),
@@ -2685,20 +2787,21 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
             )
             for _ev in _events_by_ramp.get(s["ramp"], []):
                 _ic = _ev["icon"]
+                if _ic == "▶":
+                    continue   # ramp-start events belong in the EVENTS panel, not here
                 _es = "bold red" if _ic in ("⚡", "✗") else ("bold yellow" if _ic == "⚠" else "dim")
                 st.add_row(
                     Text(f"    {_ev['ts']}  {_ic}  {_ev['message']}", style=_es),
                     Text(""), Text(""), Text(""), Text(""), Text(""), Text(""), Text(""), Text(""),
                 )
         root.add_row(st)
-        # ── Ramp trend — one line, one bar per ramp step ─────────────────────
-        all_ramps = _finalized + _active
-        if len(all_ramps) >= 2:
+        # ── Ramp trend — one bar per row shown in the table above ────────────
+        if len(ramps_disp) >= 2:
             def _ramp_spark(values: list) -> str:
                 blocks = "▁▂▃▄▅▆▇█"
                 mx = max(values) or 1
                 return "".join(blocks[min(int(v / mx * 7), 7)] for v in values)
-            _rv = all_ramps  # full history, not the capped display slice
+            _rv = ramps_disp
             root.add_row(Text(
                 f"  RAMP TREND  "
                 f"Users {_ramp_spark([r['users'] for r in _rv])}  "
@@ -2821,6 +2924,12 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         ut.add_column("p95",          justify="right", min_width=6)
         ut.add_column("Count",        justify="right", min_width=6)
         ut.add_column("Bot Response", min_width=40)
+        ut.add_row(
+            Text("── slowest ──", style="dim"),
+            Text("", style="dim"), Text("", style="dim"),
+            Text("", style="dim"), Text("", style="dim"),
+            Text("", style="dim"),
+        )
         _utt_rows(ut, slowest, "bold red")
         ut.add_row(
             Text("── fastest ──", style="dim"),
@@ -2880,7 +2989,9 @@ def _audit(csv_path: Path, snapshot: dict):
         import pandas as pd
         df = pd.read_csv(csv_path)
         if "utterance_sent_at" in df.columns and "response_received_at" in df.columns:
-            df["_recomputed_ms"] = (df["response_received_at"] - df["utterance_sent_at"]) * 1000
+            sent = pd.to_datetime(df["utterance_sent_at"], utc=True, errors="coerce")
+            recv = pd.to_datetime(df["response_received_at"], utc=True, errors="coerce")
+            df["_recomputed_ms"] = (recv - sent).dt.total_seconds() * 1000
             df["_delta"] = (df["_recomputed_ms"] - df["response_ms"]).abs()
             bad = (df["_delta"] > 10).sum()
             max_delta = int(df["_delta"].max())
@@ -2990,21 +3101,52 @@ load ramps up. Use this to find your bot's scaling knee.
 def _collect_run_params() -> dict:
     """Show all run params with defaults pre-filled. User selects any to change."""
     _START = "  ▶  Start test"
-    _NOTES = "  ✎  Add test notes"
     _HELP  = "  ?  Help"
     _EXIT  = "  ✕  Exit"
 
+    # Max utterances across all loaded CSVs — used for script duration estimate
+    _utt_count = max(
+        (len(_load_utterances(f)) for f in _csv_files),
+        default=1,
+    )
+
+    def _estimates(users: int, spawn: int, think: int, timeout: int) -> dict:
+        spawn_safe      = max(1, spawn)
+        ramp_mins       = round(users / spawn_safe, 1)
+        # Each user: utterances × (think + typical response time); use reply_timeout as ceiling
+        script_min_s    = _utt_count * (think + 5)          # optimistic: 5s response
+        script_max_s    = _utt_count * (think + timeout)    # pessimistic: full timeout each turn
+        script_min_m    = round(script_min_s / 60, 1)
+        script_max_m    = round(script_max_s / 60, 1)
+        total_min_m     = round(ramp_mins + script_min_m, 1)
+        total_max_m     = round(ramp_mins + script_max_m, 1)
+        cap_default     = int(total_max_m * 1.25) + 5       # 25% headroom + 5 min floor
+        return dict(
+            ramp_mins=ramp_mins,
+            script_range=f"{script_min_m}–{script_max_m}",
+            total_range=f"{total_min_m}–{total_max_m}",
+            cap_default=cap_default,
+        )
+
+    est = _estimates(
+        test_config["users"], test_config["spawn_rate"],
+        test_config["think_min"], int(test_config["response_timeout"]),
+    )
+
     state = {
-        "users":    test_config["users"],
-        "spawn":    test_config["spawn_rate"],
-        "run_mins": test_config["run_time_mins"],
-        "think":    test_config["think_min"],
-        "timeout":  int(test_config["response_timeout"]),
-        "notes":    "",
+        "users":   test_config["users"],
+        "spawn":   test_config["spawn_rate"],
+        "think":   test_config["think_min"],
+        "timeout": int(test_config["response_timeout"]),
+        "cap":     test_config.get("run_time_mins", est["cap_default"]),
+        "notes":   "",
     }
 
     def _prow(label: str, value, unit: str, hint: str) -> str:
-        return f"    {label:<36}  {str(value):<6} {unit:<8}  {hint}"
+        return f"    {label:<36}  {str(value):<8} {unit:<8}  {hint}"
+
+    def _divider() -> str:
+        return f"    {'─' * 80}"
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
@@ -3015,26 +3157,66 @@ def _collect_run_params() -> dict:
             border_fg="99", padding="1 4", margin="1 0 1 0",
         )
 
+        est = _estimates(state["users"], state["spawn"], state["think"], state["timeout"])
         notes_label = (state["notes"][:40] + "…") if len(state["notes"]) > 40 else (state["notes"] or "none")
+
+        # Indices for selectable items (read-only rows are skipped by index checks below)
+        # 0  Peak users
+        # 1  Spawn rate
+        # 2  Think time
+        # 3  Reply timeout
+        # 4  (divider — not selectable)
+        # 5  (Est. ramp-up — read-only)
+        # 6  (Est. script — read-only)
+        # 7  (Est. total — read-only)
+        # 8  Max run time
+        # 9  (Silence window — read-only)
+        # 10 (Protocol — read-only)
+        # 11 Notes
+        # 12 Start / Help / Exit
+
         items = [
-            _prow("Peak users",                    state["users"],    "users",   "how many hit the bot at the same time"),
-            _prow("Ramp-up rate",                  state["spawn"],    "users/m", "how many new users join per minute"),
-            _prow("Run time",                      state["run_mins"], "minutes", "how long the test runs"),
-            _prow("Wait between messages",         state["think"],    "seconds", "pause each user takes after a reply"),
-            _prow("Reply timeout",                 state["timeout"],  "seconds", "wait this long for first reply (min 15s)"),
-            _prow("Silence window",               _SILENCE_TIMEOUT,  "seconds", "fixed — wait after last reply before declaring done"),
+            _prow("Peak users",
+                  state["users"], "users",
+                  f"Total users spawned — each runs {_utt_count} message(s) then leaves"),
+            _prow("Spawn rate",
+                  state["spawn"], "users/min",
+                  f"New users per minute — 1 user every {round(60/max(1,state['spawn']),0):.0f}s"),
+            _prow("Think time",
+                  state["think"], "seconds",
+                  "How long each user pauses between sending messages (simulates reading time)"),
+            _prow("Reply timeout",
+                  state["timeout"], "seconds",
+                  "Abort and record timeout if bot has not started responding within this long (min 15s)"),
+            _divider(),
+            _prow("  ↳ Est. ramp-up",
+                  est["ramp_mins"], "min",
+                  f"Time until all {state['users']} users are active  ({state['users']} ÷ {state['spawn']}/min)"),
+            _prow("  ↳ Est. script / user",
+                  est["script_range"], "min",
+                  f"{_utt_count} msg × (think {state['think']}s + 5–{state['timeout']}s response)"),
+            _prow("  ↳ Est. total duration",
+                  est["total_range"], "min",
+                  "Ramp-up + last user's script — test ends when all users finish"),
+            _prow("Max run time  (safety cap)",
+                  state["cap"], "min",
+                  "Test force-stops here even if users are still running — set above Est. total"),
+            _prow("Silence window",
+                  int(_SILENCE_TIMEOUT), "seconds",
+                  "Fixed — extra wait after bot's last message before declaring response complete"),
             _prow("Protocol",
-                  "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket",
-                  "",
-                  "set by GRUNTMASTER_TRANSPORT env var" if test_config["transport"] == "http" else "🔒 HTTP polling coming soon"),
-            _prow("Notes",                         notes_label,       "",        "free-text description embedded in report"),
+                  "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket", "",
+                  "set by GRUNTMASTER_TRANSPORT env var" if test_config["transport"] == "http" else "production transport"),
+            _prow("Notes",
+                  notes_label, "",
+                  "Free-text label embedded in the HTML report for this run"),
             _START,
             _HELP,
             _EXIT,
         ]
 
-        choice = _gchoose(*items, header="\n  ↑ ↓  navigate     Enter  select\n",
-                          height=min(len(items) + 4, 18))
+        choice = _gchoose(*items, header="\n  ↑ ↓  navigate     Enter  select     ↳ rows update as you change settings\n",
+                          height=min(len(items) + 4, 22))
 
         if not choice:
             continue
@@ -3060,22 +3242,47 @@ def _collect_run_params() -> dict:
                 return current
 
         if idx == 0:
-            state["users"]    = _edit("How many users hit the bot at the same time? (peak concurrency)", state["users"])
+            state["users"]  = _edit(
+                f"Total users to spawn  (each runs {_utt_count} message(s) once then leaves)\n"
+                f"  Current: {state['users']}",
+                state["users"])
         elif idx == 1:
-            state["spawn"]    = _edit("How many new users join per minute? (e.g. 5 = one new user every 12s, 1 = one per minute)", state["spawn"])
+            state["spawn"]  = max(1, _edit(
+                f"New users per minute  (controls how steeply load ramps up)\n"
+                f"  e.g. 5 = one new user every 12s   1 = one per minute\n"
+                f"  Current: {state['spawn']}",
+                state["spawn"]))
         elif idx == 2:
-            state["run_mins"] = _edit("How long should the test run? (minutes)", state["run_mins"])
+            state["think"]  = max(25, _edit(
+                f"Pause each user takes between messages  (simulates time spent reading the reply)\n"
+                f"  Minimum 25s — shorter pauses are unrealistic and hammer the bot\n"
+                f"  Current: {state['think']}s",
+                state["think"]))
         elif idx == 3:
-            v = _edit("How long does each user pause between messages? (seconds, minimum 25)", state["think"])
-            state["think"] = max(25, v)
-        elif idx == 4:
-            v = _edit("How long to wait for the first bot reply? (seconds, minimum 15)", state["timeout"])
-            state["timeout"] = max(15, v)
-        elif idx == 5:
+            state["timeout"] = max(15, _edit(
+                f"Seconds to wait for the bot's first reply before giving up\n"
+                f"  Minimum 15s — the silence window ({int(_SILENCE_TIMEOUT)}s) adds on top of this\n"
+                f"  Current: {state['timeout']}s",
+                state["timeout"]))
+        elif idx in (4, 5, 6, 7):
+            _gprint(
+                f"  Est. ramp-up {est['ramp_mins']} min  ·  "
+                f"Est. script {est['script_range']} min / user  ·  "
+                f"Est. total {est['total_range']} min\n"
+                f"  These update automatically — change Peak users, Spawn rate, or Think time to adjust.",
+                fg=_G_DIM, padding="0 2",
+            )
+        elif idx == 8:
+            state["cap"] = max(1, _edit(
+                f"Safety cap — test force-stops at this many minutes even if users are still running\n"
+                f"  Set above the Est. total ({est['total_range']} min) to avoid cutting the test short\n"
+                f"  Current: {state['cap']} min",
+                state["cap"]))
+        elif idx == 9:
             _gprint(f"  Silence window is fixed at {int(_SILENCE_TIMEOUT)}s — not configurable.", fg=_G_DIM, padding="0 2")
-        elif idx == 6:
-            _gprint("  HTTP transport is not yet enabled — coming soon.", fg="yellow", padding="0 2")
-        elif idx == 7:
+        elif idx == 10:
+            _gprint("  Protocol is set by the GRUNTMASTER_TRANSPORT environment variable.", fg=_G_DIM, padding="0 2")
+        elif idx == 11:
             if _gum_ok():
                 notes = _gwrite(
                     "Describe this test run…",
@@ -3089,17 +3296,17 @@ def _collect_run_params() -> dict:
                 if v:
                     state["notes"] = v
 
-    test_config["think_min"]     = state["think"]
-    test_config["think_max"]     = state["think"]
+    test_config["think_min"]        = state["think"]
+    test_config["think_max"]        = state["think"]
     test_config["response_timeout"] = max(15.0, float(state["timeout"]))
-    test_config["users"]         = state["users"]
-    test_config["spawn_rate"]    = state["spawn"]
-    test_config["run_time_mins"] = state["run_mins"]
+    test_config["users"]            = state["users"]
+    test_config["spawn_rate"]       = state["spawn"]
+    test_config["run_time_mins"]    = state["cap"]
 
     return {
         "users":      state["users"],
         "spawn_rate": state["spawn"],
-        "run_time":   state["run_mins"] * 60,
+        "run_time":   state["cap"] * 60,
         "notes":      state["notes"],
     }
 
@@ -3193,7 +3400,12 @@ if __name__ == "__main__":
         _kw.start()
 
         os.system("cls" if os.name == "nt" else "clear")
-        with Live(console=console, auto_refresh=False, screen=True) as _live:
+        # Silence all log output to the terminal during the live dashboard — events feed carries what matters
+        _null_handler = logging.NullHandler()
+        logging.root.addHandler(_null_handler)
+        _prev_log_level = logging.root.level
+        logging.root.setLevel(logging.CRITICAL)
+        with Live(console=console, auto_refresh=False, screen=False) as _live:
             _deadline = time.time() + _params["run_time"]
             while time.time() < _deadline and not _stop_run[0]:
                 _curr = getattr(_runner, "user_count", 0)
@@ -3214,6 +3426,10 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+        # Restore logging now that the live display is gone
+        logging.root.setLevel(_prev_log_level)
+        logging.root.removeHandler(_null_handler)
+
         # Print final dashboard snapshot to normal screen — options appear below it
         _final_snap = _dash.snapshot()
         console.print(_render_dashboard(_final_snap, _runner, _params, _dash))
@@ -3232,8 +3448,14 @@ if __name__ == "__main__":
                 _run_notes = _params.get("notes", "")
                 _rep = _with_spinner(
                     "Generating HTML report…",
-                    lambda: _gen_report(_detail_log_path, p95_target=test_config["p95_target_ms"],
-                                        notes=_run_notes),
+                    lambda: _gen_report(
+                        _detail_log_path,
+                        p95_target=test_config["p95_target_ms"],
+                        notes=_run_notes,
+                        response_timeout=test_config["response_timeout"],
+                        silence_timeout=_SILENCE_TIMEOUT,
+                        events_csv=_events_log_path,
+                    ),
                 )
                 _gprint(f"  Report → {_rep}", fg=_G_CYAN, bold=True, padding="0 2", margin="0 1")
             except ImportError:

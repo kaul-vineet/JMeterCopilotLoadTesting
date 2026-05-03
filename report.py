@@ -134,10 +134,31 @@ def _gfile_pick(start: str = ".") -> str:
         return ""
 
 
+def _find_knee(values: list) -> int:
+    """Perpendicular-distance knee detection. Returns index into values, or -1."""
+    n = len(values)
+    if n < 3:
+        return -1
+    x0, y0 = 0.0, float(values[0])
+    x1, y1 = float(n - 1), float(values[n - 1])
+    dx, dy = x1 - x0, y1 - y0
+    length = (dx * dx + dy * dy) ** 0.5
+    if length == 0:
+        return -1
+    distances = [
+        abs(dy * i - dx * float(values[i]) + x1 * y0 - y1 * x0) / length
+        for i in range(n)
+    ]
+    return distances.index(max(distances))
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
-                    notes: str = "") -> Path:
+                    notes: str = "",
+                    response_timeout: float = 30.0,
+                    silence_timeout: float = 15.0,
+                    events_csv: "Path | None" = None) -> Path:
     _require_deps()
     import pandas as pd
     import plotly.graph_objects as go
@@ -152,6 +173,9 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
         df["profile"] = df.get("scenario", "unknown")
     if "scenario" not in df.columns:
         df["scenario"] = "default"
+
+    # Strip spawn number (#N) for summary-level grouping
+    df["base_profile"] = df["profile"].str.replace(r'\s*#\d+$', '', regex=True).str.strip()
 
     has_user_count = "user_count" in df.columns
     if has_user_count:
@@ -187,45 +211,119 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
         RAMP_WINDOW = 60.0
         t0_ramp = df["sent_dt"].min()
         df["_ramp_idx"] = ((df["sent_dt"] - t0_ramp).dt.total_seconds() // RAMP_WINDOW).astype(int)
-        step_rows = []
+
+        # Load events CSV (optional) — group by ramp (1-based)
+        events_by_ramp: dict = {}
+        _eff_events_csv = events_csv
+        if _eff_events_csv is None:
+            # Auto-derive: events_YYYYMMDD_HHMMSS.csv alongside detail_YYYYMMDD_HHMMSS.csv
+            _stem = csv_path.stem.replace("detail_", "events_")
+            _candidate = csv_path.parent / f"{_stem}.csv"
+            if _candidate.exists():
+                _eff_events_csv = _candidate
+        if _eff_events_csv is not None and Path(_eff_events_csv).exists():
+            try:
+                import csv as _csv_mod
+                with open(_eff_events_csv, newline="", encoding="utf-8") as _ef:
+                    for _row in _csv_mod.DictReader(_ef):
+                        _r = int(_row.get("ramp", 0))
+                        events_by_ramp.setdefault(_r, []).append(_row)
+            except Exception:
+                pass
+
+        # Build per-ramp 429 count from events
+        ramp_429: dict = {}
+        for _r, _evs in events_by_ramp.items():
+            ramp_429[_r] = sum(1 for e in _evs if e.get("event_type") == "rate_limit")
+
+        step_data = []
         for ridx, grp in df.groupby("_ramp_idx"):
             ms_grp = grp[grp["timed_out"] == 0]["response_ms"]
             tout   = int(grp["timed_out"].sum())
             count  = len(grp)
-            last_u = int(grp["user_count"].iloc[-1]) if has_user_count else "—"
-            rps    = f"{count / RAMP_WINDOW:.2f}"
+            last_u = int(grp["user_count"].iloc[-1]) if has_user_count else 0
+            rps_v  = count / RAMP_WINDOW
             p50v   = _pct(ms_grp, 0.50)
             p95v   = _pct(ms_grp, 0.95)
             p99v   = _pct(ms_grp, 0.99)
-            p95s   = ' style="color:#ef4444;font-weight:700"' if p95v > p95_target else ""
-            toc    = f'<span style="color:#ef4444">{tout}</span>' if tout else "0"
+            ramp_num = int(ridx) + 1
+            step_data.append(dict(
+                ramp=ramp_num, users=last_u, count=count, rps=rps_v,
+                p50=p50v, p95=p95v, p99=p99v, tout=tout,
+                rate_limited=ramp_429.get(ramp_num, 0),
+                events=events_by_ramp.get(ramp_num, []),
+            ))
+
+        # Knee detection on p95 series
+        _DIRECTLINE_RPS_CAP = 133.0
+        knee_ramp = -1
+        if len(step_data) >= 3:
+            knee_idx = _find_knee([s["rps"] for s in step_data])
+            if knee_idx >= 0 and step_data[knee_idx]["rps"] >= _DIRECTLINE_RPS_CAP * 0.75:
+                knee_ramp = step_data[knee_idx]["ramp"]
+
+        step_rows = []
+        for s in step_data:
+            is_knee   = (s["ramp"] == knee_ramp)
+            past_knee = (knee_ramp >= 0 and s["ramp"] > knee_ramp)
+            if is_knee:
+                row_style = ' style="background:#fefce8;border-left:3px solid #eab308"'
+            elif past_knee:
+                row_style = ' style="background:#fff7f7"'
+            else:
+                row_style = ""
+            p95s = ' style="color:#ef4444;font-weight:700"' if s["p95"] > p95_target else (
+                   ' style="color:#eab308;font-weight:700"' if is_knee else "")
+            toc  = f'<span style="color:#ef4444">{s["tout"]}</span>' if s["tout"] else "0"
+            rlc  = f'<span style="color:#ef4444;font-weight:700">{s["rate_limited"]}</span>' if s["rate_limited"] else "0"
+            knee_label = " ◀ knee" if is_knee else ("  !" if past_knee else "")
             step_rows.append(
-                f'<tr>'
-                f'<td><strong>{int(ridx) + 1}</strong></td>'
-                f'<td>{last_u}</td>'
-                f'<td>{count:,}</td>'
-                f'<td>{rps}</td>'
-                f'<td>{p50v:,}</td><td{p95s}>{p95v:,}</td><td>{p99v:,}</td>'
+                f'<tr{row_style}>'
+                f'<td><strong>{s["ramp"]}</strong>{knee_label}</td>'
+                f'<td>{s["users"]}</td>'
+                f'<td>{s["count"]:,}</td>'
+                f'<td>{s["rps"]:.2f}</td>'
+                f'<td>{s["p50"]:,}</td><td{p95s}>{s["p95"]:,}</td><td>{s["p99"]:,}</td>'
                 f'<td>{toc}</td>'
+                f'<td>{rlc}</td>'
                 f'</tr>'
             )
+            # Event sub-rows
+            for ev in s["events"]:
+                icon = ev.get("icon", "")
+                msg  = ev.get("message", "")
+                ts_e = ev.get("timestamp", "")
+                etype = ev.get("event_type", "")
+                if etype == "rate_limit":
+                    ec = "color:#ef4444"
+                elif etype == "cpu_warn":
+                    ec = "color:#f59e0b"
+                elif etype == "timeout":
+                    ec = "color:#ef4444"
+                else:
+                    ec = "color:#94a3b8"
+                step_rows.append(
+                    f'<tr><td colspan="9" style="padding:2px 14px 2px 28px;font-size:12px;{ec}">'
+                    f'{ts_e}&nbsp;&nbsp;{icon}&nbsp;&nbsp;{msg}</td></tr>'
+                )
         if step_rows:
             ramp_steps_html = (
                 '<h2>Ramp Steps</h2>'
                 '<p class="legend">'
-                'One row per 60-second window — each row is finalised when the next window begins &nbsp;&middot;&nbsp;'
+                'One row per 60-second window &nbsp;&middot;&nbsp;'
                 'USERS = last user count in that window &nbsp;&middot;&nbsp;'
-                'RPS / p50 / p95 / p99 are for that window only'
+                'RPS / p50 / p95 / p99 are for that window only &nbsp;&middot;&nbsp;'
+                '<span style="color:#eab308;font-weight:600">◀ knee</span> = RPS plateaus here — adding users stops increasing throughput'
                 '</p>'
                 '<table><thead><tr>'
                 '<th>Ramp</th><th>Users</th><th>Requests</th><th>RPS</th>'
-                '<th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>T/O</th>'
+                '<th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>T/O</th><th>Throttle</th>'
                 '</tr></thead><tbody>' + "".join(step_rows) + '</tbody></table>'
             )
 
     # ── Profile Summary ───────────────────────────────────────────────────────
     profile_rows_data = []
-    for profile, grp in df.groupby("profile"):
+    for profile, grp in df.groupby("base_profile"):
         ms       = grp[grp["timed_out"] == 0]["response_ms"]
         tout     = int(grp["timed_out"].sum())
         reqs     = len(grp)
@@ -245,7 +343,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
         tout     = int(grp["timed_out"].sum())
         reqs     = len(grp)
         p95v     = _pct(ms, 0.95)
-        profiles_for_scenario = sorted(grp["profile"].unique().tolist())
+        profiles_for_scenario = sorted(grp["base_profile"].unique().tolist())
         scenario_rows_data.append(dict(
             scenario=scenario, profiles=profiles_for_scenario, requests=reqs,
             p50=_pct(ms, 0.50), p95=p95v, p99=_pct(ms, 0.99),
@@ -259,7 +357,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
         ms       = grp[grp["timed_out"] == 0]["response_ms"]
         tout     = int(grp["timed_out"].sum())
         reqs     = len(grp)
-        profiles_for_utt = sorted(grp["profile"].unique().tolist())
+        profiles_for_utt = sorted(grp["base_profile"].unique().tolist())
 
         anomalies = 0
         if len(ms) >= 4:
@@ -287,7 +385,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
 
     # ── Chart: box/whisker per profile ────────────────────────────────────────
     box_fig = go.Figure()
-    for profile, grp in df_ok.groupby("profile"):
+    for profile, grp in df_ok.groupby("base_profile"):
         box_fig.add_trace(go.Box(
             y=grp["response_ms"].tolist(), name=profile,
             boxpoints="outliers", marker_size=4,
@@ -476,6 +574,8 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
     <div class="stat"><div class="v">{error_rate:.1f}%</div><div class="l">Error rate</div></div>
     <div class="stat"><div class="v">{overall_p95:,}ms</div><div class="l">p95</div></div>
     <div class="stat">{pass_badge}<div class="l" style="margin-top:4px">vs {p95_target:,}ms target</div></div>
+    <div class="stat"><div class="v">{int(response_timeout)}s</div><div class="l">Reply timeout</div></div>
+    <div class="stat"><div class="v">{int(silence_timeout)}s</div><div class="l">Silence window</div></div>
   </div>
 
   {notes_html}
@@ -596,9 +696,16 @@ if __name__ == "__main__":
             sys.exit(1)
         _csv = _csvs[-1]
 
+    # Auto-derive events CSV from detail CSV name
+    _events = _csv.parent / _csv.name.replace("detail_", "events_")
+    if not _events.exists():
+        _events = None
+
     print(f"\n  Generating report from: {_csv}")
+    if _events:
+        print(f"  Events log:             {_events}")
     try:
-        _out = generate_report(_csv)
+        _out = generate_report(_csv, events_csv=_events)
         print(f"  Report saved to:        {_out}\n")
     except ImportError as _e:
         print(f"\n  {_e}\n")
