@@ -115,16 +115,20 @@ Profiles can be pinned to specific scenarios. If you have two profiles and two s
 
 Locust is a Python-based load testing framework. This tool uses Locust as its execution engine — programmatically, without the Locust web interface. Here is what Locust does during a test:
 
-1. **Spawning:** You set peak users and a spawn rate in the Run Configuration menu. Every second, Locust creates new virtual users until the peak is reached.
+1. **Spawning:** You set peak users and a spawn rate in the Run Configuration menu. Locust creates new virtual users at that rate until the peak is reached.
 
 2. **Each user's lifecycle:**
    - **`on_start`:** The user opens a DirectLine conversation and WebSocket.
    - **`@task` (the main loop):** The user picks the next utterance from its CSV, sends it to the bot, waits for a reply, then waits for a "think time" (30–60 seconds by default) before sending the next message.
-   - **`on_stop`:** The user closes the WebSocket when the test ends.
+   - **`on_stop`:** The user closes the WebSocket when the test ends or is killed during ramp-down.
 
-3. **When all utterances are exhausted:** The user closes the current conversation and opens a fresh one, then starts cycling through the utterances again from the beginning.
+3. **When all utterances are exhausted:** The user does not stop. It closes the current conversation, opens a brand new DirectLine conversation, resets to utterance 1, and begins the script again. This loop runs continuously for the entire test duration. Each cycle is an independent conversation — the bot has no memory of the previous one.
 
-4. **Metrics:** Every time the tool receives a bot reply, it reports the latency to Locust internally. The live dashboard reads these events in real time.
+4. **Ramp-up behaviour:** Existing users and newly spawned users operate completely independently. When a new user is spawned mid-test, it starts a fresh conversation at utterance 1 regardless of where other users are in their scripts. A user finishing its script and a new user being spawned are unrelated events. This is intentional — ramp controls concurrent load, not script coordination.
+
+5. **Late-spawned users:** A user spawned near the end of a test may only complete one or two utterances before the test ends. This is expected and does not affect results — metrics are recorded per-reply, so partial script runs contribute normally to response time statistics.
+
+6. **Metrics:** Every time the tool receives a bot reply, it records the latency. The live dashboard reads these events in real time and aggregates them by profile, scenario, and utterance.
 
 ### 2.7 The startup sequence
 
@@ -314,6 +318,20 @@ Or with Scoop: `scoop install charm-gum`
 
 Gum is a standalone binary — it does not affect Python or your virtual environment.
 
+The tool uses the following Gum subcommands:
+
+| Command | Used for |
+|---|---|
+| `gum style` | Styled header and callout boxes in the terminal |
+| `gum input` | Single-line text fields (tenant ID, username, etc.) |
+| `gum confirm` | Yes / No prompts |
+| `gum choose` | Arrow-key single-select menus (wizard, run config, post-test) |
+| `gum choose --no-limit` | Multi-select (choosing which profiles to authenticate) |
+| `gum file` | Interactive file browser (picking a CSV for the report) |
+| `gum write` | Multi-line text input (test notes field) |
+| `gum format` | Markdown rendering (the `? Help` screen) |
+| `gum spin` | Spinner animation (waiting for bot preflight check) |
+
 ### 6.5 Create your utterance files
 
 Before running the wizard, put at least one CSV file in the `utterances/` folder. See Section 8 for the format. There is an example file `utterances/it_support.csv` already included.
@@ -486,17 +504,24 @@ All test parameters are shown with their current values. Navigate to any row and
   Select any setting to change it, then start the test.
 
 ▸   Peak users                           10     users     how many hit the bot at the same time
-    Ramp-up rate                         2      users/s   how fast new users join
+    Ramp-up rate                         2      users/m   how many new users join per minute
     Run time                             5      minutes   how long the test runs
     Wait between messages                30     seconds   pause each user takes after a reply
     Reply timeout                        10     seconds   give up waiting after this long
+    Protocol                             WebSocket        set by GRUNTMASTER_TRANSPORT env var
+    Notes                                (none)           free-text description embedded in report
     ▶  Start test
+    ?  Help
     ✕  Exit
 ```
 
 Select **▶ Start test** when ready.
 
 **What "peak users" means:** This is the number of concurrent users at peak — the maximum number of simultaneous open conversations. It is not the number of messages per second. With think time set to 30 seconds, 10 concurrent users will generate approximately 10 ÷ 30 ≈ **0.3 requests per second**. To get 1 request per second, you need roughly 30 concurrent users. This is intentional — Microsoft's Copilot Studio performance guidance assumes human-paced conversations.
+
+**What "ramp-up rate" means:** The number of new users added per minute. A rate of 2 users/min with a peak of 10 users means the test reaches full load after 5 minutes. A slower ramp gives the bot time to warm up; a faster ramp stresses it sooner.
+
+**Notes field:** Free text you can attach to the run — a description, ticket number, or anything that helps identify the test later. The notes appear as a callout box in the HTML report.
 
 **Recommended approach for first runs:**
 1. Start with 1 user, confirm the bot responds correctly.
@@ -505,47 +530,63 @@ Select **▶ Start test** when ready.
 
 ### 9.3 Live dashboard
 
-The test runs entirely in the terminal. A live dashboard updates every 0.5 seconds:
+The test runs entirely in the terminal. A live dashboard updates every 0.5 seconds using the terminal's alternate screen buffer (no flicker):
 
 ```
 ╭──────────────────────────────────────────────────────────────────────╮
-│  GRUNTMASTER 6000  ·  LIVE                     ● HEALTHY    00:02:14  │
+│  GRUNTMASTER 6000  ·  LIVE                     ● HEALTHY    00:03:24  │
 ╰──────────────────────────────────────────────────────────────────────╯
   SPAWNING  ▓▓▓▓▓▓▓▓▓░  9 / 10 users
-  RPS: 0.3/s   Errors: 0.0%   p95: [████████░░] 1820ms / 2000ms
+  Peak: 10 users   Ramp: 2/min   Run time: 5 min
+  RPS: 0.3/s   Errors: 0.0%  ▁▁▁▁▁▁▁▁   p95: [████████░░] 1820ms / 2000ms
+
+  RAMP STEPS  (2 completed)
+   Ramp   Users   Requests   RPS   p50   p95   p99   T/O
+   ──────────────────────────────────────────────────────
+       1       5         4  0.07  1100  1400  1400     0
+       2      10        12  0.20  1340  1820  2100     0
+     ▶ 3       9         6  0.30  1200  1620  1820     0
+  RAMP TREND  Users ▁▂▄  Req ▁▂▄  RPS ▁▂▃  p50 ▁▃▄  p95 ▁▄▆  p99 ▁▄▇  T/O ▁▁▁
 
   PROFILE STATS
-   User · Scenario        Requests   p50   p95   p99   T/O   Trend
-   Alice · It Support        47      1340  1820  2100    0   ▁▂▂▃▃▄▃▄
-   ALL USERS                 47      1340  1820  2100    0   ▁▂▂▃▃▄▃▄
+   User · Scenario        Requests   p50   p95   p99   T/O   p95 / 30s buckets
+   ─────────────────────────────────────────────────────────────────────────────
+   Alice · It Support        22      1340  1820  2100    0   ▁▂▂▃▃▄▃▄▁▁▁▁▁▁▁▁▁▁▁▁
+   ALL USERS                 22      1340  1820  2100    0   ▁▂▂▃▃▄▃▄▁▁▁▁▁▁▁▁▁▁▁▁
+  Trend column: each bar = p95 latency in a 30s window · taller = slower · ▁ low  █ high
+  ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁  error rate  (bar height = errors in bucket)
 
-  ▁▂▂▃▃▄▃▄  p95 trend
-  ▁▁▁▁▁▁▁▁  error rate trend
-
-  SLOWEST UTTERANCES  (top 8 by p95)
-   Utterance                        p50   p95   Count
-   How do I reset my password?      1620  2100      8
-
-  FASTEST UTTERANCES  (top 8 by p95)
-   Utterance                        p50   p95   Count
-   Hi, I need help                  1100  1400      9
+  UTTERANCES
+   Profile        Utterance              p50   p95   Count   Bot Response
+   ───────────────────────────────────────────────────────────────────────
+   Alice #1       How do I reset my…    1620  2100       8   To reset your password…
+   Alice #2       I can't log in…       1400  1900       7   Please visit the login…
+  ── fastest ──
+   Alice #3       Hi                    1100  1400       9   Hello! How can I help…
+   Alice #4       Thank you              800  1200       6   You're welcome! Let me…
 
   LIVE FEED
-  → Alice               [████████░░]  8/10  ✓ 1620ms
+  → Alice #1   [████████░░]  3/4  ✓ 1620ms
   ↑ User 9 spawned
 
-  ╭─────────────────────────────────────────────────────────────────╮
-  │  p50 = median response   p95 = 95th percentile   p99 = 99th    │
-  │  T/O = Timeout   RPS = Requests / second                        │
-  ╰─────────────────────────────────────────────────────────────────╯
-
+  ╭────────────────────────────────────────────────────────────────╮
+  │  p50 = median   p95 = 95th percentile   p99 = 99th             │
+  │  T/O = Timeout   RPS = Requests / second                       │
+  ╰────────────────────────────────────────────────────────────────╯
   Press Q to stop test and go to New Run
 ```
 
 **Health indicator:**
+- `● STARTING` — no requests recorded yet (bot hasn't replied)
 - `● HEALTHY` — p95 is below 80% of your target
 - `● DEGRADED` — p95 is between 80% and 100% of your target
 - `● CRITICAL` — p95 has exceeded your target
+
+**RAMP STEPS** shows the last 5 ramp windows. The active (in-progress) window is marked with `▶` and styled in cyan. All completed windows are shown in dim. The full history is reflected in the RAMP TREND sparkline even when older rows scroll off the table.
+
+**RAMP TREND** appears once at least two ramp steps have completed. Each tiny bar represents one ramp step — left is early in the test, right is now. Compare Users vs p95: if p95 rises faster than Users, the bot is struggling to scale.
+
+**UTTERANCES** shows the 4 slowest utterances (red) and 4 fastest (green) in one table, separated by a dim divider. Profile shows which specific user instance had the worst p95 for that utterance. Bot Response shows the actual reply from the worst-performing call, with newlines collapsed to a single line.
 
 Press **Q** at any time to stop the test early.
 
@@ -569,15 +610,59 @@ All results are automatically saved to `report/detail_YYYYMMDD_HHMMSS.csv`.
 
 | Section | What it shows |
 |---|---|
-| **Header** | Health status (HEALTHY / DEGRADED / CRITICAL) and elapsed time |
+| **Header** | Health status (STARTING / HEALTHY / DEGRADED / CRITICAL) and elapsed time |
 | **SPAWNING** | Progress bar showing users spawned vs target |
-| **RPS / p95** | Requests per second, error rate, p95 progress bar vs your target |
-| **PROFILE STATS** | One row per scenario: request count, p50/p95/p99, timeouts, sparkline trend |
-| **ALL USERS** | Aggregate row across all scenarios |
-| **Sparklines** | 30-second buckets — rising line means latency is climbing |
-| **SLOWEST UTTERANCES** | The 8 utterances with the highest p95 — find bottlenecks |
-| **FASTEST UTTERANCES** | The 8 utterances with the lowest p95 — your baseline |
-| **LIVE FEED** | Last 8 events: user completions, timeouts, new users spawning |
+| **Config FYI** | Dim line showing Peak users, Ramp rate, and Run time for the current run |
+| **RPS / p95** | Requests per second, inline error rate sparkline, p95 progress bar vs your target |
+| **RAMP STEPS** | Last 5 ramp windows (60s each) — active window marked `▶` in cyan |
+| **RAMP TREND** | One-line sparklines (Users / Req / RPS / p50 / p95 / p99 / T/O) across all ramp steps |
+| **PROFILE STATS** | One row per profile+scenario: request count, p50/p95/p99, timeouts, p95 sparkline |
+| **ALL USERS** | Aggregate row across all profiles and scenarios |
+| **p95 / 30s buckets** | Sparkline column in PROFILE STATS — each bar = p95 in a 30-second window |
+| **Error rate sparkline** | Single line below PROFILE STATS — bar height = errors in that 30s bucket |
+| **UTTERANCES** | Top 4 slowest (red) + dim divider + top 4 fastest (green) — Profile, Utterance, p50, p95, Count, Bot Response |
+| **LIVE FEED** | Last 5 events: user completions, timeouts, new users spawning |
+
+#### What the numbers actually mean
+
+**Response time (latency)**
+Think of it like a stopwatch. Every time a virtual user sends a message, the tool starts a stopwatch. It stops the moment the bot replies. That elapsed time — measured in milliseconds (ms) — is the response time. 1000 ms = 1 second. A well-performing bot usually replies in under 2000 ms.
+
+**p50 — the median**
+Sort every response time you have measured, from fastest to slowest. The value exactly in the middle is the p50. Half of all requests were faster than this number, half were slower. It is the "typical" experience — what most users feel most of the time.
+
+**p95 — the 95th percentile**
+Sort all response times again and go 95% of the way through the list. That value is the p95. It means "95 out of every 100 requests finished within this time or less." The remaining 5 out of 100 took longer. The p95 is the number to watch — it tells you how bad the *worst realistic* experience is, not just the average. A p95 of 2000 ms means almost everyone gets a reply within 2 seconds, with only rare exceptions.
+
+**p99 — the 99th percentile**
+The same idea pushed further: 99 out of 100 requests finished within this time. The p99 captures the very slow outliers. If your p99 is 5000 ms, one request in every hundred takes five seconds or more.
+
+**Why p95 matters more than average**
+The average can hide a lot. If 90 requests finish in 500 ms and 10 requests take 10 seconds, the average is about 1.4 seconds — sounds fine! But ten users out of a hundred had a terrible experience. The p95 surfaces that. This is why performance engineers use percentiles, not averages.
+
+**RPS — requests per second**
+How many bot messages are being sent per second across all virtual users right now. With human-paced think time (30 seconds between messages), 30 concurrent users generate roughly 1 request per second.
+
+**T/O — timeout**
+A request where the bot took longer than your Reply Timeout setting (default: 10 seconds). The tool gave up waiting and counted it as a failure. A rising T/O count is a strong sign the bot is struggling to keep up.
+
+**Error rate**
+The percentage of requests that either timed out or returned an error. Keep this below 1%.
+
+**The p95 / 30s buckets sparkline  (▁▂▄▇█▆▄▂)**
+Each tiny bar in the PROFILE STATS table represents one 30-second window of the test. The taller the bar, the slower the p95 was during that window. A sparkline that rises from left to right means the bot is getting slower as the load increases. A flat sparkline means the bot is handling load consistently.
+
+**Error rate sparkline**
+Shown as a single red line below PROFILE STATS. Each bar = one 30-second window. A flat line at ▁ means zero errors throughout. Any bar taller than ▁ means errors occurred in that window.
+
+**RAMP STEPS table**
+Shows the last 5 ramp windows (one row per 60-second block). The current in-progress window is marked with `▶` and highlighted in cyan; completed windows are dim. As you ramp up users, these rows let you pinpoint the load level where things started to slow down — for example, "response times were fine at 5 users but started climbing in the third minute when we hit 15."
+
+**RAMP TREND line**
+A single line of labeled sparklines where each bar represents one completed ramp step (not a time bucket). Shows Users, Req, RPS, p50, p95, p99, and T/O across the full test history — even if older ramp steps have scrolled off the RAMP STEPS table. The key pattern to watch: if the p95 bars grow faster than the Users bars, the bot is degrading under load rather than scaling linearly.
+
+**UTTERANCES table**
+Shows the 4 slowest utterances (highlighted red) and 4 fastest (highlighted green) in a single table, separated by a dim `── fastest ──` divider. Columns are: Profile (the specific user instance with the worst p95 for that utterance), Utterance (the message text), p50, p95, Count, and Bot Response (the actual reply from the slowest call, with newlines stripped). With 50 utterances in your script, you still only see 8 rows — the extremes most worth your attention.
 
 ### 10.2 The detail CSV
 
@@ -612,7 +697,46 @@ After every test run, an HTML report is automatically generated in `report/repor
 
 Requires `pandas` and `plotly` (included in `requirements.txt`). If not installed, report generation is silently skipped — the test still runs normally.
 
-### 10.3 Interpreting results
+#### Reading the charts
+
+**Box/whisker chart**
+Imagine lining up all the response times for one scenario in order from fastest to slowest, then folding the line into a shape:
+
+- The **box** covers the middle 50% of all requests — from the 25th percentile on the left edge to the 75th on the right.
+- The **line through the middle of the box** is the median (p50) — the typical response time.
+- The **whiskers** are lines that extend out from each side of the box to show the faster and slower extremes.
+- Dots beyond the whiskers are individual outlier requests that were unusually fast or slow.
+
+A **narrow box** means the bot responded consistently — most users got a similar experience. A **wide box** means high variance — some users waited much longer than others. When comparing scenarios, look for whose box sits furthest to the right (slowest).
+
+**Latency heatmap**
+This is a grid. Each row is a different utterance (a specific question). Each column is a 30-second time window during the test. Each cell is colour-coded by how slow the p95 was in that window for that utterance — lighter/cooler colours are fast, darker/warmer colours are slow.
+
+Use the heatmap to spot patterns you would miss in averages:
+- A single row that is always warm → one particular question is consistently slow no matter what
+- A column that turns warm near the right side → the bot starts degrading as more users join
+- A speckled random pattern → occasional slowdowns, probably network noise rather than a real capacity issue
+
+**Per-utterance table — p99.9 log-normal projection**
+We often cannot run a test long enough to collect 1000 measurements for every utterance. But if we assume response times follow a "log-normal distribution" (a statistical model that fits timing data well in practice — it captures the fact that responses cannot be negative and that occasional very slow requests pull the tail out to the right), we can project what the 99.9th percentile would probably be with more data.
+
+Think of it like a weather forecast: "Based on the pattern so far, here is what the worst 0.1% case is *likely* to look like." This projection is labelled with a `~` to remind you it is an estimate, not a direct measurement.
+
+**Per-utterance table — MAD anomaly flag**
+MAD stands for **Median Absolute Deviation**. It is a way of measuring how unusual one utterance is compared to all the others.
+
+Step by step:
+1. Calculate the median response time across all utterances.
+2. For each utterance, calculate how far it sits from that median.
+3. Take the median of *those* distances — that is the MAD.
+4. Any utterance whose distance from the median is more than 3× the MAD gets flagged with a dot (•).
+
+In plain terms: if most questions take around 1.5 seconds and one particular question consistently takes 6 seconds, the MAD calculation will flag it as an anomaly. It is similar to a teacher flagging a test score that is way outside the range of everyone else's results. The MAD method is more robust than comparing to the average because a few extreme outliers do not distort it.
+
+**Profile comparison**
+Select any two scenarios from the dropdown and the report shows the percentage difference in p50, p95, and p99 between them. If the IT Support scenario has a p95 of 2000 ms and the HR scenario has a p95 of 3000 ms, the comparison will show +50% for HR. This tells you which scenario is putting more strain on the bot — useful when you want to know whether topic complexity, message length, or authentication path is the root cause of a difference.
+
+### 10.4 Interpreting results
 
 **The bot passes the performance test if:**
 - 95th-percentile response time stays below 2000ms (or your configured target)

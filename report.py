@@ -4,12 +4,14 @@ report.py — Generates a self-contained HTML performance report from a detail C
 Usage:
     python report.py                          # latest detail_*.csv in report/
     python report.py report/detail_xyz.csv   # specific file
+    python report.py --browse                 # interactive file picker (requires gum)
 """
 
 import sys
 import math
 import base64
 import argparse
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from itertools import combinations
@@ -17,7 +19,7 @@ from itertools import combinations
 REPORT_DIR     = Path(__file__).parent / "report"
 P95_TARGET_MS  = 2000
 
-# ── CSS and JS as plain strings (no f-string escaping needed) ─────────────────
+# ── CSS ───────────────────────────────────────────────────────────────────────
 
 _CSS = """
 *{box-sizing:border-box;margin:0;padding:0}
@@ -28,6 +30,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-siz
 .stat{text-align:center;min-width:80px}
 .stat .v{font-size:20px;font-weight:700}
 .stat .l{font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:.6px;margin-top:2px}
+
+/* ── Tabs ── */
+.tabs{display:flex;gap:0;border-bottom:2px solid #e2e8f0;margin-bottom:24px}
+.tab-btn{padding:10px 22px;font-size:13px;font-weight:600;color:#64748b;background:none;border:none;
+         border-bottom:2px solid transparent;margin-bottom:-2px;cursor:pointer;letter-spacing:.2px;
+         transition:color .15s,border-color .15s}
+.tab-btn:hover{color:#0f172a}
+.tab-btn.active{color:#0f172a;border-bottom-color:#0f172a}
+.tab-pane{display:none}
+.tab-pane.active{display:block}
+
 h2{font-size:12px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.8px;margin:28px 0 8px}
 .legend{font-size:12px;color:#94a3b8;margin-bottom:10px}
 .legend .red{color:#ef4444}
@@ -39,13 +52,28 @@ td{padding:9px 14px;border-top:1px solid #f1f5f9;vertical-align:top}
 tr:hover td{background:#f8fafc}
 .chart{background:#fff;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:4px;padding:4px}
 .pill{display:inline-block;background:#e2e8f0;color:#475569;font-size:11px;padding:2px 7px;border-radius:10px;margin:1px 2px 1px 0}
+.notes-box{background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:13px;color:#78350f;white-space:pre-wrap}
 .dl{text-align:center;margin:28px 0 12px}
 .dl a{display:inline-block;padding:9px 22px;background:#0f172a;color:#fff;border-radius:6px;text-decoration:none;font-weight:600;font-size:13px}
 .dl a:hover{background:#1e293b}
 footer{text-align:center;color:#cbd5e1;font-size:11px;padding:20px 0}
 """
 
+# ── JS ────────────────────────────────────────────────────────────────────────
+
 _JS = """
+// Tab switching
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const target = btn.dataset.tab;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(target).classList.add('active');
+  });
+});
+
+// Sortable tables
 document.querySelectorAll('th').forEach(th => {
   th.addEventListener('click', () => {
     const tbl = th.closest('table');
@@ -96,9 +124,20 @@ def _pills(items) -> str:
     return "".join(f'<span class="pill">{i}</span>' for i in sorted(items))
 
 
+def _gfile_pick(start: str = ".") -> str:
+    """Use gum file browser to pick a CSV. Returns path or ''."""
+    try:
+        r = subprocess.run(["gum", "file", start],
+                           text=True, stdout=subprocess.PIPE, encoding="utf-8")
+        return r.stdout.strip()
+    except FileNotFoundError:
+        return ""
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
+def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
+                    notes: str = "") -> Path:
     _require_deps()
     import pandas as pd
     import plotly.graph_objects as go
@@ -108,11 +147,15 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
     df["response_ms"] = pd.to_numeric(df["response_ms"], errors="coerce").fillna(0)
     df["timed_out"]   = pd.to_numeric(df["timed_out"],   errors="coerce").fillna(0).astype(int)
 
-    # Normalise column names — older CSVs may not have profile/scenario split
+    # Normalise column names
     if "profile" not in df.columns:
         df["profile"] = df.get("scenario", "unknown")
     if "scenario" not in df.columns:
         df["scenario"] = "default"
+
+    has_user_count = "user_count" in df.columns
+    if has_user_count:
+        df["user_count"] = pd.to_numeric(df["user_count"], errors="coerce").fillna(0).astype(int)
 
     df_ok = df[df["timed_out"] == 0].copy()
 
@@ -138,8 +181,49 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
         test_date_str = csv_path.stem.replace("detail_", "")
         duration_str  = "—"
 
-    # ── Section 1: Profile Summary ────────────────────────────────────────────
-    # One row per profile (user account). Shows all scenarios that profile ran.
+    # ── Ramp steps (Tab 1) — one row per 60-second window ────────────────────
+    ramp_steps_html = ""
+    if has_ts and not df["sent_dt"].isna().all():
+        RAMP_WINDOW = 60.0
+        t0_ramp = df["sent_dt"].min()
+        df["_ramp_idx"] = ((df["sent_dt"] - t0_ramp).dt.total_seconds() // RAMP_WINDOW).astype(int)
+        step_rows = []
+        for ridx, grp in df.groupby("_ramp_idx"):
+            ms_grp = grp[grp["timed_out"] == 0]["response_ms"]
+            tout   = int(grp["timed_out"].sum())
+            count  = len(grp)
+            last_u = int(grp["user_count"].iloc[-1]) if has_user_count else "—"
+            rps    = f"{count / RAMP_WINDOW:.2f}"
+            p50v   = _pct(ms_grp, 0.50)
+            p95v   = _pct(ms_grp, 0.95)
+            p99v   = _pct(ms_grp, 0.99)
+            p95s   = ' style="color:#ef4444;font-weight:700"' if p95v > p95_target else ""
+            toc    = f'<span style="color:#ef4444">{tout}</span>' if tout else "0"
+            step_rows.append(
+                f'<tr>'
+                f'<td><strong>{int(ridx) + 1}</strong></td>'
+                f'<td>{last_u}</td>'
+                f'<td>{count:,}</td>'
+                f'<td>{rps}</td>'
+                f'<td>{p50v:,}</td><td{p95s}>{p95v:,}</td><td>{p99v:,}</td>'
+                f'<td>{toc}</td>'
+                f'</tr>'
+            )
+        if step_rows:
+            ramp_steps_html = (
+                '<h2>Ramp Steps</h2>'
+                '<p class="legend">'
+                'One row per 60-second window — each row is finalised when the next window begins &nbsp;&middot;&nbsp;'
+                'USERS = last user count in that window &nbsp;&middot;&nbsp;'
+                'RPS / p50 / p95 / p99 are for that window only'
+                '</p>'
+                '<table><thead><tr>'
+                '<th>Ramp</th><th>Users</th><th>Requests</th><th>RPS</th>'
+                '<th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>T/O</th>'
+                '</tr></thead><tbody>' + "".join(step_rows) + '</tbody></table>'
+            )
+
+    # ── Profile Summary ───────────────────────────────────────────────────────
     profile_rows_data = []
     for profile, grp in df.groupby("profile"):
         ms       = grp[grp["timed_out"] == 0]["response_ms"]
@@ -154,8 +238,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
             ok=p95v <= p95_target,
         ))
 
-    # ── Section 2: Scenario Breakdown ─────────────────────────────────────────
-    # One row per scenario (CSV file). Shows which profile ran it.
+    # ── Scenario Breakdown ────────────────────────────────────────────────────
     scenario_rows_data = []
     for scenario, grp in df.groupby("scenario"):
         ms       = grp[grp["timed_out"] == 0]["response_ms"]
@@ -170,9 +253,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
             ok=p95v <= p95_target,
         ))
 
-    # ── Section 3: Per-utterance stats ────────────────────────────────────────
-    # Grouped by (utterance, scenario) so same question in different scenarios
-    # appears as separate rows. Shows both profile and scenario.
+    # ── Per-utterance stats ───────────────────────────────────────────────────
     utterances = []
     for (utt, scenario), grp in df.groupby(["utterance", "scenario"]):
         ms       = grp[grp["timed_out"] == 0]["response_ms"]
@@ -240,8 +321,8 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
     )
     scen_html = scen_fig.to_html(include_plotlyjs=False, full_html=False)
 
-    # ── Chart: latency heatmap (utterance × time) ─────────────────────────────
-    heatmap_section = ""
+    # ── Chart: latency heatmap ────────────────────────────────────────────────
+    heatmap_html = ""
     if has_ts and "sent_dt" in df_ok.columns and not df_ok["sent_dt"].isna().all():
         t0    = df_ok["sent_dt"].min()
         df_hm = df_ok.copy()
@@ -264,16 +345,16 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
             height=max(300, len(pivot.index) * 28 + 80),
             margin=dict(t=20, b=40, l=280),
         )
-        hm_html = hm_fig.to_html(include_plotlyjs=False, full_html=False)
-        heatmap_section = (
+        hm_html_inner = hm_fig.to_html(include_plotlyjs=False, full_html=False)
+        heatmap_html = (
             '<h2>Latency Heatmap — Utterance × Time</h2>'
             '<p class="legend">Median response time per 30-second window — '
             'rising colour signals degradation over time</p>'
-            f'<div class="chart">{hm_html}</div>'
+            f'<div class="chart">{hm_html_inner}</div>'
         )
 
-    # ── Profile comparison (Option C) ─────────────────────────────────────────
-    comparison_section = ""
+    # ── Profile comparison ────────────────────────────────────────────────────
+    comparison_html = ""
     if len(profile_rows_data) >= 2:
         medians = {
             p["profile"]: _pct(
@@ -296,7 +377,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
                     f"<td>{ma:,}ms</td><td>{mb:,}ms</td></tr>"
                 )
         if rows:
-            comparison_section = (
+            comparison_html = (
                 '<h2>Profile Comparison</h2>'
                 '<p class="legend">Median response time difference between profiles (p50)</p>'
                 '<table><thead><tr>'
@@ -305,7 +386,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
                 '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
             )
 
-    # ── Assemble HTML rows ────────────────────────────────────────────────────
+    # ── Assemble HTML row builders ────────────────────────────────────────────
     def _profile_row(p):
         rs   = ' style="background:#fef2f2"' if not p["ok"] else ""
         p95s = ' style="color:#ef4444;font-weight:700"' if not p["ok"] else ""
@@ -369,7 +450,12 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
     )
     csv_b64 = base64.b64encode(csv_path.read_bytes()).decode()
 
-    # ── Final HTML ────────────────────────────────────────────────────────────
+    notes_html = (
+        f'<div class="notes-box"><strong>Test notes:</strong> {notes}</div>'
+        if notes else ""
+    )
+
+    # ── Final HTML with tabs ──────────────────────────────────────────────────
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -381,6 +467,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
 <body>
 <div class="wrap">
 
+  <!-- Header stats bar -->
   <div class="hdr">
     <h1>GRUNTMASTER 6000 &nbsp;&middot;&nbsp; LOAD TEST REPORT</h1>
     <div class="stat"><div class="v">{test_date_str}</div><div class="l">Test date</div></div>
@@ -391,56 +478,77 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS) -> Path:
     <div class="stat">{pass_badge}<div class="l" style="margin-top:4px">vs {p95_target:,}ms target</div></div>
   </div>
 
-  <h2>Profile Summary</h2>
-  <p class="legend">One row per user account — shows which scenarios each profile ran</p>
-  <table>
-    <thead><tr>
-      <th>Profile</th><th>Scenarios</th><th>Requests</th>
-      <th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Timeouts</th><th>Error %</th>
-    </tr></thead>
-    <tbody>{profile_rows_html}</tbody>
-  </table>
+  {notes_html}
 
-  <h2>Scenario Breakdown</h2>
-  <p class="legend">One row per CSV script — shows which profile ran each scenario</p>
-  <table>
-    <thead><tr>
-      <th>Scenario</th><th>Profiles</th><th>Requests</th>
-      <th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Timeouts</th><th>Error %</th>
-    </tr></thead>
-    <tbody>{scenario_rows_html}</tbody>
-  </table>
+  <!-- Tab bar -->
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="tab-summary">Summary</button>
+    <button class="tab-btn" data-tab="tab-distribution">Response Time Distribution</button>
+    <button class="tab-btn" data-tab="tab-utterances">Utterance Analysis</button>
+  </div>
 
-  <h2>Response Time Distribution — by Profile</h2>
-  <p class="legend">Each box = one user account &nbsp;&middot;&nbsp; red dashed line = p95 target</p>
-  <div class="chart">{box_html}</div>
+  <!-- ── Tab 1: Summary ─────────────────────────────────────────────────── -->
+  <div id="tab-summary" class="tab-pane active">
 
-  <h2>Response Time Distribution — by Scenario</h2>
-  <p class="legend">Each box = one CSV script &nbsp;&middot;&nbsp; red dashed line = p95 target</p>
-  <div class="chart">{scen_html}</div>
+    {ramp_steps_html}
 
-  {heatmap_section}
+    <h2>Profile Summary</h2>
+    <p class="legend">One row per user account — shows which scenarios each profile ran</p>
+    <table>
+      <thead><tr>
+        <th>Profile</th><th>Scenarios</th><th>Requests</th>
+        <th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Timeouts</th><th>Error %</th>
+      </tr></thead>
+      <tbody>{profile_rows_html}</tbody>
+    </table>
 
-  <h2>Per-Utterance Detail</h2>
-  <p class="legend">
-    Grouped by utterance + scenario &nbsp;&middot;&nbsp; sorted by p95 descending &nbsp;&middot;&nbsp;
-    <span class="red">&#9679;</span> = MAD anomaly (response &gt; median&nbsp;+&nbsp;3&times;MAD) &nbsp;&middot;&nbsp;
-    p99.9 proj = log-normal projection (requires &ge;10 samples)
-  </p>
-  <table>
-    <thead><tr>
-      <th>Utterance</th><th>Scenario</th><th>Profile(s)</th><th>Requests</th>
-      <th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Timeouts</th><th>p99.9 proj ms</th>
-    </tr></thead>
-    <tbody>{utt_rows_html}</tbody>
-  </table>
+    <h2>Scenario Breakdown</h2>
+    <p class="legend">One row per CSV script — shows which profile ran each scenario</p>
+    <table>
+      <thead><tr>
+        <th>Scenario</th><th>Profiles</th><th>Requests</th>
+        <th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Timeouts</th><th>Error %</th>
+      </tr></thead>
+      <tbody>{scenario_rows_html}</tbody>
+    </table>
 
-  {comparison_section}
+    {comparison_html}
 
-  <div class="dl">
-    <a href="data:text/csv;base64,{csv_b64}" download="{csv_path.name}">
-      &darr;&nbsp; Download raw CSV
-    </a>
+    <div class="dl">
+      <a href="data:text/csv;base64,{csv_b64}" download="{csv_path.name}">
+        &darr;&nbsp; Download raw CSV
+      </a>
+    </div>
+  </div>
+
+  <!-- ── Tab 2: Response Time Distribution ──────────────────────────────── -->
+  <div id="tab-distribution" class="tab-pane">
+    <h2>Response Time Distribution — by Profile</h2>
+    <p class="legend">Each box = one user account &nbsp;&middot;&nbsp; red dashed line = p95 target</p>
+    <div class="chart">{box_html}</div>
+
+    <h2>Response Time Distribution — by Scenario</h2>
+    <p class="legend">Each box = one CSV script &nbsp;&middot;&nbsp; red dashed line = p95 target</p>
+    <div class="chart">{scen_html}</div>
+
+    {heatmap_html}
+  </div>
+
+  <!-- ── Tab 3: Utterance Analysis ──────────────────────────────────────── -->
+  <div id="tab-utterances" class="tab-pane">
+    <h2>Per-Utterance Detail</h2>
+    <p class="legend">
+      Grouped by utterance + scenario &nbsp;&middot;&nbsp; sorted by p95 descending &nbsp;&middot;&nbsp;
+      <span class="red">&#9679;</span> = MAD anomaly (response &gt; median&nbsp;+&nbsp;3&times;MAD) &nbsp;&middot;&nbsp;
+      p99.9 proj = log-normal projection (requires &ge;10 samples)
+    </p>
+    <table>
+      <thead><tr>
+        <th>Utterance</th><th>Scenario</th><th>Profile(s)</th><th>Requests</th>
+        <th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Timeouts</th><th>p99.9 proj ms</th>
+      </tr></thead>
+      <tbody>{utt_rows_html}</tbody>
+    </table>
   </div>
 
   <footer>
@@ -467,9 +575,19 @@ if __name__ == "__main__":
         "csv", nargs="?",
         help="Path to detail CSV (default: latest in report/)",
     )
+    parser.add_argument(
+        "--browse", action="store_true",
+        help="Open gum file browser to pick a CSV",
+    )
     args = parser.parse_args()
 
-    if args.csv:
+    if args.browse:
+        picked = _gfile_pick(str(REPORT_DIR))
+        if not picked:
+            print("No file selected.")
+            sys.exit(1)
+        _csv = Path(picked)
+    elif args.csv:
         _csv = Path(args.csv)
     else:
         _csvs = sorted(REPORT_DIR.glob("detail_*.csv"), key=lambda p: p.stat().st_mtime)

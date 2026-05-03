@@ -555,7 +555,7 @@ def _ginput(placeholder: str = "", *, header: str = "", default: str = "",
            "--cursor.foreground",    _G_CYAN,
            "--header.foreground",    _G_DIM,
            "--width",                str(width),
-           "--no-show-help"]
+           ]
     if header:
         cmd += ["--header", f"\n  {header}\n"]
     if default:
@@ -575,9 +575,7 @@ def _gconfirm(prompt: str, *, default: bool = False) -> bool:
         "--prompt.foreground",        "255",
         "--selected.background",      "213",
         "--selected.foreground",      _G_BLACK,
-        "--unselected.foreground",    "252",
-        "--unselected.background",    "236",
-        "--no-show-help",
+
     ]
     if default:
         cmd.append("--default")
@@ -594,12 +592,62 @@ def _gchoose(*items: str, header: str = "", height: int = 12,
            "--header.foreground",   _G_PURPLE,
            "--cursor",              "▸ ",
            "--height",              str(height),
-           "--no-show-help"]
+           ]
     if header:
         cmd += ["--header", header]
     cmd += list(items)
     r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, encoding="utf-8")
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _gchoose_multi(*items: str, header: str = "", height: int = 12) -> list:
+    """Multi-select via `gum choose --no-limit`. Space toggles, Enter confirms."""
+    cmd = ["gum", "choose", "--no-limit",
+           "--cursor.foreground",        _G_CYAN,
+           "--selected.foreground",      "213",
+           "--selected.background",      "236",
+           "--header.foreground",        _G_PURPLE,
+           "--cursor",                   "▸ ",
+           "--height",                   str(height),
+           ]
+    if header:
+        cmd += ["--header", header]
+    cmd += list(items)
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, encoding="utf-8")
+    return [line for line in r.stdout.splitlines() if line.strip()] if r.returncode == 0 else []
+
+
+def _gfile(start_path: str = ".") -> str:
+    """Interactive file browser via `gum file`. Returns selected path or ''."""
+    r = subprocess.run(["gum", "file", start_path],
+                       text=True, stdout=subprocess.PIPE, encoding="utf-8")
     return r.stdout.strip()
+
+
+def _gwrite(placeholder: str = "", *, header: str = "",
+            width: int = 72, height: int = 8) -> str:
+    """Multi-line text input via `gum write`. Ctrl-D to confirm, Esc to cancel."""
+    cmd = ["gum", "write",
+           "--placeholder",       placeholder,
+           "--prompt.foreground", _G_CYAN,
+           "--cursor.foreground", _G_CYAN,
+           "--header.foreground", _G_DIM,
+           "--width",             str(width),
+           "--height",            str(height),
+   
+           "--char-limit",        "2000"]
+    if header:
+        cmd += ["--header", f"\n  {header}\n"]
+    r = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, encoding="utf-8")
+    return r.stdout.strip()
+
+
+def _gformat(text: str):
+    """Render markdown text via `gum format`, falls back to plain print."""
+    r = subprocess.run(["gum", "format", "--", text],
+                       text=True, encoding="utf-8")
+    if r.returncode != 0:
+        print(text)
 
 
 _GUM_ENV = {**os.environ, "PYTHONUTF8": "1"}   # ensure UTF-8 I/O on Windows
@@ -633,8 +681,8 @@ def _rainbow(line: str, offset: int) -> str:
 
 def _section_header(title: str):
     """Vivid section header via gum style (stable, no shimmer)."""
-    _gprint(f"  {title}", border="rounded", fg=_G_CYAN,
-            bold=True, padding="0 3", margin="1 0")
+    _gprint(f"  {title}  ", border="rounded", fg=_G_CYAN,
+            bold=True, padding="0 3", margin="1 0", align="center")
 
 
 def _ok_line(label: str, note: str = ""):
@@ -1583,6 +1631,13 @@ def run_wizard():
             border_fg=_G_YELLOW, padding="1 2", margin="0 1",
         )
         print()
+        if len(needs_auth) > 1 and _gum_ok():
+            chosen = _gchoose_multi(
+                *needs_auth,
+                header="\n  Select profiles to authenticate now (Space = toggle, Enter = confirm):\n",
+                height=min(len(needs_auth) + 4, 14),
+            )
+            needs_auth = chosen if chosen else needs_auth
         for username in needs_auth:
             _rocket_auth(username)
 
@@ -1774,14 +1829,15 @@ def _init_detail_log():
             "profile", "event_number", "scenario", "conversation_id",
             "utterance", "bot_response",
             "utterance_sent_at", "response_received_at", "response_ms",
-            "timed_out",
+            "timed_out", "user_count",
         ])
     log.info("Detail log → %s", _detail_log_path)
 
 
 def _log_request(profile: str, event_number: int, scenario: str, conv_id: str,
                  utterance: str, bot_response: str,
-                 send_time: float, response_ms: float, timed_out: bool):
+                 send_time: float, response_ms: float, timed_out: bool,
+                 user_count: int = 0):
     if not _detail_log_path:
         return
     sent_at     = datetime.fromtimestamp(send_time, tz=timezone.utc).isoformat(timespec="milliseconds")
@@ -1791,6 +1847,7 @@ def _log_request(profile: str, event_number: int, scenario: str, conv_id: str,
         utterance, bot_response,
         sent_at, received_at, f"{response_ms:.0f}",
         "1" if timed_out else "0",
+        str(user_count),
     ]
     with _detail_lock:
         with open(_detail_log_path, "a", newline="", encoding="utf-8") as f:
@@ -1921,13 +1978,17 @@ class CopilotBaseUser(User):
 
         _base_label   = self.profile.get("display_name", self.profile.get("username", ""))
         profile_label = f"{_base_label} #{self._spawn_num}"
+        # metric key includes base profile so each profile gets its own dashboard row
+        _metric_name  = f"Copilot Response — {_base_label} · {self.scenario_name}"
 
+        _uc = _active_dashboard._current_users if _active_dashboard is not None else 0
         if response.timed_out:
             log.warning("No bot reply received for activity %s", activity_id)
             _log_request(profile_label, self._idx, self.scenario_name,
                          self.conversation.id, utterance, "",
-                         send_time, response.latency_ms, timed_out=True)
-            _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms,
+                         send_time, response.latency_ms, timed_out=True,
+                         user_count=_uc)
+            _fire_metric(self.environment, _metric_name, response.latency_ms,
                          error=Exception("No bot reply received"))
             if _active_dashboard is not None:
                 _active_dashboard.on_utterance(
@@ -1942,12 +2003,14 @@ class CopilotBaseUser(User):
         )[:500]
         _log_request(profile_label, self._idx, self.scenario_name,
                      self.conversation.id, utterance, bot_text,
-                     send_time, response.latency_ms, timed_out=False)
-        _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms)
+                     send_time, response.latency_ms, timed_out=False,
+                     user_count=_uc)
+        _fire_metric(self.environment, _metric_name, response.latency_ms)
         if _active_dashboard is not None:
             _active_dashboard.on_utterance(
                 utterance, self.scenario_name, id(self), profile_label,
-                self._idx, len(self.utterances), response.latency_ms, False)
+                self._idx, len(self.utterances), response.latency_ms, False,
+                bot_response=bot_text)
         time.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
         # All utterances sent — close this conversation and open a fresh one
@@ -2118,13 +2181,16 @@ class CopilotHttpUser(CopilotBaseUser):
 
         _base_label   = self.profile.get("display_name", self.profile.get("username", ""))
         profile_label = f"{_base_label} #{self._spawn_num}"
+        _metric_name  = f"Copilot Response — {_base_label} · {self.scenario_name}"
 
+        _uc = _active_dashboard._current_users if _active_dashboard is not None else 0
         if response.timed_out:
             log.warning("No bot reply received for activity %s", activity_id)
             _log_request(profile_label, self._idx, self.scenario_name,
                          self.conversation.id, utterance, "",
-                         send_time, response.latency_ms, timed_out=True)
-            _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}",
+                         send_time, response.latency_ms, timed_out=True,
+                         user_count=_uc)
+            _fire_metric(self.environment, _metric_name,
                          response.latency_ms, error=Exception("No bot reply received"))
             if _active_dashboard is not None:
                 _active_dashboard.on_utterance(
@@ -2139,12 +2205,14 @@ class CopilotHttpUser(CopilotBaseUser):
         )[:500]
         _log_request(profile_label, self._idx, self.scenario_name,
                      self.conversation.id, utterance, bot_text,
-                     send_time, response.latency_ms, timed_out=False)
-        _fire_metric(self.environment, f"Copilot Response — {self.scenario_name}", response.latency_ms)
+                     send_time, response.latency_ms, timed_out=False,
+                     user_count=_uc)
+        _fire_metric(self.environment, _metric_name, response.latency_ms)
         if _active_dashboard is not None:
             _active_dashboard.on_utterance(
                 utterance, self.scenario_name, id(self), profile_label,
-                self._idx, len(self.utterances), response.latency_ms, False)
+                self._idx, len(self.utterances), response.latency_ms, False,
+                bot_response=bot_text)
         time.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
         if self._idx >= len(self.utterances):
@@ -2164,24 +2232,31 @@ def _make_http_user_class(class_name: str, utterances: list[str], scenario: str,
     })
 
 
-# Profiles with an explicit scenario field are pinned to that CSV.
-# Profiles with no scenario field fill in the remaining CSVs by position.
-_pinned     = {p["scenario"]: p for p in _profiles_list if p.get("scenario")}
-_unassigned = [p for p in _profiles_list if not p.get("scenario")]
+# Strategy: one Locust user class per (CSV × profile) combination.
+# Every profile runs every scenario in parallel — Locust distributes the
+# configured user count evenly across all classes (weight=1 each).
+# Pinned profiles (profile["scenario"] == csv stem) are exclusive to that CSV.
 
-for _i, _csv in enumerate(_csv_files):
-    _scenario   = _csv.stem.replace("_", " ").title()
-    _class_name = "".join(w.capitalize() for w in _csv.stem.split("_")) + "User"
+_pinned     = {p["scenario"]: p for p in _profiles_list if p.get("scenario")}
+_free       = [p for p in _profiles_list if not p.get("scenario")] or [{}]
+_factory    = _make_http_user_class if test_config["transport"] == "http" else _make_user_class
+
+for _csv in _csv_files:
+    _scenario    = _csv.stem.replace("_", " ").title()
+    _base_name   = "".join(w.capitalize() for w in _csv.stem.split("_")) + "User"
+    _utterances  = _load_utterances(_csv)
+
     if _csv.stem in _pinned:
-        _profile = _pinned[_csv.stem]
-    elif _unassigned:
-        _profile = _unassigned[_i % len(_unassigned)]
-    elif _profiles_list:
-        _profile = _profiles_list[_i % len(_profiles_list)]
+        # Pinned: exactly one profile for this CSV
+        _profiles_for_csv = [_pinned[_csv.stem]]
     else:
-        _profile = {}
-    _factory = _make_http_user_class if test_config["transport"] == "http" else _make_user_class
-    globals()[_class_name] = _factory(_class_name, _load_utterances(_csv), _scenario, _profile)
+        # All free profiles run this scenario
+        _profiles_for_csv = _free
+
+    for _pi, _profile in enumerate(_profiles_for_csv):
+        # Unique class name: ScenarioUser if single profile, ScenarioUser_2 etc.
+        _class_name = _base_name if _pi == 0 else f"{_base_name}_{_pi + 1}"
+        globals()[_class_name] = _factory(_class_name, _utterances, _scenario, _profile)
 
 
 # ── Live dashboard ────────────────────────────────────────────────────────────
@@ -2200,13 +2275,17 @@ class _DashboardState:
         self._errs:        list[tuple[float, bool]]       = []
         self._utt_times:   dict[str, list[float]]         = {}
         self._utt_tout:    dict[str, int]                 = {}
+        self._utt_response: dict[str, str]               = {}  # worst-instance bot reply per key
         self._users:       dict[int, dict]                = {}
         self.feed          = collections.deque(maxlen=8)
-        # Ramp step tracking — keyed by user count
-        self._current_users: int                              = 0
-        self._step_times:    dict[int, list[float]]           = {}
-        self._step_tout:     dict[int, int]                   = {}
-        self._step_elapsed:  dict[int, list[float]]           = {}  # elapsed timestamps
+        # Ramp tracking — one row per 60-second window, added when next window starts
+        self._current_users:    int         = 0
+        self._ramp_window:      float       = 60.0
+        self._ramps_done:       list        = []   # finalized ramp dicts
+        self._cur_ramp_ms:      list        = []   # response_ms in current window
+        self._cur_ramp_tout:    int         = 0
+        self._cur_ramp_idx:     int         = 0    # which 60s window we're in
+        self._cur_ramp_users:   int         = 0    # last user count seen this window
 
     def set_user_count(self, n: int):
         with self._lock:
@@ -2231,21 +2310,39 @@ class _DashboardState:
             self._ts.append((elapsed, rt))
             self._scenario_ts.setdefault(scenario, []).append((elapsed, rt))
             self._errs.append((elapsed, is_err))
-            # Step tracking
-            u = self._current_users
-            self._step_elapsed.setdefault(u, []).append(elapsed)
+            # Ramp window tracking: finalize completed 60s windows on each new request
+            ramp_idx = int(elapsed // self._ramp_window)
+            while self._cur_ramp_idx < ramp_idx:
+                if self._cur_ramp_ms or self._cur_ramp_tout:
+                    count = len(self._cur_ramp_ms) + self._cur_ramp_tout
+                    self._ramps_done.append({
+                        "ramp":     len(self._ramps_done) + 1,
+                        "users":    self._cur_ramp_users,
+                        "requests": count,
+                        "rps":      round(count / self._ramp_window, 2),
+                        "p50":      _pct(self._cur_ramp_ms, 0.50),
+                        "p95":      _pct(self._cur_ramp_ms, 0.95),
+                        "p99":      _pct(self._cur_ramp_ms, 0.99),
+                        "timeouts": self._cur_ramp_tout,
+                        "active":   False,
+                    })
+                self._cur_ramp_idx  += 1
+                self._cur_ramp_ms    = []
+                self._cur_ramp_tout  = 0
+                self._cur_ramp_users = self._current_users
+            self._cur_ramp_users = self._current_users
             if is_err:
-                self._step_tout[u] = self._step_tout.get(u, 0) + 1
+                self._cur_ramp_tout += 1
             else:
-                self._step_times.setdefault(u, []).append(rt)
+                self._cur_ramp_ms.append(rt)
 
     def on_utterance(self, utterance: str, scenario: str, user_id: int,
                      display: str, idx: int, total: int,
-                     response_ms: float, timed_out: bool):
+                     response_ms: float, timed_out: bool, bot_response: str = ""):
         filled  = int((idx / max(1, total)) * 10)
         bar     = "█" * filled + "░" * (10 - filled)
         status  = "✗ timeout" if timed_out else f"✓ {int(response_ms)}ms"
-        key = f"{scenario}||{utterance}"
+        key = f"{display}||{scenario}||{utterance}"
         with self._lock:
             self._utt_times.setdefault(key, [])
             self._utt_tout.setdefault(key, 0)
@@ -2253,6 +2350,10 @@ class _DashboardState:
                 self._utt_tout[key] += 1
             else:
                 self._utt_times[key].append(response_ms)
+                # keep response from the slowest call for this key
+                prev = self._utt_times[key]
+                if len(prev) == 1 or response_ms >= max(prev[:-1]):
+                    self._utt_response[key] = bot_response
             self._users[user_id] = {"name": display, "idx": idx, "total": total}
             self.feed.appendleft(f"  → {display:<20} [{bar}] {idx:>2}/{total}  {status}")
 
@@ -2262,22 +2363,24 @@ class _DashboardState:
 
     def snapshot(self) -> dict:
         with self._lock:
-            steps = []
-            for u in sorted(self._step_elapsed.keys()):
-                ts      = self._step_elapsed[u]
-                ms      = self._step_times.get(u, [])
-                tout    = self._step_tout.get(u, 0)
-                count   = len(ms) + tout
-                dur     = (max(ts) - min(ts)) if len(ts) > 1 else 0
-                rps     = round(count / dur, 2) if dur > 0 else 0.0
-                steps.append({
-                    "users":   u,
-                    "count":   count,
-                    "rps":     rps,
-                    "p50":     _pct(ms, 0.50),
-                    "p95":     _pct(ms, 0.95),
-                    "p99":     _pct(ms, 0.99),
-                    "timeouts": tout,
+            # Build ramp list: finalized rows + current in-progress row
+            ramps = list(self._ramps_done)
+            if self._cur_ramp_ms or self._cur_ramp_tout:
+                count = len(self._cur_ramp_ms) + self._cur_ramp_tout
+                elapsed_in_window = max(
+                    (time.time() - self.start_time) - self._cur_ramp_idx * self._ramp_window,
+                    1.0,
+                )
+                ramps.append({
+                    "ramp":     len(self._ramps_done) + 1,
+                    "users":    self._cur_ramp_users,
+                    "requests": count,
+                    "rps":      round(count / elapsed_in_window, 2),
+                    "p50":      _pct(self._cur_ramp_ms, 0.50),
+                    "p95":      _pct(self._cur_ramp_ms, 0.95),
+                    "p99":      _pct(self._cur_ramp_ms, 0.99),
+                    "timeouts": self._cur_ramp_tout,
+                    "active":   True,
                 })
             return {
                 "times":       {k: list(v) for k, v in self._times.items()},
@@ -2285,10 +2388,11 @@ class _DashboardState:
                 "ts":          list(self._ts),
                 "scenario_ts": {k: list(v) for k, v in self._scenario_ts.items()},
                 "errs":        list(self._errs),
-                "utt_times":   {k: list(v) for k, v in self._utt_times.items()},
-                "utt_tout":    dict(self._utt_tout),
-                "feed":        list(self.feed),
-                "steps":       steps,
+                "utt_times":    {k: list(v) for k, v in self._utt_times.items()},
+                "utt_tout":     dict(self._utt_tout),
+                "utt_response": dict(self._utt_response),
+                "feed":         list(self.feed),
+                "ramps":       ramps,
             }
 
 
@@ -2367,20 +2471,32 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         f"  SPAWNING  {spawn_bar}  {curr} / {target} users",
         style="bold white",
     ))
+    # ── Config FYI ───────────────────────────────────────────────────────────
+    root.add_row(Text(
+        f"  Peak: {target} users   Ramp: {params.get('spawn_rate', 0)}/min   "
+        f"Run time: {params.get('run_time', 0) // 60} min",
+        style=f"color({_G_DIM})",
+    ))
     # ── Stats summary (own line) ──────────────────────────────────────────────
     root.add_row(Text(
         f"  RPS: {rps:.1f}/s   Errors: {err_rate:.1f}%   "
         f"p95: [{p95_bar}] {all_p95}ms / {p95_tgt}ms{p95_warn}",
         style="bold white",
     ))
-    root.add_row(Text(""))
 
-    # ── Ramp steps ────────────────────────────────────────────────────────────
-    steps = [s for s in snap.get("steps", []) if s["count"] >= 3]
-    if steps:
-        root.add_row(Text("  RAMP STEPS", style="bold cyan"))
+    # ── Ramp steps — cap display so LIVE FEED stays visible ──────────────────
+    ramps = snap.get("ramps", [])
+    if ramps:
+        _finalized = [r for r in ramps if not r.get("active")]
+        _active    = [r for r in ramps if r.get("active")]
+        ramps_disp = (_finalized + _active)[-5:]   # last 5 rows total
+        root.add_row(Text(
+            f"  RAMP STEPS  ({len(_finalized)} completed)",
+            style="bold cyan",
+        ))
         st = Table(show_header=True, header_style="bold cyan",
-                   box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=False)
+                   box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=True)
+        st.add_column("Ramp",     justify="right", min_width=5)
         st.add_column("Users",    justify="right", min_width=6)
         st.add_column("Requests", justify="right", min_width=8)
         st.add_column("RPS",      justify="right", min_width=6)
@@ -2388,25 +2504,47 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         st.add_column("p95",      justify="right", min_width=6)
         st.add_column("p99",      justify="right", min_width=6)
         st.add_column("T/O",      justify="right", min_width=5)
-        for s in steps:
-            p95c = "bold red" if s["p95"] > state.p95_target else "white"
-            toc  = "bold red" if s["timeouts"] > 0 else "white"
+        for s in ramps_disp:
+            live  = s.get("active", False)
+            p95c  = "bold red" if s["p95"] > state.p95_target else ("cyan" if live else "white")
+            toc   = "bold red" if s["timeouts"] > 0 else ("cyan" if live else "white")
+            rn    = f'▶ {s["ramp"]}' if live else str(s["ramp"])
+            rstyle = "bold cyan" if live else "dim"
             st.add_row(
-                Text(str(s["users"]),    style="bold cyan"),
-                Text(str(s["count"])),
-                Text(f'{s["rps"]:.1f}'),
-                Text(str(s["p50"])),
+                Text(rn,                 style="bold cyan" if live else "white"),
+                Text(str(s["users"]),    style=rstyle),
+                Text(str(s["requests"]), style=rstyle),
+                Text(f'{s["rps"]:.2f}',  style=rstyle),
+                Text(str(s["p50"]),      style=rstyle),
                 Text(str(s["p95"]),      style=p95c),
-                Text(str(s["p99"])),
+                Text(str(s["p99"]),      style=rstyle),
                 Text(str(s["timeouts"]), style=toc),
             )
         root.add_row(st)
-        root.add_row(Text(""))
+        # ── Ramp trend — one line, one bar per ramp step ─────────────────────
+        all_ramps = _finalized + _active
+        if len(all_ramps) >= 2:
+            def _ramp_spark(values: list) -> str:
+                blocks = "▁▂▃▄▅▆▇█"
+                mx = max(values) or 1
+                return "".join(blocks[min(int(v / mx * 7), 7)] for v in values)
+            _rv = all_ramps  # full history, not the capped display slice
+            root.add_row(Text(
+                f"  RAMP TREND  "
+                f"Users {_ramp_spark([r['users'] for r in _rv])}  "
+                f"Req {_ramp_spark([r['requests'] for r in _rv])}  "
+                f"RPS {_ramp_spark([r['rps'] for r in _rv])}  "
+                f"p50 {_ramp_spark([r['p50'] for r in _rv])}  "
+                f"p95 {_ramp_spark([r['p95'] for r in _rv])}  "
+                f"p99 {_ramp_spark([r['p99'] for r in _rv])}  "
+                f"T/O {_ramp_spark([r['timeouts'] for r in _rv])}",
+                style=f"color({_G_DIM})",
+            ))
 
     # ── Profile stats ─────────────────────────────────────────────────────────
     root.add_row(Text("  PROFILE STATS", style="bold cyan"))
     tbl = Table(show_header=True, header_style="bold cyan",
-                box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=False)
+                box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=True)
     tbl.add_column("User · Scenario", min_width=32)
     tbl.add_column("Requests", justify="right", min_width=8)
     tbl.add_column("p50",      justify="right", min_width=6)
@@ -2449,59 +2587,86 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         "  Trend column: each bar = p95 latency in a 30s window  ·  taller bar = slower responses  ·  ▁ low  █ high",
         style=f"color({_G_DIM})",
     ))
-
-    # ── Sparklines ────────────────────────────────────────────────────────────
     err_ts = [(t, 1000.0 if e else 0.0) for t, e in snap["errs"]]
-    root.add_row(Text(f"  {_sparkline(snap['ts'])}  overall p95  (each bar = 30s bucket)",  style="cyan"))
-    root.add_row(Text(f"  {_sparkline(err_ts)}  error rate   (bar height = errors in bucket)", style="red"))
+    root.add_row(Text(f"  {_sparkline(err_ts)}  error rate  (bar height = errors in bucket)", style="red"))
     root.add_row(Text(""))
-
     # ── Utterance tables ──────────────────────────────────────────────────────
-    utt_data = []
+    # Group by (scenario, utterance) across all profile instances.
+    # Track combined times/timeouts but surface the single worst-p95 instance
+    # in the Profile column so the user can see exactly who is lagging.
+    _utt_merged: dict = {}
     for key, times in snap["utt_times"].items():
-        scenario_k, utt = key.split("||", 1) if "||" in key else ("", key)
-        profile_k = state.profile_map.get(scenario_k, scenario_k)
-        tout_u    = snap["utt_tout"].get(key, 0)
-        utt_data.append((utt, profile_k, times, tout_u))
-
-    def _utt_table(title: str, rows: list, col: str):
-        root.add_row(Text(f"  {title}", style="bold cyan"))
-        ut = Table(show_header=True, header_style="bold cyan",
-                   box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=False)
-        ut.add_column("Profile",   min_width=16)
-        ut.add_column("Utterance", min_width=32)
-        ut.add_column("p50",   justify="right", min_width=6)
-        ut.add_column("p95",   justify="right", min_width=6)
-        ut.add_column("Count", justify="right", min_width=6)
-        for utt, profile_k, times, tout_u in rows[:8]:
-            p50_u  = _pct(times, 0.50)
-            p95_u  = _pct(times, 0.95)
-            cnt    = len(times) + tout_u
-            plabel = (profile_k[:14] + "…") if len(profile_k) > 15 else profile_k
-            ulabel = (utt[:30] + "…") if len(utt) > 31 else utt
-            ut.add_row(Text(plabel, style="cyan"),
-                       Text(ulabel, style=col),
-                       Text(str(p50_u), style=col),
-                       Text(str(p95_u), style=col),
-                       Text(str(cnt)))
-        root.add_row(ut)
+        parts = key.split("||", 2)
+        if len(parts) == 3:
+            profile_k, scenario_k, utt = parts
+        elif len(parts) == 2:
+            scenario_k, utt = parts
+            profile_k = state.profile_map.get(scenario_k, scenario_k)
+        else:
+            profile_k, scenario_k, utt = "", "", key
+        tout_u = snap["utt_tout"].get(key, 0)
+        mk = (scenario_k, utt)
+        if mk not in _utt_merged:
+            _utt_merged[mk] = {"times": [], "tout": 0,
+                                "worst_profile": profile_k, "worst_p95": 0,
+                                "worst_response": ""}
+        _utt_merged[mk]["times"].extend(times)
+        _utt_merged[mk]["tout"] += tout_u
+        inst_p95 = _pct(times, 0.95)
+        if inst_p95 > _utt_merged[mk]["worst_p95"]:
+            _utt_merged[mk]["worst_p95"] = inst_p95
+            _utt_merged[mk]["worst_profile"] = profile_k
+            _utt_merged[mk]["worst_response"] = snap.get("utt_response", {}).get(key, "")
+    utt_data = [
+        (utt, d["worst_profile"], d["times"], d["tout"], d["worst_response"])
+        for (_sc, utt), d in _utt_merged.items()
+    ]
 
     if utt_data:
         slowest = sorted(utt_data, key=lambda x: _pct(x[2], 0.95), reverse=True)
         fastest = sorted(utt_data, key=lambda x: _pct(x[2], 0.95))
-        _utt_table("SLOWEST UTTERANCES  (top 8 by p95)", slowest, "bold red")
-        root.add_row(Text(""))
-        _utt_table("FASTEST UTTERANCES  (top 8 by p95)", fastest, "bold green")
-        root.add_row(Text(""))
+
+        def _utt_rows(ut: Table, rows: list, col: str):
+            for utt, profile_k, times, tout_u, bot_resp in rows[:4]:
+                p50_u  = _pct(times, 0.50)
+                p95_u  = _pct(times, 0.95)
+                cnt    = len(times) + tout_u
+                plabel = (profile_k[:20] + "…") if len(profile_k) > 21 else profile_k
+                ulabel = (utt[:28] + "…") if len(utt) > 29 else utt
+                _resp  = " ".join(bot_resp.split())
+                rlabel = (_resp[:38] + "…") if len(_resp) > 39 else _resp
+                ut.add_row(Text(plabel, style="cyan"),
+                           Text(ulabel, style=col),
+                           Text(str(p50_u), style=col),
+                           Text(str(p95_u), style=col),
+                           Text(str(cnt)),
+                           Text(rlabel, style="dim"))
+
+        root.add_row(Text("  UTTERANCES", style="bold cyan"))
+        ut = Table(show_header=True, header_style="bold cyan",
+                   box=rich_box.SIMPLE_HEAD, padding=(0, 2), expand=True)
+        ut.add_column("Profile",      min_width=22)
+        ut.add_column("Utterance",    min_width=30)
+        ut.add_column("p50",          justify="right", min_width=6)
+        ut.add_column("p95",          justify="right", min_width=6)
+        ut.add_column("Count",        justify="right", min_width=6)
+        ut.add_column("Bot Response", min_width=40)
+        _utt_rows(ut, slowest, "bold red")
+        ut.add_row(
+            Text("── fastest ──", style="dim"),
+            Text("", style="dim"), Text("", style="dim"),
+            Text("", style="dim"), Text("", style="dim"),
+            Text("", style="dim"),
+        )
+        _utt_rows(ut, fastest, "bold green")
+        root.add_row(ut)
 
 
     # ── Live feed ─────────────────────────────────────────────────────────────
     root.add_row(Text("  LIVE FEED", style="bold cyan"))
-    for entry in list(snap["feed"])[:8]:
+    for entry in list(snap["feed"])[:5]:
         style = "bold red" if "timeout" in entry else ("bold yellow" if "spawned" in entry else "white")
         root.add_row(Text(entry, style=style))
-
-    root.add_row(Text(""))
 
     # ── Acronym legend ────────────────────────────────────────────────────────
     legend = (
@@ -2519,9 +2684,43 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
 
 # ── Run parameters ────────────────────────────────────────────────────────────
 
+_HELP_MD = """
+# GRUNTMASTER 6000 — Quick Reference
+
+## What does it test?
+Fires concurrent simulated users at your Copilot Studio bot, measures
+response latency for each utterance, and generates a per-profile HTML report.
+
+## Key metrics
+| Metric | Meaning |
+|--------|---------|
+| **p50** | Median response time — half of requests were faster |
+| **p95** | 95th percentile — 5% of requests took longer than this |
+| **p99** | 99th percentile — worst-1% threshold |
+| **T/O** | Timed-out requests (no bot reply within Reply Timeout) |
+| **RPS** | Requests per second at a given user-count step |
+
+## Trend column (live dashboard)
+Each bar in the Trend sparkline = p95 latency in a **30-second window**.
+Taller bar = slower responses. ▁ = fast · █ = slow.
+
+## Ramp steps
+The dashboard tracks RPS / p50 / p95 / p99 at each user-count level as the
+load ramps up. Use this to find your bot's scaling knee.
+
+## Tips
+- Set **Peak users** to your expected peak concurrent load.
+- **Ramp-up rate** controls how fast you reach that peak (users per minute).
+- Run time should be ≥5 min for stable p95 readings.
+- Keep **Reply timeout** ≥ your bot's known worst-case response time.
+"""
+
+
 def _collect_run_params() -> dict:
     """Show all run params with defaults pre-filled. User selects any to change."""
     _START = "  ▶  Start test"
+    _NOTES = "  ✎  Add test notes"
+    _HELP  = "  ?  Help"
     _EXIT  = "  ✕  Exit"
 
     state = {
@@ -2530,6 +2729,7 @@ def _collect_run_params() -> dict:
         "run_mins": test_config["run_time_mins"],
         "think":    test_config["think_min"],
         "timeout":  int(test_config["frame_timeout"]),
+        "notes":    "",
     }
 
     def _prow(label: str, value, unit: str, hint: str) -> str:
@@ -2544,6 +2744,7 @@ def _collect_run_params() -> dict:
             border_fg="99", padding="1 4", margin="1 0 1 0",
         )
 
+        notes_label = (state["notes"][:40] + "…") if len(state["notes"]) > 40 else (state["notes"] or "none")
         items = [
             _prow("Peak users",                    state["users"],    "users",   "how many hit the bot at the same time"),
             _prow("Ramp-up rate",                  state["spawn"],    "users/m", "how many new users join per minute"),
@@ -2554,12 +2755,14 @@ def _collect_run_params() -> dict:
                   "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket",
                   "",
                   "set by GRUNTMASTER_TRANSPORT env var" if test_config["transport"] == "http" else "🔒 HTTP polling coming soon"),
+            _prow("Notes",                         notes_label,       "",        "free-text description embedded in report"),
             _START,
+            _HELP,
             _EXIT,
         ]
 
         choice = _gchoose(*items, header="\n  ↑ ↓  navigate     Enter  select\n",
-                          height=min(len(items) + 4, 16))
+                          height=min(len(items) + 4, 18))
 
         if not choice:
             continue
@@ -2567,6 +2770,13 @@ def _collect_run_params() -> dict:
             sys.exit(0)
         if choice.strip() == _START.strip():
             break
+        if choice.strip() == _HELP.strip():
+            if _gum_ok():
+                _gformat(_HELP_MD)
+            else:
+                print(_HELP_MD)
+            input("\n  Press Enter to return…")
+            continue
 
         idx = next((i for i, it in enumerate(items) if it.strip() == choice.strip()), -1)
 
@@ -2590,6 +2800,19 @@ def _collect_run_params() -> dict:
             state["timeout"]  = _edit("Give up waiting for a reply after how many seconds?", state["timeout"])
         elif idx == 5:
             _gprint("  HTTP transport is not yet enabled — coming soon.", fg="yellow", padding="0 2")
+        elif idx == 6:
+            if _gum_ok():
+                notes = _gwrite(
+                    "Describe this test run…",
+                    header="Test notes  (Ctrl-D to save · Esc to cancel)",
+                    width=68, height=6,
+                )
+                if notes:
+                    state["notes"] = notes
+            else:
+                v = _ginput("Test notes", header="Describe this test run")
+                if v:
+                    state["notes"] = v
 
     test_config["think_min"]     = state["think"]
     test_config["think_max"]     = state["think"]
@@ -2598,7 +2821,12 @@ def _collect_run_params() -> dict:
     test_config["spawn_rate"]    = state["spawn"]
     test_config["run_time_mins"] = state["run_mins"]
 
-    return {"users": state["users"], "spawn_rate": state["spawn"], "run_time": state["run_mins"] * 60}
+    return {
+        "users":      state["users"],
+        "spawn_rate": state["spawn"],
+        "run_time":   state["run_mins"] * 60,
+        "notes":      state["notes"],
+    }
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -2626,6 +2854,13 @@ if __name__ == "__main__":
             border_style="yellow",
         ))
         console.print()
+        if len(_needs_auth) > 1 and _gum_ok():
+            _chosen = _gchoose_multi(
+                *_needs_auth,
+                header="\n  Select profiles to authenticate now (Space = toggle, Enter = confirm):\n",
+                height=min(len(_needs_auth) + 4, 14),
+            )
+            _needs_auth = _chosen if _chosen else _needs_auth
         for _username in _needs_auth:
             if not _rocket_auth(_username):
                 console.print(f"[bold red]Auth failed for {_username}. Stopping.[/bold red]")
@@ -2681,7 +2916,7 @@ if __name__ == "__main__":
         _kw = gevent.spawn(_keywatch)
 
         os.system("cls" if os.name == "nt" else "clear")
-        with Live(console=console, auto_refresh=False) as _live:
+        with Live(console=console, auto_refresh=False, screen=True) as _live:
             _deadline = time.time() + _params["run_time"]
             while time.time() < _deadline and not _stop_run[0]:
                 _curr = getattr(_runner, "user_count", 0)
@@ -2698,13 +2933,16 @@ if __name__ == "__main__":
 
         _stop_run[0] = True
         _kw.kill()
-        _runner.quit()
-        _runner.greenlet.join()
+        try:
+            _runner.quit()
+            _runner.greenlet.join(timeout=8)   # don't hang if a user greenlet is mid-sleep
+        except Exception:
+            pass
         _active_dashboard = None
         with _spawn_lock:
             _spawn_counters.clear()
 
-        gevent.sleep(0.3)
+        os.system("cls" if os.name == "nt" else "clear")
         _celebrate("Test complete")
 
         if _detail_log_path and _detail_log_path.exists():
@@ -2712,15 +2950,18 @@ if __name__ == "__main__":
                 sys.stdout.write("\n  ⏳  Generating report…\n")
                 sys.stdout.flush()
                 from report import generate_report as _gen_report
+                _run_notes = _params.get("notes", "")
                 _rep = _with_spinner(
                     "Generating HTML report…",
-                    lambda: _gen_report(_detail_log_path, p95_target=test_config["p95_target_ms"]),
+                    lambda: _gen_report(_detail_log_path, p95_target=test_config["p95_target_ms"],
+                                        notes=_run_notes),
                 )
                 _gprint(f"  Report → {_rep}", fg=_G_CYAN, bold=True, padding="0 2", margin="0 1")
             except ImportError:
                 pass
             except Exception as _e:
-                log.debug("Report generation failed: %s", _e)
+                sys.stdout.write(f"\n  Report error: {_e}\n")
+                sys.stdout.flush()
 
         while True:
             _post = _gchoose(
