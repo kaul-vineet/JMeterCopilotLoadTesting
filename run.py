@@ -2093,8 +2093,11 @@ class CopilotBaseUser(User):
             gevent.sleep(1)
             return
 
-        # Proactively refresh stream if it is older than 45s — before it expires mid-reply
-        if time.time() - getattr(self, "_stream_opened_at", 0) > 45:
+        # Refresh if stream age + response_timeout would exceed DirectLine's ~60s idle limit.
+        # threshold = 60s − response_timeout − 5s safety buffer, floor 10s.
+        _rt = test_config.get("response_timeout", 30.0)
+        _refresh_threshold = max(10.0, 60.0 - _rt - 5.0)
+        if time.time() - getattr(self, "_stream_opened_at", 0) > _refresh_threshold:
             self._refresh_stream()
 
         # Send with error classification
