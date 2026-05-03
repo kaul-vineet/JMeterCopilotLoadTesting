@@ -2521,7 +2521,6 @@ class _DashboardState:
                 self._cur_ramp_tout  = 0
                 self._cur_ramp_429   = 0
                 self._cur_ramp_users = self._current_users
-                self.on_event("▶", f"Ramp {self._cur_ramp_idx + 1} — {self._current_users} users")
             self._cur_ramp_users = self._current_users
             if is_err:
                 self._cur_ramp_tout += 1
@@ -2943,21 +2942,21 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
 
     # ── Events feed ───────────────────────────────────────────────────────────
     events = snap.get("events", [])
-    if events:
+    p_events = [ev for ev in events if isinstance(ev, dict) and ev.get("icon") != "▶"]
+    if p_events:
         root.add_row(Text("  EVENTS", style="bold cyan"))
-        for ev in events[:8]:
-            if isinstance(ev, dict):
-                icon  = ev.get("icon", "")
-                entry = f"  {ev['ts']}  R{ev['ramp']}  {icon}  {ev['message']}"
+        for ev in p_events[:8]:
+            icon = ev.get("icon", "")
+            if icon == "⚡":
+                prefix = "[P0] "
+                style  = "bold red"
+            elif icon in ("✗", "⚠"):
+                prefix = "[P1] "
+                style  = "bold yellow" if icon == "⚠" else "red"
             else:
-                icon  = ""
-                entry = ev
-            if "⚡" in entry or "✗" in entry:
-                style = "bold red"
-            elif "⚠" in entry:
-                style = "bold yellow"
-            else:
-                style = "dim"
+                prefix = ""
+                style  = "dim"
+            entry = f"  {ev['ts']}  R{ev['ramp']}  {icon}  {prefix}{ev['message']}"
             root.add_row(Text(entry, style=style))
 
     # ── Acronym legend ────────────────────────────────────────────────────────
