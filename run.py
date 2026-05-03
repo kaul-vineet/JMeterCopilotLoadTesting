@@ -101,6 +101,20 @@ test_config: dict = {
     "transport":     os.environ.get("GRUNTMASTER_TRANSPORT", "websocket").lower(),
 }
 
+from requests.adapters import HTTPAdapter
+
+_session = requests.Session()
+
+def _init_session(user_count: int):
+    """Resize connection pool to match test scale. Called once before test starts."""
+    adapter = HTTPAdapter(
+        pool_connections=1,
+        pool_maxsize=user_count + 50,
+        pool_block=False,
+    )
+    _session.mount("https://", adapter)
+    _session.mount("http://", adapter)
+
 _active_dashboard: "Optional[_DashboardState]" = None
 _spawn_counters: dict[str, int] = {}   # class_name → spawn sequence number
 _spawn_lock     = threading.Lock()
@@ -277,12 +291,12 @@ def fetch_directline_token(aad_token: Optional[str] = None) -> str:
         headers = {}
         if ENDPOINT_NEEDS_AUTH and aad_token:
             headers["Authorization"] = f"Bearer {aad_token}"
-        resp = requests.get(TOKEN_ENDPOINT, headers=headers, timeout=10)
+        resp = _session.get(TOKEN_ENDPOINT, headers=headers, timeout=10)
         resp.raise_for_status()
         return resp.json()["token"]
 
     if DL_SECRET:
-        resp = requests.post(
+        resp = _session.post(
             f"{DIRECTLINE_BASE}/v3/directline/tokens/generate",
             headers={"Authorization": f"Bearer {DL_SECRET}"},
             timeout=10,
@@ -294,7 +308,7 @@ def fetch_directline_token(aad_token: Optional[str] = None) -> str:
 
 
 def start_conversation(dl_token: str) -> Conversation:
-    resp = requests.post(
+    resp = _session.post(
         f"{DIRECTLINE_BASE}/v3/directline/conversations",
         headers={"Authorization": f"Bearer {dl_token}", "Content-Type": "application/json"},
         timeout=10,
@@ -312,7 +326,7 @@ def open_websocket(stream_url: str) -> websocket.WebSocket:
 
 def send_utterance(conversation: Conversation, utterance: str) -> tuple[str, float]:
     send_time = time.time()
-    resp = requests.post(
+    resp = _session.post(
         f"{DIRECTLINE_BASE}/v3/directline/conversations/{conversation.id}/activities",
         headers={"Authorization": f"Bearer {conversation.token}", "Content-Type": "application/json"},
         json={"locale": "en-US", "type": "message", "from": {"id": "load-test-user"}, "text": utterance},
@@ -328,7 +342,7 @@ def send_token_exchange(conversation: Conversation, invoke_id: str, connection_n
     Copilot Studio sends this when 'Authenticate manually' is enabled —
     the client must reply with the user's AAD token to complete SSO.
     """
-    resp = requests.post(
+    resp = _session.post(
         f"{DIRECTLINE_BASE}/v3/directline/conversations/{conversation.id}/activities",
         headers={"Authorization": f"Bearer {conversation.token}", "Content-Type": "application/json"},
         json={
@@ -1921,6 +1935,20 @@ def _retry_call(fn, attempts: int = 3, base_delay: float = 1.0):
 # Show a dashboard warning when Locust reports high CPU
 _cpu_warn_ts: float = 0.0
 
+_circuit_open_until: float = 0.0
+
+def _trip_circuit():
+    global _circuit_open_until
+    _circuit_open_until = time.time() + 60.0
+    if _active_dashboard is not None:
+        _active_dashboard.on_event("⚡", "429 rate limit hit — circuit open for 60s")
+        _active_dashboard.on_429()
+    log.warning("Circuit breaker tripped — all users pausing 60s")
+
+def _is_circuit_open() -> bool:
+    return time.time() < _circuit_open_until
+
+
 class _CpuWarnHandler(logging.Handler):
     def emit(self, record):
         global _cpu_warn_ts
@@ -1998,15 +2026,33 @@ class CopilotBaseUser(User):
         utterance = self.utterances[self._idx]
         self._idx += 1
 
-        try:
-            activity_id, send_time = _retry_call(
-                lambda: send_utterance(self.conversation, utterance),
-                attempts=2, base_delay=1.0,
-            )
-        except Exception as e:
-            log.error("Send utterance failed: %s", e)
-            _fire_metric(self.environment, "Send Utterance", 0, error=e)
-            raise StopUser()
+        # Check circuit before sending
+        if _is_circuit_open():
+            gevent.sleep(1)
+            return
+
+        # Send with error classification
+        for _attempt in range(2):
+            try:
+                activity_id, send_time = send_utterance(self.conversation, utterance)
+                break
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 429:
+                    _trip_circuit()
+                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    gevent.sleep(1)
+                    return  # stay alive, circuit will clear in 60s
+                if _attempt == 1:
+                    log.error("Send utterance failed: %s", e)
+                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    raise StopUser()
+                gevent.sleep(1)
+            except Exception as e:
+                if _attempt == 1:
+                    log.error("Send utterance failed: %s", e)
+                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    raise StopUser()
+                gevent.sleep(1)
 
         response_timeout = max(15.0, test_config.get("response_timeout", 30.0))
         try:
@@ -2063,7 +2109,7 @@ class CopilotBaseUser(User):
                 utterance, self.scenario_name, id(self), profile_label,
                 self._idx, len(self.utterances), response.latency_ms, False,
                 bot_response=bot_text)
-        time.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
+        gevent.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
         # All utterances sent — close this conversation and open a fresh one
         if self._idx >= len(self.utterances):
@@ -2107,7 +2153,7 @@ def read_response_http(
         if watermark is not None:
             url += f"?watermark={watermark}"
         try:
-            r = requests.get(
+            r = _session.get(
                 url,
                 headers={"Authorization": f"Bearer {conversation.token}"},
                 timeout=5,
@@ -2214,15 +2260,33 @@ class CopilotHttpUser(CopilotBaseUser):
         utterance = self.utterances[self._idx]
         self._idx += 1
 
-        try:
-            activity_id, send_time = _retry_call(
-                lambda: send_utterance(self.conversation, utterance),
-                attempts=2, base_delay=1.0,
-            )
-        except Exception as e:
-            log.error("Send utterance failed: %s", e)
-            _fire_metric(self.environment, "Send Utterance", 0, error=e)
-            raise StopUser()
+        # Check circuit before sending
+        if _is_circuit_open():
+            gevent.sleep(1)
+            return
+
+        # Send with error classification
+        for _attempt in range(2):
+            try:
+                activity_id, send_time = send_utterance(self.conversation, utterance)
+                break
+            except requests.exceptions.HTTPError as e:
+                if e.response is not None and e.response.status_code == 429:
+                    _trip_circuit()
+                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    gevent.sleep(1)
+                    return  # stay alive, circuit will clear in 60s
+                if _attempt == 1:
+                    log.error("Send utterance failed: %s", e)
+                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    raise StopUser()
+                gevent.sleep(1)
+            except Exception as e:
+                if _attempt == 1:
+                    log.error("Send utterance failed: %s", e)
+                    _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    raise StopUser()
+                gevent.sleep(1)
 
         try:
             response = read_response_http(
@@ -2276,7 +2340,7 @@ class CopilotHttpUser(CopilotBaseUser):
                 utterance, self.scenario_name, id(self), profile_label,
                 self._idx, len(self.utterances), response.latency_ms, False,
                 bot_response=bot_text)
-        time.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
+        gevent.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
         if self._idx >= len(self.utterances):
             self._open_conversation()
@@ -2347,6 +2411,7 @@ class _DashboardState:
         self._ramps_done:       list        = []   # finalized ramp dicts
         self._cur_ramp_ms:      list        = []   # response_ms in current window
         self._cur_ramp_tout:    int         = 0
+        self._cur_ramp_429:     int         = 0
         self._cur_ramp_idx:     int         = 0    # which 60s window we're in
         self._cur_ramp_users:   int         = 0    # last user count seen this window
 
@@ -2379,19 +2444,21 @@ class _DashboardState:
                 if self._cur_ramp_ms or self._cur_ramp_tout:
                     count = len(self._cur_ramp_ms) + self._cur_ramp_tout
                     self._ramps_done.append({
-                        "ramp":     len(self._ramps_done) + 1,
-                        "users":    self._cur_ramp_users,
-                        "requests": count,
-                        "rps":      round(count / self._ramp_window, 2),
-                        "p50":      _pct(self._cur_ramp_ms, 0.50),
-                        "p95":      _pct(self._cur_ramp_ms, 0.95),
-                        "p99":      _pct(self._cur_ramp_ms, 0.99),
-                        "timeouts": self._cur_ramp_tout,
-                        "active":   False,
+                        "ramp":         len(self._ramps_done) + 1,
+                        "users":        self._cur_ramp_users,
+                        "requests":     count,
+                        "rps":          round(count / self._ramp_window, 2),
+                        "p50":          _pct(self._cur_ramp_ms, 0.50),
+                        "p95":          _pct(self._cur_ramp_ms, 0.95),
+                        "p99":          _pct(self._cur_ramp_ms, 0.99),
+                        "timeouts":     self._cur_ramp_tout,
+                        "rate_limited": self._cur_ramp_429,
+                        "active":       False,
                     })
                 self._cur_ramp_idx  += 1
                 self._cur_ramp_ms    = []
                 self._cur_ramp_tout  = 0
+                self._cur_ramp_429   = 0
                 self._cur_ramp_users = self._current_users
                 self.on_event("▶", f"Ramp {self._cur_ramp_idx} started — {self._current_users} users")
             self._cur_ramp_users = self._current_users
@@ -2425,6 +2492,10 @@ class _DashboardState:
         with self._lock:
             self.events.appendleft(f"  {ts}  {icon}  {message}")
 
+    def on_429(self):
+        with self._lock:
+            self._cur_ramp_429 += 1
+
     def snapshot(self) -> dict:
         with self._lock:
             # Build ramp list: finalized rows + current in-progress row
@@ -2436,15 +2507,16 @@ class _DashboardState:
                     1.0,
                 )
                 ramps.append({
-                    "ramp":     len(self._ramps_done) + 1,
-                    "users":    self._cur_ramp_users,
-                    "requests": count,
-                    "rps":      round(count / elapsed_in_window, 2),
-                    "p50":      _pct(self._cur_ramp_ms, 0.50),
-                    "p95":      _pct(self._cur_ramp_ms, 0.95),
-                    "p99":      _pct(self._cur_ramp_ms, 0.99),
-                    "timeouts": self._cur_ramp_tout,
-                    "active":   True,
+                    "ramp":         len(self._ramps_done) + 1,
+                    "users":        self._cur_ramp_users,
+                    "requests":     count,
+                    "rps":          round(count / elapsed_in_window, 2),
+                    "p50":          _pct(self._cur_ramp_ms, 0.50),
+                    "p95":          _pct(self._cur_ramp_ms, 0.95),
+                    "p99":          _pct(self._cur_ramp_ms, 0.99),
+                    "timeouts":     self._cur_ramp_tout,
+                    "rate_limited": self._cur_ramp_429,
+                    "active":       True,
                 })
             return {
                 "times":       {k: list(v) for k, v in self._times.items()},
@@ -2553,6 +2625,13 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
             "consider reducing users or spawning fewer per second",
             style="bold red",
         ))
+    if _is_circuit_open():
+        remaining = int(_circuit_open_until - time.time())
+        root.add_row(Text(
+            f"  ⚡ CIRCUIT OPEN — DirectLine rate limit (429) hit — "
+            f"all users paused — resuming in {remaining}s",
+            style="bold red on dark_red",
+        ))
 
     # ── Ramp steps ───────────────────────────────────────────────────────────
     ramps = snap.get("ramps", [])
@@ -2574,10 +2653,12 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         st.add_column("p95",      justify="right", min_width=6)
         st.add_column("p99",      justify="right", min_width=6)
         st.add_column("T/O",      justify="right", min_width=5)
+        st.add_column("429",      justify="right", min_width=5)
         for s in ramps_disp:
             live  = s.get("active", False)
             p95c  = "bold red" if s["p95"] > state.p95_target else ("cyan" if live else "white")
             toc   = "bold red" if s["timeouts"] > 0 else ("cyan" if live else "white")
+            rlc   = "bold red" if s.get("rate_limited", 0) > 0 else ("cyan" if live else "white")
             rn    = f'▶ {s["ramp"]}' if live else str(s["ramp"])
             rstyle = "bold cyan" if live else "dim"
             st.add_row(
@@ -2589,6 +2670,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
                 Text(str(s["p95"]),      style=p95c),
                 Text(str(s["p99"]),      style=rstyle),
                 Text(str(s["timeouts"]), style=toc),
+                Text(str(s.get("rate_limited", 0)), style=rlc),
             )
         root.add_row(st)
         # ── Ramp trend — one line, one bar per ramp step ─────────────────────
@@ -2757,6 +2839,94 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
 
     root.add_row(Text("  Press Q to stop test and go to New Run", style="dim"))
     return root
+
+
+def _audit(csv_path: Path, snapshot: dict):
+    """Four independent checks on test data. Prints results to console."""
+    import numpy as np
+
+    console.print()
+    console.print(Text("  AUDIT", style="bold cyan"))
+    console.print(Text("  " + "─" * 65, style="dim"))
+
+    all_ok = True
+
+    # ── 1. Timestamp recheck ─────────────────────────────────────────
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        if "utterance_sent_at" in df.columns and "response_received_at" in df.columns:
+            df["_recomputed_ms"] = (df["response_received_at"] - df["utterance_sent_at"]) * 1000
+            df["_delta"] = (df["_recomputed_ms"] - df["response_ms"]).abs()
+            bad = (df["_delta"] > 10).sum()
+            max_delta = int(df["_delta"].max())
+            total = len(df)
+            if bad == 0:
+                console.print(Text(f"  Timestamp recheck      {total} / {total} rows agree  (max delta: {max_delta}ms)   ✓", style="green"))
+            else:
+                console.print(Text(f"  Timestamp recheck      {bad} / {total} rows diverge >10ms  (max delta: {max_delta}ms)   ✗", style="bold red"))
+                all_ok = False
+        else:
+            console.print(Text("  Timestamp recheck      skipped — CSV missing timestamp columns", style="dim"))
+    except Exception as e:
+        console.print(Text(f"  Timestamp recheck      error: {e}", style="dim"))
+
+    # ── 2. Count reconciliation ──────────────────────────────────────
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        csv_total = len(df)
+        dash_total = sum(len(v) for v in snapshot["times"].values()) + sum(snapshot["tout"].values())
+        if csv_total == dash_total:
+            console.print(Text(f"  Count reconciliation   dashboard {dash_total} = csv {csv_total}                   ✓", style="green"))
+        else:
+            console.print(Text(f"  Count reconciliation   dashboard {dash_total} ≠ csv {csv_total}  ← {abs(dash_total - csv_total)} discrepancy   ✗", style="bold red"))
+            all_ok = False
+    except Exception as e:
+        console.print(Text(f"  Count reconciliation   error: {e}", style="dim"))
+
+    # ── 3. Percentile cross-check ────────────────────────────────────
+    try:
+        import pandas as pd
+        all_times = [v for vlist in snapshot["times"].values() for v in vlist]
+        if len(all_times) >= 20:
+            our_p95   = _pct(all_times, 0.95)
+            np_p95    = int(np.percentile(all_times, 95, method="lower"))
+            pd_p95    = int(pd.Series(all_times).quantile(0.95, interpolation="lower"))
+            if our_p95 == np_p95 == pd_p95:
+                console.print(Text(f"  p95 cross-check        _pct={our_p95}  numpy={np_p95}  pandas={pd_p95}   ✓", style="green"))
+            else:
+                console.print(Text(f"  p95 cross-check        _pct={our_p95}  numpy={np_p95}  pandas={pd_p95}   ✗", style="bold red"))
+                all_ok = False
+        else:
+            console.print(Text("  p95 cross-check        skipped — fewer than 20 data points", style="dim"))
+    except Exception as e:
+        console.print(Text(f"  p95 cross-check        error: {e}", style="dim"))
+
+    # ── 4. Profile sum check ─────────────────────────────────────────
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        if "profile" in df.columns:
+            df["base_profile"] = df["profile"].str.replace(r'\s*#\d+$', '', regex=True).str.strip()
+            per_profile = df.groupby("base_profile").size().to_dict()
+            profile_sum = sum(per_profile.values())
+            total = len(df)
+            parts = "  +  ".join(f"{k} {v}" for k, v in sorted(per_profile.items()))
+            if profile_sum == total:
+                console.print(Text(f"  Profile sum check      {parts} = {total}   ✓", style="green"))
+            else:
+                console.print(Text(f"  Profile sum check      {parts} = {profile_sum} ≠ {total}   ✗", style="bold red"))
+                all_ok = False
+        else:
+            console.print(Text("  Profile sum check      skipped — CSV missing profile column", style="dim"))
+    except Exception as e:
+        console.print(Text(f"  Profile sum check      error: {e}", style="dim"))
+
+    console.print(Text("  " + "─" * 65, style="dim"))
+    if not all_ok:
+        console.print(Text("  ⚠ Audit found discrepancies — review before sharing results", style="bold red"))
+    console.print()
 
 
 # ── Run parameters ────────────────────────────────────────────────────────────
@@ -2973,6 +3143,7 @@ if __name__ == "__main__":
         )
         _active_dashboard = _dash
         _env.events.request.add_listener(_dash.on_request)
+        _init_session(_params["users"])
         _runner.start(user_count=_params["users"], spawn_rate=max(0.01, _params["spawn_rate"] / 60))
 
         _stop_run   = [False]
@@ -3020,6 +3191,8 @@ if __name__ == "__main__":
         # Print final dashboard snapshot to normal screen — options appear below it
         _final_snap = _dash.snapshot()
         console.print(_render_dashboard(_final_snap, _runner, _params, _dash))
+        if _detail_log_path and _detail_log_path.exists():
+            _audit(_detail_log_path, _final_snap)
 
         _active_dashboard = None
         with _spawn_lock:
