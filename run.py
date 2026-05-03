@@ -2647,6 +2647,22 @@ def _sparkline(ts: list, width: int = 20, bucket_s: float = 30.0) -> str:
     return line[-width:].ljust(width, "▁")
 
 
+def _error_sparkline(errs: list, width: int = 20, bucket_s: float = 30.0) -> str:
+    """Count errors per time bucket — correct for low error rates where p95 always returns 0."""
+    if not errs:
+        return "▁" * width
+    blocks = "▁▂▃▄▅▆▇█"
+    max_t  = max(t for t, _ in errs)
+    n      = max(1, int(max_t / bucket_s) + 1)
+    counts = [0] * n
+    for t, e in errs:
+        if e:
+            counts[min(int(t / bucket_s), n - 1)] += 1
+    mx   = max(counts) or 1
+    line = "".join(blocks[min(int(c / mx * 7), 7)] for c in counts)
+    return line[-width:].ljust(width, "▁")
+
+
 def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState") -> Table:
     elapsed  = int(time.time() - state.start_time)
     h, m, s  = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
@@ -2868,8 +2884,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         "  Trend column: each bar = p95 latency in a 30s window  ·  taller bar = slower responses  ·  ▁ low  █ high",
         style=f"color({_G_DIM})",
     ))
-    err_ts = [(t, 1000.0 if e else 0.0) for t, e in snap["errs"]]
-    root.add_row(Text(f"  {_sparkline(err_ts)}  error rate  (bar height = errors in bucket)", style="red"))
+    root.add_row(Text(f"  {_error_sparkline(snap['errs'])}  error rate  (bar height = errors in bucket)", style="red"))
     root.add_row(Text(""))
     # ── Utterance tables ──────────────────────────────────────────────────────
     # Group by (scenario, utterance) across all profile instances.
