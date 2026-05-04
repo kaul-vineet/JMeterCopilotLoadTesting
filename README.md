@@ -328,7 +328,7 @@ An alternative to the DirectLine Secret. Some organisations use a Token Endpoint
 
 Where to find it: Copilot Studio → Settings → Channels → Direct Line → Token Endpoint URL.
 
-If you set this, leave the DirectLine Secret blank (or vice versa). If both are set, the Token Endpoint takes priority. After you enter or change the URL, the tool makes a quick test to confirm the address is reachable before continuing.
+If you set this, leave the DirectLine Secret blank (or vice versa). If both are set, the Token Endpoint takes priority. After you enter the URL, the wizard asks: **"Does this Token Endpoint require an AAD Bearer token?"** — answer Yes if your endpoint is protected by Azure AD and expects an Authorization header; answer No if it is publicly accessible. After that, the tool makes a quick test to confirm the address is reachable before continuing.
 
 ---
 
