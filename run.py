@@ -3286,11 +3286,11 @@ def _collect_run_params() -> dict:
         # 1  Spawn rate
         # 2  Think time
         # 3  Reply timeout
-        # 4  (divider — not selectable)
-        # 5  (Est. ramp-up — read-only)
-        # 6  (Est. script — read-only)
-        # 7  (Est. total — read-only)
-        # 8  Max run time
+        # 4  Max run time  (safety cap)
+        # 5  (divider — not selectable)
+        # 6  (Est. ramp-up — read-only)
+        # 7  (Est. script — read-only)
+        # 8  (Est. total — read-only)
         # 9  (Silence window — read-only)
         # 10 (Protocol — read-only)
         # 11 Notes
@@ -3309,6 +3309,9 @@ def _collect_run_params() -> dict:
             _prow("Reply timeout",
                   state["timeout"], "seconds",
                   "Abort and record timeout if bot has not started responding within this long (min 15s)"),
+            _prow("Max run time  (safety cap)",
+                  state["cap"], "min",
+                  "Test force-stops here even if users are still running — set above Est. total"),
             _divider(),
             _prow("  ↳ Est. ramp-up",
                   est["ramp_mins"], "min",
@@ -3319,15 +3322,12 @@ def _collect_run_params() -> dict:
             _prow("  ↳ Est. total duration",
                   est["total_range"], "min",
                   "Ramp-up + last user's script — test ends when all users finish"),
-            _prow("Max run time  (safety cap)",
-                  state["cap"], "min",
-                  "Test force-stops here even if users are still running — set above Est. total"),
             _prow("Silence window",
                   int(_SILENCE_TIMEOUT), "seconds",
                   "Fixed — extra wait after bot's last message before declaring response complete"),
             _prow("Protocol",
-                  "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket", "",
-                  "set by GRUNTMASTER_TRANSPORT env var" if test_config["transport"] == "http" else "production transport"),
+                  "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket 🔒", "",
+                  "set by GRUNTMASTER_TRANSPORT env var" if test_config["transport"] == "http" else "DirectLine WebSocket over TLS — traffic is encrypted"),
             _prow("Notes",
                   notes_label, "",
                   "Free-text label embedded in the HTML report for this run"),
@@ -3385,7 +3385,13 @@ def _collect_run_params() -> dict:
                 f"  Minimum 15s — the silence window ({int(_SILENCE_TIMEOUT)}s) adds on top of this\n"
                 f"  Current: {state['timeout']}s",
                 state["timeout"]))
-        elif idx in (4, 5, 6, 7):
+        elif idx == 4:
+            state["cap"] = max(1, _edit(
+                f"Safety cap — test force-stops at this many minutes even if users are still running\n"
+                f"  Set above the Est. total ({est['total_range']} min) to avoid cutting the test short\n"
+                f"  Current: {state['cap']} min",
+                state["cap"]))
+        elif idx in (5, 6, 7, 8):
             _gprint(
                 f"  Est. ramp-up {est['ramp_mins']} min  ·  "
                 f"Est. script {est['script_range']} min / user  ·  "
@@ -3393,12 +3399,6 @@ def _collect_run_params() -> dict:
                 f"  These update automatically — change Peak users, Spawn rate, or Think time to adjust.",
                 fg=_G_DIM, padding="0 2",
             )
-        elif idx == 8:
-            state["cap"] = max(1, _edit(
-                f"Safety cap — test force-stops at this many minutes even if users are still running\n"
-                f"  Set above the Est. total ({est['total_range']} min) to avoid cutting the test short\n"
-                f"  Current: {state['cap']} min",
-                state["cap"]))
         elif idx == 9:
             _gprint(f"  Silence window is fixed at {int(_SILENCE_TIMEOUT)}s — not configurable.", fg=_G_DIM, padding="0 2")
         elif idx == 10:
