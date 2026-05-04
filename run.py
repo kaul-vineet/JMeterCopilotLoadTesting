@@ -2190,12 +2190,16 @@ class CopilotBaseUser(User):
         self._transport.close()
         self._consecutive_timeouts = 0
 
+        _who = self.profile.get("display_name", self.profile.get("username", "?"))
         self.aad_token = None
         if _user_auth_required():
             try:
                 self.aad_token = get_valid_token(self.profile["username"])
             except RuntimeError as e:
                 log.error("Auth failed for %s: %s", self.profile["username"], e)
+                if _run_state.dashboard is not None:
+                    _run_state.dashboard.on_event("✗", f"Auth failed — {_who}")
+                _log_event("✗", "auth_error", f"Auth failed — {_who}")
                 raise StopUser()
 
         try:
@@ -2203,6 +2207,9 @@ class CopilotBaseUser(User):
         except Exception as e:
             log.error("DirectLine token fetch failed after retries: %s", e)
             _fire_metric(self.environment, "Fetch Token", 0, error=e)
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("✗", f"DL token fetch failed — {_who}")
+            _log_event("✗", "token_error", f"DL token fetch failed — {_who}")
             raise StopUser()
 
         try:
@@ -2210,6 +2217,9 @@ class CopilotBaseUser(User):
         except Exception as e:
             log.error("Start conversation failed after retries: %s", e)
             _fire_metric(self.environment, "Start Conversation", 0, error=e)
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("✗", f"Start conversation failed — {_who}")
+            _log_event("✗", "conv_error", f"Start conversation failed — {_who}")
             raise StopUser()
 
         self._idx = 0
@@ -2237,6 +2247,10 @@ class CopilotBaseUser(User):
         if self._transport.needs_refresh(_rt):
             self._refresh_stream()
 
+        _base_label   = self.profile.get("display_name", self.profile.get("username", ""))
+        profile_label = f"{_base_label} #{self._spawn_num}"
+        _metric_name  = f"Copilot Response — {_base_label} · {self.scenario_name}"
+
         for _attempt in range(2):
             try:
                 activity_id, send_time = send_utterance(self.conversation, utterance)
@@ -2250,12 +2264,18 @@ class CopilotBaseUser(User):
                 if _attempt == 1:
                     log.error("Send utterance failed: %s", e)
                     _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    if _run_state.dashboard is not None:
+                        _run_state.dashboard.on_event("✗", f"Send failed ({e.response.status_code}) — {profile_label}")
+                    _log_event("✗", "send_error", f"Send HTTP {e.response.status_code} — {profile_label}")
                     raise StopUser()
                 gevent.sleep(1)
             except Exception as e:
                 if _attempt == 1:
                     log.error("Send utterance failed: %s", e)
                     _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    if _run_state.dashboard is not None:
+                        _run_state.dashboard.on_event("✗", f"Send error ({type(e).__name__}) — {profile_label}")
+                    _log_event("✗", "send_error", f"Send {type(e).__name__} — {profile_label}")
                     raise StopUser()
                 gevent.sleep(1)
 
@@ -2268,11 +2288,10 @@ class CopilotBaseUser(User):
         except Exception as e:
             log.error("Read response failed: %s", e)
             _fire_metric(self.environment, "Copilot Response", 0, error=e)
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("✗", f"Read error ({type(e).__name__}) — {profile_label}")
+            _log_event("✗", "read_error", f"Read {type(e).__name__} — {profile_label}")
             raise StopUser()
-
-        _base_label   = self.profile.get("display_name", self.profile.get("username", ""))
-        profile_label = f"{_base_label} #{self._spawn_num}"
-        _metric_name  = f"Copilot Response — {_base_label} · {self.scenario_name}"
 
         _uc = _run_state.dashboard._current_users if _run_state.dashboard is not None else 0
         if response.timed_out:
@@ -2290,11 +2309,16 @@ class CopilotBaseUser(User):
                 _run_state.dashboard.on_utterance(
                     utterance, self.scenario_name, id(self), profile_label,
                     self._idx, len(self.utterances), response.latency_ms, True)
+            # Fire a P1 event for every timeout — not just after 2 consecutive
+            utt_short = (utterance[:35] + "…") if len(utterance) > 36 else utterance
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("✗", f"T/O — {profile_label} — \"{utt_short}\"")
+            _log_event("✗", "timeout", f"T/O — {profile_label} — {utt_short}")
             self._consecutive_timeouts += 1
             if self._consecutive_timeouts >= 2:
                 if _run_state.dashboard is not None:
-                    _run_state.dashboard.on_event("✗", f"2 consecutive timeouts — {profile_label}")
-                _log_event("✗", "timeout", f"2 consecutive timeouts — {profile_label}")
+                    _run_state.dashboard.on_event("✗", f"2 consecutive T/Os — restarting — {profile_label}")
+                _log_event("✗", "timeout_consecutive", f"2 consecutive T/Os — restarting — {profile_label}")
                 self._open_conversation()
             return
 
