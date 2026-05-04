@@ -124,11 +124,11 @@ Locust is a Python-based load testing framework. This tool uses Locust as its ex
    - **`@task` (the main loop):** The user picks the next utterance from its CSV, sends it to the bot, waits for a reply, then waits for a "think time" before sending the next message.
    - **`on_stop`:** The user closes the WebSocket when the test ends.
 
-3. **When all utterances are exhausted:** The user does not stop. It closes the current conversation, opens a brand new DirectLine conversation, resets to utterance 1, and begins the script again. This loop runs continuously for the entire test duration. Each cycle is an independent conversation — the bot has no memory of the previous one.
+3. **When all utterances are exhausted:** The user stops — it does not restart. Each user runs its script exactly once (one-shot). When enough users have finished to account for the full peak count, the tool sets a shared `all_users_done` flag. Any user Locust tries to respawn immediately raises `StopUser` at the top of `on_start`, so the active user count drains toward zero. When it reaches zero, the test ends early and the report is generated — regardless of how much time remains on the safety cap.
 
-4. **Ramp-up behaviour:** Existing users and newly spawned users operate completely independently. When a new user is spawned mid-test, it starts a fresh conversation at utterance 1 regardless of where other users are in their scripts. A user finishing its script and a new user being spawned are unrelated events. This is intentional — ramp controls concurrent load, not script coordination.
+4. **Ramp-up behaviour:** Locust creates new users at the configured spawn rate until the peak is reached. Each new user starts a fresh conversation at utterance 1, independent of where other users are in their scripts. Ramp controls concurrent load, not script coordination.
 
-5. **Late-spawned users:** A user spawned near the end of a test may only complete one or two utterances before the test ends. This is expected and does not affect results — metrics are recorded per-reply, so partial script runs contribute normally to response time statistics.
+5. **Test ending:** The test ends under any of three conditions: (a) all users finish their scripts and the active count reaches zero, (b) the safety cap (Max run time) expires, or (c) you press Q. The safety cap is a backstop — it only triggers if users are still running when time runs out, which can happen if the bot is timing out on many requests.
 
 6. **Metrics:** Every time the tool receives a bot reply, it records the latency. The live dashboard reads these events in real time and aggregates them by profile, scenario, and utterance.
 
@@ -269,8 +269,8 @@ Direct Line is the API channel this tool uses to talk to the bot.
 ### 6.1 Get the code
 
 ```
-git clone https://github.com/kaul-vineet/JMeterCopilotLoadTesting.git
-cd JMeterCopilotLoadTesting
+git clone https://github.com/kaul-vineet/GRUNTMASTER6000-CopilotLoadTesting.git
+cd GRUNTMASTER6000-CopilotLoadTesting
 ```
 
 > **New machine / new clone:** If you clone this repository to a different machine, you will need to re-run the setup wizard and re-authenticate each profile. Credentials and tokens are stored in Windows Credential Manager and `profiles/.tokens/` on the local machine — they are intentionally not committed to the repository (they would be a security risk if they were).
@@ -360,11 +360,12 @@ The wizard uses arrow-key navigation. Each row is a setting — navigate to it a
       Client ID                          cea29e59-…                      ✓
       Bot Client ID (SSO)                (optional — blank = SSO disabled)
       DirectLine Secret                  ●●●●●●●● (saved)                ✓
+      Token Endpoint                     (not set)
 
   ─  PROFILES  ─  Each profile is a real M365 account. Assign a scenario
      to control which utterances it sends. Multiple profiles = more load.
 
-      Profile: User 1                    loadtest.user1@…  → it_support   ✓
+      Profile [0]: User 1                loadtest.user1@…  → it_support   ✓
 
   +  Add profile
   ✓  Save & continue
@@ -416,6 +417,8 @@ An alternative to the DirectLine Secret. Some organisations use a Token Endpoint
 Where to find it: Copilot Studio → Settings → Channels → Direct Line → Token Endpoint URL.
 
 If you set this, leave the DirectLine Secret blank (or vice versa). If both are set, the Token Endpoint takes priority.
+
+The Token Endpoint field is always visible in the wizard. After you enter or change the URL, the tool makes a test GET request to confirm the endpoint is reachable before continuing.
 
 ---
 
@@ -506,14 +509,18 @@ All test parameters are shown with their current values. Navigate to any row and
 
   Select any setting to change it, then start the test.
 
-▸   Peak users                           10     users     how many hit the bot at the same time
-    Ramp-up rate                         5      users/m   how many new users join per minute
-    Run time                             5      minutes   how long the test runs
-    Wait between messages                30     seconds   pause each user takes after a reply
-    Reply timeout                        30     seconds   wait this long for first reply (min 15s)
-    Silence window                       15     seconds   fixed — wait after last reply before declaring done
-    Protocol                             WebSocket        set by GRUNTMASTER_TRANSPORT env var
-    Notes                                (none)           free-text description embedded in report
+▸   Peak users                           10     users     Total users spawned — each runs N message(s) then leaves
+    Spawn rate                           5      users/min New users per minute — 1 user every 12s
+    Think time                           30     seconds   How long each user pauses between messages
+    Reply timeout                        30     seconds   Abort if bot has not started responding within this long (min 15s)
+    Max run time  (safety cap)           20     min       Test force-stops here even if users are still running
+    ────────────────────────────────────────────────────────────────────────────────
+      ↳ Est. ramp-up                     2.0    min       Time until all 10 users are active (10 ÷ 5/min)
+      ↳ Est. script / user               2.9–7.2 min      N msg × (think 30s + 5–30s response)
+      ↳ Est. total duration              4.9–9.2 min       Ramp-up + last user's script
+    Silence window                       15     seconds   Fixed — wait after bot's last message before recording done
+    Protocol                             WebSocket 🔒      DirectLine WebSocket over TLS — traffic is encrypted
+    Notes                                (none)           Free-text label embedded in the HTML report for this run
     ▶  Start test
     ?  Help
     ✕  Exit
@@ -521,9 +528,11 @@ All test parameters are shown with their current values. Navigate to any row and
 
 Select **▶ Start test** when ready.
 
-**What "peak users" means:** This is the number of concurrent users at peak — the maximum number of simultaneous open conversations. It is not the number of messages per second. With think time set to 30 seconds, 10 concurrent users will generate approximately 10 ÷ 30 ≈ **0.3 requests per second**. To get 1 request per second, you need roughly 30 concurrent users. This is intentional — Microsoft's Copilot Studio performance guidance assumes human-paced conversations.
+**What "peak users" means:** This is the number of users spawned in total — each runs the full script once then stops. It is not a concurrent-at-all-times count. With think time set to 30 seconds, 10 users will generate approximately 10 ÷ 30 ≈ **0.3 requests per second** at peak concurrency. To get 1 request per second, you need roughly 30 users. This is intentional — Microsoft's Copilot Studio performance guidance assumes human-paced conversations.
 
-**What "ramp-up rate" means:** The number of new users added per minute. A rate of 5 users/min with a peak of 10 users means the test reaches full load after 2 minutes. A slower ramp gives the bot time to warm up; a faster ramp stresses it sooner.
+**What "spawn rate" means:** The number of new users added per minute. A rate of 5 users/min with a peak of 10 users means the test reaches full load after 2 minutes. A slower ramp gives the bot time to warm up; a faster ramp stresses it sooner.
+
+**What "Max run time (safety cap)" means:** The test will force-stop at this many minutes even if users are still running (e.g., if many requests are timing out and scripts are taking longer than expected). Set it above the "Est. total duration" shown in the read-only rows below. Under normal conditions — where users finish their scripts on time — the test ends early through natural completion, and the cap is never reached.
 
 **The timeout model:** There are two timeouts working in sequence:
 1. **Reply timeout** (default 30s, minimum 15s, configurable) — how long the tool waits for the *first* bot reply after sending a message. If nothing arrives in this window, the request is counted as timed out.
@@ -614,7 +623,7 @@ The test runs entirely in the terminal. A live dashboard updates every 0.5 secon
 
 **UTTERANCES** shows the 4 slowest utterances (red) and 4 fastest (green) in one table, separated by a dim `── fastest ──` divider. Profile shows which specific user instance had the worst p95 for that utterance. Bot Response shows the actual reply from the worst-performing call, with newlines collapsed to a single line.
 
-**EVENTS** shows the last 8 test events with timestamps and the ramp step (R1, R2, …) they belong to. Events include: ramp window starts, 429 rate-limit hits (shown in red), consecutive timeout warnings (shown in red), and CPU warnings (shown in yellow).
+**EVENTS** shows the last 8 test events with timestamps and the ramp step (R1, R2, …) they belong to. Events include: ramp window starts, timeouts (with the utterance and duration), 429 rate-limit hits (shown in bold red), consecutive timeout warnings, WebSocket stream errors, auth failures, DirectLine token failures, conversation start failures, send failures, read failures — all with a short reason extracted from the HTTP response or exception. CPU warnings appear in yellow.
 
 **Circuit breaker banner:** If the bot returns a 429 (Too Many Requests) response, the tool trips a circuit breaker and displays a red banner: `⚡ CIRCUIT OPEN — DirectLine rate limit (429) hit — all users paused — resuming in Xs`. All virtual users pause for 60 seconds (or the duration in the Retry-After header if provided). After the pause, users resume automatically. This prevents a flood of failing requests from distorting your metrics.
 
@@ -622,7 +631,7 @@ Press **Q** at any time to stop the test early. On Windows, Q is detected by a d
 
 ### 9.5 After the test
 
-When the test ends (time expires or you press Q):
+When the test ends (all users finish their scripts, the safety cap expires, or you press Q):
 
 1. **Adversarial audit** — the tool runs four independent checks on the recorded data (see Section 11). Results print below the final dashboard.
 2. **HTML report** — generated automatically in `report/report_YYYYMMDD_HHMMSS.html`.
@@ -723,11 +732,12 @@ You can open this file in Excel, Power BI, or any analysis tool to produce your 
 
 ### 10.3 HTML report
 
-After every test run, an HTML report is automatically generated in `report/report_YYYYMMDD_HHMMSS.html`. It is a 3-tab report:
+After every test run, an HTML report is automatically generated in `report/report_YYYYMMDD_HHMMSS.html`. It is a 4-tab report:
 
 **Tab 1 — Summary**
 - Summary header — request count, duration, error rate, p95 vs target (PASS/FAIL badge)
-- Ramp Steps table — one row per 60-second window: users, requests, RPS, p50/p95/p99, timeouts
+- Ramp Steps table — one row per 60-second window: users, requests, RPS, p50/p95/p99, timeouts, 429s; events appear as indented sub-rows
+- Error Breakdown table — counts of each error type (timeout, ws_closed, rate_limit, auth_error, etc.) with an example message, sorted by count
 - Profile summary table — p50/p95/p99/error rate per user account, rows highlighted red if p95 exceeds target
 - Scenario Breakdown table — same stats grouped by scenario CSV
 - Profile comparison — percentage difference in median (p50) response time between any two profiles
@@ -736,10 +746,15 @@ After every test run, an HTML report is automatically generated in `report/repor
 **Tab 2 — Response Time Distribution**
 - Box/whisker chart per profile — latency distribution, p95 target line
 - Box/whisker chart per scenario — same view grouped by scenario
-- Latency heatmap — median response time per 30-second bucket per utterance
+- Latency heatmap — median response time per 30-second bucket per utterance (shows a warning if the `utterance_sent_at` column is absent)
 
 **Tab 3 — Utterance Analysis**
+- Live filter input — type to filter utterance rows instantly, no page reload
 - Per-utterance table — sortable by any column: count, p50/p95/p99, timeouts, MAD anomaly flag, log-normal p99.9 projection
+- Baseline comparison columns — if a previous run's detail CSV is found, Δp95 and Δp50 columns appear showing % change vs baseline (green = faster, red = slower, grey = within ±10%)
+
+**Tab 4 — Config**
+- All test parameters for this run: peak users, spawn rate, think time, reply timeout, safety cap, p95 target, silence window
 
 All tables in the report are sortable — click any column header to sort.
 
@@ -786,7 +801,7 @@ For any two profiles, the report shows the percentage difference in median (p50)
 
 **The bot passes the performance test if:**
 - 95th-percentile response time stays below 2000ms (or your configured target)
-- Error rate stays below 0.5% (or your configured target)
+- Error rate stays below 1% (timeouts are the most common error — investigate any T/O count above a handful)
 
 **Signs of trouble:**
 - Response times climbing steadily → bot is under capacity pressure; add message capacity in Power Platform
@@ -825,7 +840,7 @@ If a single virtual user receives 2 consecutive timeouts (no reply received), th
 
 If any request receives a 429 (Too Many Requests) response from DirectLine, the circuit breaker trips:
 
-1. `_circuit_open_until` is set to `now + 60 seconds`.
+1. `_run_state.circuit_open_until` is set to `now + 60 seconds`.
 2. All virtual users check `_is_circuit_open()` before each send. If the circuit is open, they skip that iteration and sleep.
 3. The dashboard shows a red banner: `⚡ CIRCUIT OPEN — DirectLine rate limit (429) hit — all users paused — resuming in Xs`.
 4. After 60 seconds, the circuit closes automatically and all users resume.
@@ -840,7 +855,7 @@ All HTTP requests (DirectLine token fetch, conversation start, utterance send) u
 
 After every test run, the tool runs `_audit()` — four independent checks on the recorded data:
 
-1. **Timestamp recheck** — re-computes `response_ms` from the CSV's `utterance_sent_at` and `response_received_at` timestamps. Flags any rows where the re-computed value differs from the recorded `response_ms` by more than 10ms.
+1. **Timestamp round-trip** — re-computes `response_ms` from the CSV's `utterance_sent_at` and `response_received_at` columns and compares to the stored `response_ms` value. Note: `response_received_at` is derived from `send_time + response_ms`, so this is a serialisation round-trip check (detects CSV write/read corruption), not a fully independent measurement. Flags any row where the re-computed value differs from the stored value by more than 10ms.
 2. **Count reconciliation** — checks that the number of rows in the CSV matches the count the dashboard tracked in memory. A mismatch means some events were logged but not counted, or vice versa.
 3. **Percentile cross-check** — recalculates the overall p95 using numpy and pandas and compares to the tool's own `_pct()` function. A mismatch means the dashboard was showing wrong numbers.
 4. **Profile sum check** — sums up request counts per profile and checks they add up to the total. Detects if any rows were assigned to a profile that was not expected.
@@ -960,62 +975,64 @@ $env:GRUNTMASTER_TRANSPORT = ""
 | `profiles/profiles.example.json` | Example of the profiles.json format, for reference. |
 | `report.py` | HTML report generator. Auto-runs after each test; also callable standalone: `python report.py`. |
 | `report/detail_*.csv` | Per-run detail logs. One CSV per test run. Not committed to version control. |
+| `report/events_*.csv` | Per-run event log (ramp starts, errors, 429s, etc.). Paired with the detail CSV by timestamp. Not committed to version control. |
 | `report/report_*.html` | Auto-generated HTML reports. One file per test run. Not committed to version control. |
+| `report/ci_*.json` | CI summary JSON written after every test. Contains p50/p95/p99, error_rate, total_requests, passed (bool). Set `GRUNTMASTER_CI=1` to also print this to stdout and exit 0/1 based on pass/fail. |
 
 ---
 
 ## 14. Adversarial Self-Check
 
-This section re-reads the README above as a skeptic and checks every major claim against the actual code.
+This section re-reads the README above as a skeptic and checks every major claim against the actual code. Line numbers are omitted — they drift; search for the identifier instead.
 
 ### Claims verified as correct
 
-- **response_timeout default is 30s** — `test_config["response_timeout"] = 30.0` (line 93 of run.py). The old README incorrectly showed 10s in the config menu example.
-- **_SILENCE_TIMEOUT is fixed at 15s** — `_SILENCE_TIMEOUT = 15.0` (line 133). Confirmed not configurable; the config menu shows it as read-only.
-- **Minimum response_timeout enforced at 15s** — both `_collect_run_params` and `_send_and_measure` enforce `max(15.0, ...)`.
-- **Token valid threshold is 10 minutes (600 seconds)** — `is_token_valid(token_data, min_ttl_seconds=600)` (line 196).
-- **_retry_call: 3 attempts with exponential backoff** — `for i in range(attempts)` with `base_delay * (2 ** i) + random.uniform(0, 1)` (lines 1925–1932).
-- **send_utterance: 2 attempts** — `for _attempt in range(2)` (lines 2035, 2269).
-- **Consecutive timeout threshold is 2** — `if self._consecutive_timeouts >= 2` (lines 2089, 2320).
-- **Circuit breaker default is 60s** — `_circuit_open_until = time.time() + 60.0` (line 1942).
-- **Connection pool sized to users + 50** — `pool_maxsize=user_count + 50` (line 113), `pool_block=False` (line 114).
-- **RAMP STEPS table has a 429 column** — column added at line 2661; named `rate_limited` in the data.
-- **Events appear as sub-rows in RAMP STEPS** — loop at lines 2686–2692 inserts event rows inside the ramp table.
-- **EVENTS section (not LIVE FEED)** — the dashboard section is labelled "EVENTS" (line 2838), not "LIVE FEED" as the old README said.
-- **EVENTS shows last 8 entries** — `for ev in events[:8]` (line 2839). The deque has maxlen=20 but only 8 are displayed.
-- **Q key runs in an OS thread** — `threading.Thread(target=_keywatch, daemon=True)` (line 3192), using `msvcrt` on Windows.
-- **Adversarial audit has 4 checks** — timestamp recheck, count reconciliation, p95 cross-check, profile sum check (lines 2879–2948).
-- **Report has 3 tabs** — Summary, Response Time Distribution, Utterance Analysis (report.py lines 488–491).
-- **Profile comparison uses p50 (median)** — `medians = {p["profile"]: _pct(..., 0.50) ...}` (report.py lines 362–367). The old README claimed it showed p50/p95/p99 differences; it only shows p50.
-- **Ramp windows are 60 seconds** — `_ramp_window = 60.0` (line 2410).
-- **Last 5 ramp rows shown** — `(_finalized + _active)[-5:]` (line 2646).
-- **Default peak users is 10, spawn rate is 5** — `test_config["users"] = 10, "spawn_rate": 5` (lines 98–99).
-- **Default think time is 30–60s** — `"think_min": 30, "think_max": 60` (lines 95–96).
-- **Pre-flight check uses response_timeout=30.0** — `read_response(..., response_timeout=30.0, ...)` (line 1246). The old README said "up to 15 seconds" which was wrong.
-- **Silence window row in config menu is read-only** — `_gprint(f"  Silence window is fixed at {int(_SILENCE_TIMEOUT)}s — not configurable.", ...)` (line 3075).
-- **Percentile method is "lower"** — `s[min(int(len(s) * p), len(s) - 1)]` in `_pct()` (line 2543) — this is equivalent to the "lower" interpolation method.
-- **think_min enforces minimum 25 when editing** — `state["think"] = max(25, v)` (line 3070). Note: the default is 30 but the edit minimum is 25. The README says minimum 25 in this context.
-- **Detail CSV includes `user_count` column** — `csv.writer(f).writerow([..., "user_count"])` (line 1858).
-- **gevent monkey-patch at top of file** — confirmed at lines 13–15.
+- **response_timeout default is 30s** — `test_config["response_timeout"] = 30.0` ✓
+- **_SILENCE_TIMEOUT fixed at 15s** — `_SILENCE_TIMEOUT = 15.0` — not configurable; shown read-only in the menu ✓
+- **Minimum response_timeout enforced at 15s** — `_TestConfig` bounds `(15.0, 300.0)` and `max(15, ...)` in `_collect_run_params` ✓
+- **Token valid threshold 10 minutes** — `is_token_valid(token_data, min_ttl_seconds=600)` ✓
+- **_retry_call 3 attempts, exponential back-off** — `for i in range(3)` with `base_delay * (2**i) + random.uniform(0,1)` ✓
+- **send_utterance 2 attempts** — `for _attempt in range(2)` in `_send_and_measure` ✓
+- **Consecutive timeout threshold is 2** — `if self._consecutive_timeouts >= 2` ✓
+- **Circuit breaker default 60s** — `_run_state.circuit_open_until = time.time() + 60.0` ✓
+- **Connection pool users+50, pool_block=False** — `pool_maxsize=user_count + 50, pool_block=False` in `_init_session` ✓
+- **RAMP STEPS has 429 column** — `rate_limited` field in ramp step dict ✓
+- **Events as sub-rows in RAMP STEPS** — event loop inside ramp table rendering ✓
+- **EVENTS section, not LIVE FEED** — section labelled `"  EVENTS"` ✓
+- **EVENTS shows last 8** — `for ev in vm["p_events"][:8]` ✓; deque maxlen=20 ✓
+- **Q key runs in an OS thread** — `threading.Thread(target=_keywatch, daemon=True)` using `msvcrt` ✓
+- **Adversarial audit has 4 checks** — timestamp round-trip, count reconciliation, p95 cross-check, profile sum check ✓
+- **Report has 4 tabs** — Summary, Response Time Distribution, Utterance Analysis, Config ✓
+- **Profile comparison uses p50** — `_pct(..., 0.50)` — only median, not p95/p99 ✓
+- **Ramp windows are 60 seconds** — `self._ramp_window = 60.0` ✓
+- **Last 5 ramp rows shown** — `(_finalized + _active_r)[-5:]` ✓
+- **Default peak users 10, spawn rate 5** — `"users": 10, "spawn_rate": 5` in `test_config` initialiser ✓
+- **Default think time 30–60s** — `"think_min": 30, "think_max": 60` ✓
+- **Pre-flight check uses response_timeout=30.0** — `read_response(..., response_timeout=30.0, ...)` in `_preflight_bot_check` ✓
+- **Silence window row in config menu is read-only** — `_gprint("  Silence window is fixed…")` in `_collect_run_params` ✓
+- **Percentile method "lower"** — `_pct` uses `sorted_list[min(int(len(s) * p), len(s)-1)]` ✓
+- **think_min edit minimum is 25** — `state["think"] = max(25, _edit(...))` ✓ (default is 30, but 25 is the edit floor)
+- **Detail CSV includes `user_count` column** — header in `_init_detail_log` includes `"user_count"` ✓
+- **gevent monkey-patch at top of file** — `gevent.monkey.patch_all()` before any I/O imports ✓
+- **One-shot user design** — `StopUser()` raised when `_idx >= len(utterances)`; `all_users_done` flag prevents Locust respawn ✓
 
-### Claims that were inaccurate in the old README (now corrected)
+### Claims that were inaccurate (now corrected in this README)
 
-- **Old README showed "Reply timeout: 10 seconds" in the config menu example** — the actual default is 30 seconds. Fixed.
-- **Old README described "LIVE FEED" section** — the code renders an "EVENTS" section. Fixed.
-- **Old README did not mention the 429 / rate_limited column in RAMP STEPS** — added.
-- **Old README said events appear separately** — they appear as sub-rows inside the RAMP STEPS table. Fixed.
-- **Old README said pre-flight check waits "up to 15 seconds"** — it passes `response_timeout=30.0` to `read_response`. Fixed.
-- **Old README said profile comparison shows p50/p95/p99 differences** — it only compares p50 medians. Fixed.
-- **Old README did not mention retry logic** — added Section 11.2.
-- **Old README did not mention the circuit breaker** — added Section 11.4.
-- **Old README did not mention the consecutive timeout guard** — added Section 11.3.
-- **Old README did not mention the shared connection pool** — added Section 11.5.
-- **Old README did not mention the adversarial audit** — added Section 11.6.
-- **Old README did not document the RPS ceiling** — added Section 9.3.
-- **Old README did not mention the Silence window row in the config menu** — added.
-- **Old README did not mention the `user_count` column in the detail CSV** — added.
+- **Old README said users restart from utterance 1** — wrong; one-shot design. Fixed in §2.6.
+- **Old README said "loop runs continuously for the entire test duration"** — wrong. Fixed in §2.6.
+- **Clone URL was JMeterCopilotLoadTesting** — wrong; repo is GRUNTMASTER6000-CopilotLoadTesting. Fixed in §6.1.
+- **Token Endpoint shown conditionally** — now always shown. Fixed in §7.1 and §7.2.
+- **Run config field names wrong** — "Ramp-up rate" / "Run time" / "Wait between messages" not what the code renders. Fixed in §9.2.
+- **Est. rows and divider missing from config menu example** — added to §9.2.
+- **"time expires or you press Q" as only end conditions** — missing natural completion. Fixed in §9.5.
+- **EVENTS described only ramp/429/CPU** — now fires on all error types with reasons. Fixed in §9.4.
+- **Report described as 3 tabs** — now 4 tabs. Fixed in §10.3.
+- **Error Breakdown, utterance filter, baseline comparison not documented** — added to §10.3.
+- **`_circuit_open_until` reference** — should be `_run_state.circuit_open_until`. Fixed in §11.4.
+- **Timestamp check described as two independent measurement paths** — `response_received_at` is derived from `response_ms`, so it is a serialisation round-trip check, not independent. Fixed in §11.6.
+- **File Reference missing events_*.csv and ci_*.json** — added.
 
 ### Claims that could not be fully verified
 
-- **"Retry-After header if present"** — the circuit breaker code at line 1942 always uses 60s (`time.time() + 60.0`) and does not read a `Retry-After` header from the 429 response. The 60s is always the pause duration regardless of what the server sends. This is documented in the README as "60 seconds" without claiming Retry-After is respected.
-- **"token expires typically after 90 days"** — this is determined by Microsoft Entra ID tenant policy, not by this tool's code. The 90-day figure is standard Microsoft guidance but the actual expiry depends on your tenant.
+- **"Retry-After header if present"** — the circuit breaker always uses 60s and does not read a `Retry-After` header. The 60s is unconditional. Documented as such.
+- **"Token expires typically after 90 days"** — determined by Microsoft Entra ID tenant policy, not this code. Standard Microsoft guidance; actual expiry varies by tenant configuration.
