@@ -2867,7 +2867,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
         st.add_column("Ramp",     justify="right", min_width=5)
         st.add_column("Users",    justify="right", min_width=6)
         st.add_column("Requests", justify="right", min_width=8)
-        st.add_column("RPS",      justify="right", min_width=6)
+        st.add_column("RPS (~=live)", justify="right", min_width=10)
         st.add_column("p50",      justify="right", min_width=6)
         st.add_column("p95",      justify="right", min_width=6)
         st.add_column("p99",      justify="right", min_width=6)
@@ -2886,11 +2886,12 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
             knee_marker = " ◀" if is_knee else ("  !" if past_knee else "")
             rn     = f'▶ {s["ramp"]}' if live else f'{s["ramp"]}{knee_marker}'
             rstyle = "bold cyan" if live else ("bold yellow" if is_knee else "dim")
+            rps_str = f'{s["rps"]:.2f}~' if live else f'{s["rps"]:.2f}'
             st.add_row(
                 Text(rn,                 style="bold cyan" if live else ("bold yellow" if is_knee else "white")),
                 Text(str(s["users"]),    style=rstyle),
                 Text(str(s["requests"]), style=rstyle),
-                Text(f'{s["rps"]:.2f}',  style=rstyle),
+                Text(rps_str,            style=rstyle),
                 Text(str(s["p50"]),      style=rstyle),
                 Text(str(s["p95"]),      style=p95c),
                 Text(str(s["p99"]),      style=rstyle),
