@@ -7,7 +7,7 @@ A load testing tool for Microsoft Copilot Studio bots. It simulates many users h
 ## Table of Contents
 
 1. [What this tool does](#1-what-this-tool-does)
-2. [Architecture](#2-architecture)
+2. [How it works](#2-how-it-works)
 3. [Prerequisites — what you need before starting](#3-prerequisites)
 4. [Azure setup — step-by-step](#4-azure-setup)
 5. [Copilot Studio setup](#5-copilot-studio-setup)
@@ -16,9 +16,10 @@ A load testing tool for Microsoft Copilot Studio bots. It simulates many users h
 8. [Writing test scripts (utterance files)](#8-writing-test-scripts-utterance-files)
 9. [Running the load test](#9-running-the-load-test)
 10. [Reading the results](#10-reading-the-results)
-11. [Architecture notes](#11-architecture-notes)
+11. [How it handles problems](#11-how-it-handles-problems)
 12. [Troubleshooting](#12-troubleshooting)
 13. [Beta Testing](#13-beta-testing)
+14. [File Reference](#14-file-reference)
 
 ---
 
@@ -29,125 +30,54 @@ Your Copilot Studio bot is designed to handle one user at a time from the browse
 This tool answers that question by:
 
 - **Simulating multiple users at once.** Each simulated user follows a script — a list of messages to send — and behaves like a real person (it pauses between messages the way a human would).
-- **Automating authentication.** Copilot Studio bots protected by Microsoft sign-in require a real user identity to respond. This tool authenticates each simulated user using a real Microsoft 365 account, the same way a browser would — but fully automated, so you can run 50 users without 50 browser windows.
+- **Automating sign-in.** Copilot Studio bots protected by Microsoft sign-in require a real user identity to respond. This tool signs in each simulated user using a real Microsoft 365 account, the same way a browser would — but fully automated, so you can run 50 users without 50 browser windows.
 - **Measuring response time.** The tool records exactly how long the bot takes to reply to each message, from the moment the message is sent to the moment the bot finishes replying.
-- **Live terminal dashboard.** While the test runs, a real-time dashboard shows requests per second, percentile response times, per-scenario stats, and a feed of test events — all in the terminal, no browser required.
+- **Live terminal dashboard.** While the test runs, a real-time dashboard shows requests per second, response times, per-user stats, and a feed of test events — all in the terminal window, no browser required.
 
 ---
 
-## 2. Architecture
+## 2. How it works
 
-Understanding how the pieces fit together will help you set it up correctly and debug issues when they arise.
+### 2.1 How the tool talks to the bot
 
-### 2.1 The DirectLine protocol
+The tool communicates with your bot through a messaging channel called **Direct Line**. Think of Direct Line as the back-door API that web chat widgets use to talk to bots. When someone chats with your bot on a website, the website is already using Direct Line behind the scenes. This tool uses the same channel — just without the browser.
 
-Copilot Studio bots are not chat programs you connect to directly. They speak a protocol called **Bot Framework DirectLine**, which is a Microsoft-designed API layer that sits between your application and the bot.
-
-When you talk to a bot on a website, the website is secretly using DirectLine. This tool does the same thing programmatically.
-
-A DirectLine conversation works in two directions at once:
-- **Sending messages (HTTP POST):** You send a message to the bot by making an HTTP POST request to the DirectLine REST API.
-- **Receiving replies (WebSocket):** The bot's replies come back over a WebSocket — a persistent, two-way connection that stays open for the duration of the conversation. The tool listens on this WebSocket and records when replies arrive.
-
-This split is why the tool makes both HTTP calls and WebSocket connections. They are different channels doing different jobs.
+The tool sends messages to the bot over the internet (HTTPS) and listens for replies over a separate persistent connection called a **WebSocket**. A WebSocket is like keeping a phone line open so the bot can send replies the moment they are ready, rather than making the tool repeatedly ask "any reply yet?"
 
 ```
-  Load Test Tool                         Microsoft Cloud
+  GRUNTMASTER 6000                       Microsoft Cloud
   ─────────────────────────────────────────────────────────
-  HTTP POST /activities  ──────────────►  DirectLine API
+  Sends message (HTTPS) ───────────────►  Direct Line API
                                                 │
                                                 ▼
-  WebSocket (listening) ◄──────────────  Bot replies (streaming)
+  Listens for reply (WebSocket) ◄──────── Bot replies
                                                 │
                                           Copilot Studio Bot
 ```
 
-### 2.2 Authentication — why it is complex
+### 2.2 Why real user accounts are needed
 
-Most load testing tools just send HTTP requests. This bot requires the user to be signed in to a Microsoft account before it will respond to questions. That means every simulated user needs a real token — a cryptographic proof of identity issued by Microsoft Entra ID (formerly called Azure Active Directory).
+If your bot requires users to sign in before they can use it, the bot will not respond to questions from an unknown, unsigned-in user. Every simulated user needs to prove its identity — the same way you prove yours when you sign in to an app with your Microsoft account.
 
-Getting that token requires a two-application pattern that Microsoft requires for security reasons:
+The tool handles this by signing in to a real Microsoft 365 account once before the test starts. It saves a sign-in token (a digital proof of identity) securely on your machine. During the test, it uses that saved token automatically for every message the simulated user sends.
 
-**Application 1 — the Resource (CopilotStudioAuthApp):**
-Copilot Studio creates this automatically in your Azure tenant when you configure authentication. It represents the bot's identity. It exposes a permission called `access_as_user`. When a user signs in, they are granting your tool the right to "access as user" on this resource.
+The sign-in process happens once per account, in a browser. After that, the tool handles renewals silently for up to 90 days.
 
-**Application 2 — the Client (your load test app):**
-This is an app registration you create yourself. It represents the load test tool. It requests the `access_as_user` permission from Application 1 on behalf of each test user.
+If your bot does **not** require sign-in (anyone can use it without logging in), you can skip the Azure setup sections entirely.
 
-Think of it like a door with two keys. The bot (Application 1) has the lock. Your load test client (Application 2) has a key. To open the door, you need the right key for that specific lock.
+### 2.3 How the test works end-to-end
 
-**Token exchange:**
-When the bot wants proof of identity, it sends the load test tool an "OAuthCard" — a card saying "I need you to prove who you are." The tool responds by sending the user's access token back through the DirectLine channel. This exchange is called `signin/tokenExchange`. If the token has the correct audience and scope, the bot accepts it and continues the conversation.
+Here is what happens from the moment you start the tool to the moment results appear:
 
-```
-  1. Tool sends "hi"
-  2. Bot replies with OAuthCard: "Please authenticate"
-  3. Tool sends token exchange: "Here is the user's signed token"
-  4. Bot validates the token and replies: "Hello! How can I help you?"
-  5. Conversation continues normally
-```
-
-### 2.3 Token caching
-
-Acquiring a new token requires the user to go to a website and enter a code (the "device code flow"). This cannot be done 50 times in a loop during a test. So the tool caches tokens on disk, encrypted with a key stored in Windows Credential Manager.
-
-Before a test runs, you authenticate each profile once through the terminal. The token (and its refresh token, which lets the tool renew it silently) is saved encrypted in `profiles/.tokens/`. During the test, the tool reads these cached tokens. If a token has less than 10 minutes of life left, it uses the refresh token to get a new one automatically.
-
-### 2.4 Profiles — simulating multiple users
-
-A "profile" is a test user account. Each profile has:
-- A username (a Microsoft 365 account email address, e.g. `loadtest.user1@yourcompany.com`)
-- A display name (shown in the terminal during the test)
-- Optionally, a scenario name (see section 2.5)
-
-Each profile corresponds to a real account in your Microsoft 365 tenant. The bot will see these as real signed-in users.
-
-Why multiple profiles? A single user account is typically rate-limited by the bot. Spreading the load across multiple accounts makes the test more realistic and avoids single-account throttling.
-
-### 2.5 Scenarios — what messages to send
-
-A scenario is a CSV (comma-separated values) file containing a list of messages. You put these files in the `utterances/` folder. For example, `utterances/it_support.csv` might contain messages like "How do I reset my password?" and "I can't access my email."
-
-Each scenario becomes a separate set of virtual users in Locust. If you have three CSV files, you get three "user types" that can be run independently or together.
-
-Profiles can be pinned to specific scenarios. If you have two profiles and two scenarios, you can say "Profile A always uses the HR scenario" and "Profile B always uses the IT support scenario." Profiles without a pinned scenario are assigned to scenarios by position (round-robin).
-
-### 2.6 How Locust drives the test
-
-Locust is a Python-based load testing framework. This tool uses Locust as its execution engine — programmatically, without the Locust web interface. Here is what Locust does during a test:
-
-1. **Spawning:** You set peak users and a spawn rate in the Run Configuration menu. Locust creates new virtual users at that rate until the peak is reached.
-
-2. **Each user's lifecycle:**
-   - **`on_start`:** The user opens a DirectLine conversation and WebSocket.
-   - **`@task` (the main loop):** The user picks the next utterance from its CSV, sends it to the bot, waits for a reply, then waits for a "think time" before sending the next message.
-   - **`on_stop`:** The user closes the WebSocket when the test ends.
-
-3. **When all utterances are exhausted:** The user stops — it does not restart. Each user runs its script exactly once (one-shot). When enough users have finished to account for the full peak count, the tool sets a shared `all_users_done` flag. Any user Locust tries to respawn immediately raises `StopUser` at the top of `on_start`, so the active user count drains toward zero. When it reaches zero, the test ends early and the report is generated — regardless of how much time remains on the safety cap.
-
-4. **Ramp-up behaviour:** Locust creates new users at the configured spawn rate until the peak is reached. Each new user starts a fresh conversation at utterance 1, independent of where other users are in their scripts. Ramp controls concurrent load, not script coordination.
-
-5. **Test ending:** The test ends under any of three conditions: (a) all users finish their scripts and the active count reaches zero, (b) the safety cap (Max run time) expires, or (c) you press Q. The safety cap is a backstop — it only triggers if users are still running when time runs out, which can happen if the bot is timing out on many requests.
-
-6. **Metrics:** Every time the tool receives a bot reply, it records the latency. The live dashboard reads these events in real time and aggregates them by profile, scenario, and utterance.
-
-### 2.7 The startup sequence
-
-Running `python run.py` does the following before any load test traffic is sent:
-
-```
-python run.py
-    │
-    ├─ 1. Wizard (if not yet configured)
-    ├─ 2. Credential check (reads from Windows Credential Manager)
-    ├─ 3. Profile status (checks cached tokens are valid)
-    ├─ 4. Authentication (device code flow for any profile that needs it)
-    ├─ 5. Pre-flight bot check (sends "hi" to the bot, verifies it responds)
-    ├─ 6. Run Configuration menu (set users, spawn rate, run time)
-    └─ 7. Live terminal dashboard (real-time stats · press Q to stop)
-```
-
-This design means the live dashboard only appears after everything is confirmed working. You will not see the dashboard until the bot has been verified and you have confirmed the test parameters.
+1. The tool checks that all credentials and sign-in tokens are in order.
+2. It sends a single test message ("hi") to the bot to confirm everything is working.
+3. You review and confirm the test settings (number of users, speed of ramp-up, etc.).
+4. The test starts. The tool adds new simulated users one at a time at the speed you chose, until the peak number is reached.
+5. Each simulated user follows a script. It sends the first message, waits for the bot to reply, pauses for a moment to simulate reading, then sends the next message.
+6. Each user runs through all messages in the script exactly once and then stops.
+7. The test ends when all users have finished — or when the safety cut-off time you set expires, or when you press Q.
+8. If a user gets no response for too long, the tool records a timeout and moves on.
+9. When the test finishes, the tool saves a results file and generates an HTML report automatically.
 
 ---
 
@@ -157,9 +87,9 @@ Before you start, make sure you have the following:
 
 | Requirement | Notes |
 |---|---|
-| **Windows 10/11 machine** | Required for Windows Credential Manager integration. Linux works with an extra step (see `TOKEN_ENCRYPTION_PASSWORD` in `.env.example`). |
-| **Python 3.10 or newer** | Download from python.org. During installation, tick "Add Python to PATH". Version 3.10 is the minimum — the tool uses type syntax introduced in that version. |
-| **Charm Gum CLI** | Required for the interactive TUI menus. Install with `winget install charmbracelet.gum` (see Section 6.4). |
+| **Windows 10/11 machine** | Required for the secure credential storage this tool uses. |
+| **Python 3.10 or newer** | Download from python.org. During installation, tick "Add Python to PATH". |
+| **Charm Gum CLI** | Required for the interactive menus. Install with `winget install charmbracelet.gum` (see Section 6.4). |
 | **A published Copilot Studio bot** | The bot must be published and have the Direct Line channel enabled. |
 | **Two test user accounts** | Real Microsoft 365 accounts in your tenant (e.g. `loadtest.user1@yourcompany.com`). These accounts will be used as simulated users. They need a Copilot Studio licence or a Teams licence. |
 | **Azure portal access** | You need permission to register applications in Microsoft Entra ID. The "Application Developer" role is sufficient. |
@@ -272,24 +202,24 @@ git clone https://github.com/kaul-vineet/GRUNTMASTER6000-CopilotLoadTesting.git
 cd GRUNTMASTER6000-CopilotLoadTesting
 ```
 
-> **New machine / new clone:** If you clone this repository to a different machine, you will need to re-run the setup wizard and re-authenticate each profile. Credentials and tokens are stored in Windows Credential Manager and `profiles/.tokens/` on the local machine — they are intentionally not committed to the repository (they would be a security risk if they were).
+> **New machine / new clone:** If you clone this repository to a different machine, you will need to re-run the setup wizard and re-authenticate each profile. Credentials and tokens are stored securely on the local machine — they are intentionally not included in the repository download (they would be a security risk if they were).
 
 ### 6.2 Create a Python virtual environment
 
-A virtual environment keeps this project's dependencies isolated from other Python programs on your machine. This prevents version conflicts.
+This command creates a private, isolated space for GRUNTMASTER 6000's software packages. It keeps the tool's packages separate from anything else on your machine so nothing conflicts.
 
 ```
 python -m venv .venv
 .venv\Scripts\activate
 ```
 
-After running `activate`, your terminal prompt will show `(.venv)` at the start. All Python commands from now on will use this isolated environment.
+After running `activate`, your terminal prompt will show `(.venv)` at the start. This tells you the isolated environment is active. All commands from now on will use it.
 
-> **PowerShell note:** If you see an error saying "running scripts is disabled on this system", run this once in PowerShell as your normal user (not administrator):
+> **PowerShell note:** If you see an error saying "running scripts is disabled on this system", run this once in PowerShell as your normal user (not as administrator):
 > ```
 > Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 > ```
-> Then try `.venv\Scripts\activate` again. This is a Windows security policy — the command above allows scripts you create on your own machine to run.
+> Then try `.venv\Scripts\activate` again. This is a Windows security setting. The command above allows scripts you create on your own machine to run.
 
 ### 6.3 Install dependencies
 
@@ -297,20 +227,17 @@ After running `activate`, your terminal prompt will show `(.venv)` at the start.
 pip install -r requirements.txt
 ```
 
-This installs:
-- **locust** — the load testing framework
-- **msal** — Microsoft Authentication Library, handles the device code sign-in flow
-- **requests** — HTTP client used for DirectLine REST calls
-- **websocket-client** — used to receive bot replies over WebSocket
-- **cryptography** — Fernet encryption for token storage
-- **keyring** — reads/writes Windows Credential Manager
-- **rich** — the coloured terminal output and live dashboard
-- **colorama** — Windows console colour compatibility
-- **pandas** and **plotly** — required for HTML report generation (optional — if not installed, reports are skipped)
+This command downloads and installs all the software packages GRUNTMASTER 6000 needs to run. You only need to do this once. The packages include:
+
+- The load testing engine that runs the simulated users
+- The Microsoft sign-in library that handles authentication
+- Tools for sending messages to the bot and receiving replies
+- The library that draws the live dashboard in your terminal
+- Tools for generating the HTML report at the end of the test
 
 ### 6.4 Install Charm Gum (TUI menus)
 
-The interactive wizard and run configuration menus use [Charm Gum](https://github.com/charmbracelet/gum). Install it once:
+GRUNTMASTER 6000 uses a tool called [Charm Gum](https://github.com/charmbracelet/gum) to draw the interactive menus you navigate with arrow keys. Install it once:
 
 ```
 winget install charmbracelet.gum
@@ -318,21 +245,7 @@ winget install charmbracelet.gum
 
 Or with Scoop: `scoop install charm-gum`
 
-Gum is a standalone binary — it does not affect Python or your virtual environment.
-
-The tool uses the following Gum subcommands:
-
-| Command | Used for |
-|---|---|
-| `gum style` | Styled header and callout boxes in the terminal |
-| `gum input` | Single-line text fields (tenant ID, username, etc.) |
-| `gum confirm` | Yes / No prompts |
-| `gum choose` | Arrow-key single-select menus (wizard, run config, post-test) |
-| `gum choose --no-limit` | Multi-select (choosing which profiles to authenticate) |
-| `gum file` | Interactive file browser (picking a CSV for the report) |
-| `gum write` | Multi-line text input (test notes field) |
-| `gum format` | Markdown rendering (the `? Help` screen) |
-| `gum spin` | Spinner animation (waiting for bot preflight check) |
+Gum is a standalone program. It has no effect on Python or the virtual environment.
 
 ### 6.5 Create your utterance files
 
@@ -348,11 +261,11 @@ Run:
 python run.py
 ```
 
-The first time you run this (or if not configured), the setup wizard opens automatically. The wizard saves all credentials into **Windows Credential Manager** — the same secure store that browsers use to save passwords. Nothing sensitive is written to any file.
+The first time you run this (or if not yet configured), the setup wizard opens automatically. The wizard saves all credentials into **Windows Credential Manager** — the same secure store that browsers use to save passwords. Nothing sensitive is written to a plain text file.
 
 ### 7.1 The wizard menu
 
-The wizard uses arrow-key navigation. Each row is a setting — navigate to it and press Enter to edit:
+The wizard uses arrow-key navigation. Each row is a setting. Navigate to it and press Enter to edit:
 
 ```
       Tenant ID                          72f988bf-…                      ✓
@@ -393,7 +306,7 @@ Where to find it: Azure portal → App registrations → [your app] → Applicat
 ---
 
 **Bot Client ID (SSO)**
-The identifier of the bot's resource app (the one Copilot Studio created automatically).
+The identifier of the bot's resource app — the one Copilot Studio created automatically when you configured authentication.
 
 Where to find it: Copilot Studio → Settings → Security → Authentication → Client ID.
 
@@ -402,38 +315,36 @@ Leave this blank if your bot does not use authentication.
 ---
 
 **DirectLine Secret**
-The secret key that gives this tool permission to talk to your bot.
+The secret key that gives this tool permission to talk to your bot over Direct Line.
 
 Where to find it: Copilot Studio → Settings → Channels → Direct Line → Secret keys → Show.
 
-The value is a long string of random characters. It is masked as you type it.
+The value is a long string of random characters. It is hidden as you type it.
 
 ---
 
 **Token Endpoint URL**
-An alternative to the DirectLine Secret. Some organisations use a Token Endpoint — a URL on their own server that vends temporary DirectLine tokens without exposing the raw secret.
+An alternative to the DirectLine Secret. Some organisations use a Token Endpoint — a URL on their own server that gives out temporary access tokens without exposing the raw secret.
 
 Where to find it: Copilot Studio → Settings → Channels → Direct Line → Token Endpoint URL.
 
-If you set this, leave the DirectLine Secret blank (or vice versa). If both are set, the Token Endpoint takes priority.
-
-The Token Endpoint field is always visible in the wizard. After you enter or change the URL, the tool makes a test GET request to confirm the endpoint is reachable before continuing.
+If you set this, leave the DirectLine Secret blank (or vice versa). If both are set, the Token Endpoint takes priority. After you enter or change the URL, the tool makes a quick test to confirm the address is reachable before continuing.
 
 ---
 
 **Profiles**
-After the credential fields, you can add profiles. A profile is a test user account.
+A profile is a test user account. After the credential fields, you can add as many profiles as you need.
 
 For each profile you need:
 - **Username (UPN):** The full email address of the test account, e.g. `loadtest.user1@yourcompany.com`
-- **Display name:** A short label shown in the terminal (e.g. `User 1`). Press Enter to accept the default (the part before @).
+- **Display name:** A short label shown in the terminal (e.g. `User 1`). Press Enter to accept the default.
 - **Scenario (CSV name):** The name of the CSV file (without `.csv`) this profile will use. Leave blank to auto-assign.
 
 After adding a profile, the wizard asks whether to add another.
 
 ### 7.3 Authentication
 
-After saving, the wizard checks whether each profile already has a valid cached token. For any that do not, it starts the device code flow:
+After saving, the wizard checks whether each profile already has a valid saved sign-in token. For any that do not, it starts the device code sign-in process:
 
 ```
   ╭──────────────────────────────────╮
@@ -444,11 +355,11 @@ After saving, the wizard checks whether each profile already has a valid cached 
   Waiting for sign-in…
 ```
 
-Open a browser, go to that URL, enter the code shown, and sign in with the test user account. The tool waits. When sign-in completes, the token is saved encrypted to `profiles/.tokens/`. You will not need to do this again for that account until the refresh token expires (typically 90 days).
+Open a browser, go to that URL, enter the code shown, and sign in with the test user account. The tool waits. When sign-in completes, the token is saved securely to your machine. You will not need to do this again for that account for up to 90 days.
 
 ### 7.4 Pre-flight check
 
-Before showing the run configuration, the tool sends "hi" to the bot and waits for a reply (up to 30 seconds for the first response, then a further 15 seconds of silence before declaring it complete). This confirms the credentials work and the bot is reachable. If this fails, an error message explains what to check.
+Before showing the run configuration, the tool sends "hi" to the bot and waits for a reply. This confirms the credentials work and the bot is reachable. If this fails, an error message explains what to check.
 
 > **Note:** The pre-flight check sends one real message to your bot. If you are testing a production bot, this will appear in the bot's analytics as one conversation. This is unavoidable and harmless — it is a single "hi" message sent once at startup.
 
@@ -456,11 +367,11 @@ Before showing the run configuration, the tool sends "hi" to the bot and waits f
 
 ## 8. Writing Test Scripts (Utterance Files)
 
-Utterance files are CSV files in the `utterances/` folder. Each file is one "scenario" — one type of user journey through the bot.
+Utterance files are the scripts GRUNTMASTER 6000 follows when simulating users. Each file lives in the `utterances/` folder. Each file represents one type of user — one "scenario".
 
 ### 8.1 Format
 
-The file must have a header row with the column name `utterance`. Each subsequent row is one message to send.
+The file must be a CSV (comma-separated values) file with a header row containing the word `utterance`. Each row after that is one message to send to the bot, in order.
 
 ```csv
 utterance
@@ -470,7 +381,7 @@ What are the steps to reset a password?
 Please escalate this to a human.
 ```
 
-The tool sends these messages in order. After the last message, it opens a new conversation and starts again from the first message.
+The tool sends these messages one at a time in order. It waits for the bot to reply before sending the next one.
 
 ### 8.2 What makes a good test script
 
@@ -481,7 +392,7 @@ The tool sends these messages in order. After the last message, it opens a new c
 
 ### 8.3 Assigning profiles to scenarios
 
-If you have two CSV files and two profiles, assign each profile to one scenario in the wizard (the "Scenario" field when adding a profile). The profile's username will be used exclusively for that scenario's virtual users.
+If you have two CSV files and two profiles, assign each profile to one scenario in the wizard (the "Scenario" field when adding a profile). That profile's simulated users will only use messages from that scenario's script.
 
 If you have more CSV files than profiles, profiles are reused in rotation across scenarios.
 
@@ -491,17 +402,17 @@ If you have more CSV files than profiles, profiles are reused in rotation across
 
 ### 9.1 Start the tool
 
-With the virtual environment active:
+Make sure the virtual environment is active (you see `(.venv)` in your terminal prompt). Then run:
 
 ```
 python run.py
 ```
 
-If already configured, the wizard is skipped. The tool checks credentials, verifies profile tokens, and runs the pre-flight check, then shows the **Run Configuration** menu.
+If already configured, the wizard is skipped. The tool checks credentials, verifies sign-in tokens, and runs the pre-flight check, then shows the **Run Configuration** menu.
 
 ### 9.2 Run Configuration menu
 
-All test parameters are shown with their current values. Navigate to any row and press Enter to edit it:
+All test settings are shown with their current values. Navigate to any row and press Enter to change it:
 
 ```
   ✦  RUN CONFIGURATION  ✦
@@ -527,43 +438,34 @@ All test parameters are shown with their current values. Navigate to any row and
 
 Select **▶ Start test** when ready.
 
-**What "peak users" means:** This is the number of users spawned in total — each runs the full script once then stops. It is not a concurrent-at-all-times count. With think time set to 30 seconds, 10 users will generate approximately 10 ÷ 30 ≈ **0.3 requests per second** at peak concurrency. To get 1 request per second, you need roughly 30 users. This is intentional — Microsoft's Copilot Studio performance guidance assumes human-paced conversations.
+**Peak users** — How many simulated users will run in total. Each user sends all the messages in the script once and then stops. With think time set to 30 seconds, 10 users will send roughly 1 message every 3 seconds combined. To generate 1 message per second, you need roughly 30 users. This matches the pace of real human conversations.
 
-**What "spawn rate" means:** The number of new users added per minute. A rate of 5 users/min with a peak of 10 users means the test reaches full load after 2 minutes. A slower ramp gives the bot time to warm up; a faster ramp stresses it sooner.
+**Spawn rate** — How quickly users are added. A rate of 5 users/min means one new user starts every 12 seconds. With a peak of 10 users, the test reaches full load after 2 minutes. A slower ramp gives the bot time to warm up. A faster ramp stresses it sooner.
 
-**What "Max run time (safety cap)" means:** The test will force-stop at this many minutes even if users are still running (e.g., if many requests are timing out and scripts are taking longer than expected). Set it above the "Est. total duration" shown in the read-only rows below. Under normal conditions — where users finish their scripts on time — the test ends early through natural completion, and the cap is never reached.
+**Think time** — How long each simulated user pauses between messages to simulate a real person reading the reply. The actual pause varies randomly to avoid all users sending at exactly the same moment.
 
-**The timeout model:** There are two timeouts working in sequence:
-1. **Reply timeout** (default 30s, minimum 15s, configurable) — how long the tool waits for the *first* bot reply after sending a message. If nothing arrives in this window, the request is counted as timed out.
-2. **Silence window** (fixed at 15s, not configurable) — once the first reply arrives, the tool keeps listening for additional reply activities (some bots send multiple cards). If 15 seconds pass with no new activity, the tool declares the response complete and records the latency.
+**Reply timeout** — How long the tool waits for the bot to start replying before giving up. If the bot does not send its first word within this time, the request is recorded as a timeout. The minimum is 15 seconds.
 
-**Worst case per utterance:** reply timeout + silence window = up to 45 seconds (at default settings) before a request is abandoned.
+**Max run time (safety cut-off)** — The test will force-stop at this number of minutes even if users are still in the middle of their scripts. This is a backstop for situations where many requests are timing out and scripts are taking much longer than expected. Set it higher than the "Est. total duration" shown below. Under normal conditions the test ends earlier on its own, and this cut-off is never reached.
 
-**Notes field:** Free text you can attach to the run — a description, ticket number, or anything that helps identify the test later. The notes appear as a callout box in the HTML report.
+**Est. ramp-up / Est. script / user / Est. total duration** — These rows are calculated automatically and update as you change the settings above them. They give you a rough preview of how long the test will take. You cannot edit them directly.
 
-**The "Silence window" row** is read-only — it is shown for information only and cannot be changed through the menu.
+**Silence window** — After the bot sends its first reply, the tool waits this long for any follow-up messages (some bots send multiple reply cards). This is fixed at 15 seconds and cannot be changed.
+
+**Notes** — Free text you can attach to a run — a description, ticket number, or anything that helps identify it later. The notes appear in the HTML report.
 
 **Recommended approach for first runs:**
 1. Start with 1 user, confirm the bot responds correctly.
 2. Step up to 5 users, watch for errors.
 3. Step up to 10, 20, 50 users incrementally.
 
-### 9.3 RPS ceiling — understanding DirectLine rate limits
+### 9.3 Understanding the rate limit ceiling
 
-DirectLine enforces a rate limit of approximately 8,000 requests per minute (133 requests per second) across your bot. This is a hard ceiling you cannot exceed regardless of how many virtual users you run.
-
-To estimate how many concurrent users you need to approach this ceiling:
-
-```
-cycle time = response_time + think_time
-users needed to saturate = 133 × cycle_time
-```
-
-For example: if your bot takes 2 seconds to reply and you use the default 30-second think time, the cycle is 32 seconds. To generate 133 RPS you would need 133 × 32 = 4,256 concurrent users — which is not realistic for typical Copilot Studio deployments. In practice, the realistic bottleneck is the bot's message capacity (set in Power Platform Admin Center), not the DirectLine rate limit.
+Direct Line (the messaging channel the tool uses) has a hard rate limit of approximately 8,000 messages per minute. You cannot exceed this regardless of how many users you run. In practice, the more likely bottleneck for a typical Copilot Studio deployment is the bot's message capacity setting in Power Platform Admin Center, not this ceiling.
 
 ### 9.4 Live dashboard
 
-The test runs entirely in the terminal. A live dashboard updates every 0.5 seconds using the terminal's alternate screen buffer (no flicker):
+The test runs entirely in the terminal. A live dashboard updates every half-second:
 
 ```
 ╭──────────────────────────────────────────────────────────────────────╮
@@ -610,31 +512,34 @@ The test runs entirely in the terminal. A live dashboard updates every 0.5 secon
   Press Q to stop test and go to New Run
 ```
 
-**Health indicator:**
-- `● STARTING` — no requests recorded yet (bot hasn't replied)
-- `● HEALTHY` — p95 is below 80% of your target
-- `● DEGRADED` — p95 is between 80% and 100% of your target
-- `● CRITICAL` — p95 has exceeded your target
+**Health indicator (top right):**
+- `● STARTING` — no replies recorded yet
+- `● HEALTHY` — response times are well within your target
+- `● DEGRADED` — response times are close to your target
+- `● CRITICAL` — response times have exceeded your target
 
-**RAMP STEPS** shows the last 5 ramp windows (one per 60-second block). The active (in-progress) window is marked with `▶` and styled in cyan. All completed windows are shown in dim. The table has a 429 column showing how many rate-limit hits occurred in each window. Events (ramp starts, 429 hits, timeout warnings) appear as sub-rows indented under the ramp step they belong to.
+**SPAWNING bar** — Shows how many users have been started so far versus the peak you set. The bar fills up as the ramp proceeds.
 
-**RAMP TREND** appears once at least two ramp steps have completed. Each tiny bar represents one ramp step — left is early in the test, right is now. Compare Users vs p95: if p95 rises faster than Users, the bot is struggling to scale.
+**RPS / Errors / p95 bar** — The current rate of messages per second, the current error rate, and a progress bar showing how close the p95 response time is to your target.
 
-**UTTERANCES** shows the 4 slowest utterances (red) and 4 fastest (green) in one table, separated by a dim `── fastest ──` divider. Profile shows which specific user instance had the worst p95 for that utterance. Bot Response shows the actual reply from the worst-performing call, with newlines collapsed to a single line.
+**RAMP STEPS table** — The test is divided into 60-second windows called ramp steps. Each row covers one minute. The current in-progress minute is marked with `▶` in cyan. The 429 column shows how many times the bot said "slow down" during that minute. Events (ramp starts, errors) appear as indented rows under the minute they happened in.
 
-**EVENTS** shows the last 8 test events with timestamps and the ramp step (R1, R2, …) they belong to. Events include: ramp window starts, timeouts (with the utterance and duration), 429 rate-limit hits (shown in bold red), consecutive timeout warnings, WebSocket stream errors, auth failures, DirectLine token failures, conversation start failures, send failures, read failures — all with a short reason extracted from the HTTP response or exception. CPU warnings appear in yellow.
+**RAMP TREND line** — A line of tiny bars showing how metrics evolved across all ramp steps. Each bar is one completed minute. If the p95 bars grow faster than the Users bars, the bot is slowing down under load.
 
-**Circuit breaker banner:** If the bot returns a 429 (Too Many Requests) response, the tool trips a circuit breaker and displays a red banner: `⚡ CIRCUIT OPEN — DirectLine rate limit (429) hit — all users paused — resuming in Xs`. All virtual users pause for 60 seconds (or the duration in the Retry-After header if provided). After the pause, users resume automatically. This prevents a flood of failing requests from distorting your metrics.
+**PROFILE STATS** — One row per test user account. Shows how many messages were sent, the response time at the 50th, 95th, and 99th percentile, the timeout count, and a small sparkline chart showing how the 95th percentile changed over time during the test. A sparkline that rises from left to right means the bot got slower as the test progressed.
 
-Press **Q** at any time to stop the test early. On Windows, Q is detected by a dedicated OS thread using `msvcrt` — it does not run inside Locust's gevent greenlet pool.
+**UTTERANCES** — Shows the 4 slowest messages (highlighted in red) and the 4 fastest (highlighted in green) in one table, separated by a dim divider. The "Bot Response" column shows the actual reply the bot gave on the slowest recorded call for each message.
+
+**EVENTS** — A timestamped log of the last 8 things that happened: ramp steps starting, timeouts, rate-limit hits, and errors. This is useful for understanding when things went wrong during the test.
+
+Press **Q** at any time to stop the test early.
 
 ### 9.5 After the test
 
-When the test ends (all users finish their scripts, the safety cap expires, or you press Q):
+When the test ends (all users finish their scripts, the safety cut-off expires, or you press Q):
 
-1. **Adversarial audit** — the tool runs four independent checks on the recorded data (see Section 11). Results print below the final dashboard.
-2. **HTML report** — generated automatically in `report/report_YYYYMMDD_HHMMSS.html`.
-3. **Post-run menu** — choose what to do next.
+1. An HTML report is generated automatically in `report/report_YYYYMMDD_HHMMSS.html`.
+2. A post-run menu appears.
 
 ```
   ▶  New Run         — go back to Run Configuration and start again
@@ -648,220 +553,133 @@ All results are automatically saved to `report/detail_YYYYMMDD_HHMMSS.csv`.
 
 ## 10. Reading the Results
 
-### 10.1 Live dashboard metrics
-
-| Section | What it shows |
-|---|---|
-| **Header** | Health status (STARTING / HEALTHY / DEGRADED / CRITICAL) and elapsed time |
-| **SPAWNING** | Progress bar showing users spawned vs target |
-| **Config FYI** | Dim line showing Peak users, Ramp rate, and Run time for the current run |
-| **RPS / p95** | Requests per second, inline error rate, p95 progress bar vs your target |
-| **RAMP STEPS** | Last 5 ramp windows (60s each) — active window marked `▶` in cyan — includes 429 column — events appear as indented sub-rows |
-| **RAMP TREND** | One-line sparklines (Users / Req / RPS / p50 / p95 / p99 / T/O) across all ramp steps |
-| **PROFILE STATS** | One row per profile+scenario: request count, p50/p95/p99, timeouts, p95 sparkline |
-| **ALL USERS** | Aggregate row across all profiles and scenarios |
-| **p95 / 30s buckets** | Sparkline column in PROFILE STATS — each bar = p95 in a 30-second window |
-| **Error rate sparkline** | Single red line below PROFILE STATS — bar height = errors in that 30s bucket |
-| **UTTERANCES** | Top 4 slowest (red) + dim divider + top 4 fastest (green) — Profile, Utterance, p50, p95, Count, Bot Response |
-| **EVENTS** | Last 8 events: ramp starts, 429 hits, timeout warnings, CPU warnings — each tagged with timestamp and ramp number |
-
-#### What the numbers actually mean
+### 10.1 Live dashboard metrics explained
 
 **Response time (latency)**
-Think of it like a stopwatch. Every time a virtual user sends a message, the tool starts a stopwatch. It stops the moment the bot finishes all reply activities. That elapsed time — measured in milliseconds (ms) — is the response time. 1000 ms = 1 second. A well-performing bot usually replies in under 2000 ms.
+Think of it like a stopwatch. Every time a simulated user sends a message, the tool starts a stopwatch. It stops the moment the bot finishes all its replies. That elapsed time — measured in milliseconds — is the response time. 1000 ms equals 1 second. A well-performing bot usually replies in under 2000 ms.
 
 **p50 — the median**
-Sort every response time you have measured, from fastest to slowest. The value exactly in the middle is the p50. Half of all requests were faster than this number, half were slower. It is the "typical" experience — what most users feel most of the time.
+Sort every response time you have measured from fastest to slowest. The value exactly in the middle is the p50. Half of all requests were faster than this number, half were slower. It represents the typical experience — what most users feel most of the time.
 
 **p95 — the 95th percentile**
-Sort all response times again and go 95% of the way through the list. That value is the p95. It means "95 out of every 100 requests finished within this time or less." The remaining 5 out of 100 took longer. The p95 is the number to watch — it tells you how bad the *worst realistic* experience is, not just the average. A p95 of 2000 ms means almost everyone gets a reply within 2 seconds, with only rare exceptions.
+Sort all response times again and go 95% of the way through the list. That value is the p95. It means "95 out of every 100 requests finished within this time or faster." The remaining 5 out of 100 took longer. The p95 is the most important number to watch. It tells you how bad the worst realistic experience is, not just the average. A p95 of 2000 ms means almost everyone gets a reply within 2 seconds, with only rare exceptions.
 
 **p99 — the 99th percentile**
 The same idea pushed further: 99 out of 100 requests finished within this time. The p99 captures the very slow outliers. If your p99 is 5000 ms, one request in every hundred takes five seconds or more.
 
 **Why p95 matters more than average**
-The average can hide a lot. If 90 requests finish in 500 ms and 10 requests take 10 seconds, the average is about 1.4 seconds — sounds fine! But ten users out of a hundred had a terrible experience. The p95 surfaces that. This is why performance engineers use percentiles, not averages.
-
-**How percentiles are calculated**
-The tool uses the "lower" method: it sorts all recorded values and picks the value at position `floor(count × percentile)`. This is the same method as numpy's `method="lower"` and pandas' `interpolation="lower"`. It never interpolates between two values — it picks an actual measurement.
+The average can hide a lot. If 90 requests finish in 500 ms and 10 requests take 10 seconds, the average is about 1.4 seconds — sounds fine. But ten users out of every hundred had a terrible experience. The p95 surfaces that problem. This is why the dashboard focuses on percentiles rather than averages.
 
 **RPS — requests per second**
-How many bot messages are being sent per second across all virtual users right now. With human-paced think time (30 seconds between messages), 30 concurrent users generate roughly 1 request per second.
+How many messages are being sent to the bot per second right now across all simulated users. With a 30-second think time between messages, 30 concurrent users generate roughly 1 message per second.
 
 **T/O — timeout**
-A request where the bot did not reply within the Reply Timeout setting (default 30 seconds). The tool gave up waiting and counted it as a failure. A rising T/O count is a strong sign the bot is struggling to keep up.
+A request where the bot did not reply within the Reply Timeout setting. The tool gave up waiting and counted it as a failure. A rising T/O count is a strong sign the bot is struggling to keep up.
 
 **Error rate**
 The percentage of requests that either timed out or returned an error. Keep this below 1%.
 
-**The p95 / 30s buckets sparkline  (▁▂▄▇█▆▄▂)**
-Each tiny bar in the PROFILE STATS table represents one 30-second window of the test. The taller the bar, the slower the p95 was during that window. A sparkline that rises from left to right means the bot is getting slower as the load increases. A flat sparkline means the bot is handling load consistently.
+**The p95 / 30s buckets sparkline (▁▂▄▇█▆▄▂)**
+Each tiny bar in the PROFILE STATS table represents one 30-second window of the test. The taller the bar, the slower the p95 was during that window. A sparkline that rises from left to right means the bot got slower as load increased. A flat sparkline means the bot handled load consistently.
 
 **Error rate sparkline**
-Shown as a single red line below PROFILE STATS. Each bar = one 30-second window. A flat line at ▁ means zero errors throughout. Any bar taller than ▁ means errors occurred in that window.
+Shown as a single red line below PROFILE STATS. Each bar covers one 30-second window. A flat line at ▁ means zero errors throughout. Any bar taller than ▁ means errors occurred in that window.
 
 **RAMP STEPS table**
-Shows the last 5 ramp windows (one row per 60-second block). The current in-progress window is marked with `▶` and highlighted in cyan; completed windows are dim. The 429 column shows how many rate-limit responses the bot returned in each window. As you ramp up users, these rows let you pinpoint the load level where things started to slow down — for example, "response times were fine at 5 users but started climbing in the third minute when we hit 15."
+One row per 60-second window of the test. The current in-progress window is highlighted in cyan. The 429 column shows rate-limit responses per window. These rows let you pinpoint the load level where things started to slow down — for example, "response times were fine at 5 users but started climbing in the third minute when load hit 15 users."
 
 **RAMP TREND line**
-A single line of labeled sparklines where each bar represents one completed ramp step (not a time bucket). Shows Users, Req, RPS, p50, p95, p99, and T/O across the full test history — even if older ramp steps have scrolled off the RAMP STEPS table. The key pattern to watch: if the p95 bars grow faster than the Users bars, the bot is degrading under load rather than scaling linearly.
+A single line of labeled sparklines where each bar is one completed 60-second window. It shows Users, Requests, RPS, p50, p95, p99, and timeouts across the full test. If the p95 bars grow faster than the Users bars, the bot is degrading under load.
 
 **UTTERANCES table**
-Shows the 4 slowest utterances (highlighted red) and 4 fastest (highlighted green) in a single table, separated by a dim `── fastest ──` divider. Columns are: Profile (the specific user instance with the worst p95 for that utterance), Utterance (the message text), p50, p95, Count, and Bot Response (the actual reply from the slowest call, with newlines stripped). With 50 utterances in your script, you still only see 8 rows — the extremes most worth your attention.
+Shows the 4 slowest messages (highlighted red) and 4 fastest (highlighted green) in a single table, separated by a dim divider. With 50 messages in your script, you still only see 8 rows — the extremes most worth your attention.
 
 ### 10.2 The detail CSV
 
-Every bot reply is recorded to `report/detail_YYYYMMDD_HHMMSS.csv`. One file per test run.
+Every bot reply is recorded to `report/detail_YYYYMMDD_HHMMSS.csv`. One file is created per test run.
 
-| Column | What it means |
-|---|---|
-| `profile` | Display name of the test user (includes spawn number, e.g. `Alice #1`) |
-| `event_number` | Sequential event index for this user within the test run |
-| `scenario` | Scenario name (CSV filename without extension) |
-| `conversation_id` | DirectLine conversation ID |
-| `utterance` | The message that was sent |
-| `bot_response` | The bot's reply text (up to 500 characters; `|`-separated if multiple activities) |
-| `utterance_sent_at` | UTC ISO timestamp when the message was sent |
-| `response_received_at` | UTC ISO timestamp when the reply was received |
-| `response_ms` | Round-trip latency in milliseconds |
-| `timed_out` | `1` if no reply was received within the timeout, `0` otherwise |
-| `user_count` | Number of concurrent users active when this request was recorded |
+The file contains one row per message exchange: which test user sent the message, which conversation it belonged to, what the message was, what the bot replied, when it was sent, how long it took to reply (in milliseconds), whether it timed out, and how many users were active at that moment.
 
 You can open this file in Excel, Power BI, or any analysis tool to produce your own charts and summaries.
 
 ### 10.3 HTML report
 
-After every test run, an HTML report is automatically generated in `report/report_YYYYMMDD_HHMMSS.html`. It is a 4-tab report:
+After every test run, an HTML report is automatically generated in `report/report_YYYYMMDD_HHMMSS.html`. It has four tabs:
 
 **Tab 1 — Summary**
-- Summary header — request count, duration, error rate, p95 vs target (PASS/FAIL badge)
-- Ramp Steps table — one row per 60-second window: users, requests, RPS, p50/p95/p99, timeouts, 429s; events appear as indented sub-rows
-- Error Breakdown table — counts of each error type (timeout, ws_closed, rate_limit, auth_error, etc.) with an example message, sorted by count
-- Profile summary table — p50/p95/p99/error rate per user account, rows highlighted red if p95 exceeds target
-- Scenario Breakdown table — same stats grouped by scenario CSV
-- Profile comparison — percentage difference in median (p50) response time between any two profiles
-- CSV download — embedded link to download the raw detail CSV
+The top-line results at a glance. Shows total message count, test duration, error rate, and whether the p95 response time passed or failed your target. Below that: a ramp steps table (one row per minute of the test), a breakdown of error types, per-user stats, and a comparison of how different user accounts performed.
 
 **Tab 2 — Response Time Distribution**
-- Box/whisker chart per profile — latency distribution, p95 target line
-- Box/whisker chart per scenario — same view grouped by scenario
-- Latency heatmap — median response time per 30-second bucket per utterance (shows a warning if the `utterance_sent_at` column is absent)
+Charts that show the spread of response times per user account and per scenario. A narrow spread means the bot responded consistently. A wide spread means some users waited much longer than others. Also includes a heatmap showing how response times changed over time for each individual message in your script.
 
 **Tab 3 — Utterance Analysis**
-- Live filter input — type to filter utterance rows instantly, no page reload
-- Per-utterance table — sortable by any column: count, p50/p95/p99, timeouts, MAD anomaly flag, log-normal p99.9 projection
-- Baseline comparison columns — if a previous run's detail CSV is found, Δp95 and Δp50 columns appear showing % change vs baseline (green = faster, red = slower, grey = within ±10%)
+A detailed table of every message in your script with its response time stats. You can type in the filter box to search for a specific message. If you run a second test after a baseline test, this tab shows percentage changes so you can see whether things got faster or slower.
 
 **Tab 4 — Config**
-- All test parameters for this run: peak users, spawn rate, think time, reply timeout, safety cap, p95 target, silence window
+A record of all the settings used for this test run: peak users, spawn rate, think time, reply timeout, safety cut-off, and p95 target. Useful for sharing results and knowing exactly what conditions produced them.
 
 All tables in the report are sortable — click any column header to sort.
 
-Requires `pandas` and `plotly` (included in `requirements.txt`). If not installed, report generation is silently skipped — the test still runs normally.
-
-#### Reading the charts
+#### Reading the response time charts
 
 **Box/whisker chart**
-Imagine lining up all the response times for one scenario in order from fastest to slowest, then folding the line into a shape:
+Imagine lining up all the response times for one scenario from fastest to slowest, then folding the line into a shape:
 
-- The **box** covers the middle 50% of all requests — from the 25th percentile on the left edge to the 75th on the right.
+- The **box** covers the middle 50% of all requests.
 - The **line through the middle of the box** is the median (p50) — the typical response time.
-- The **whiskers** are lines that extend out from each side of the box to show the faster and slower extremes.
-- Dots beyond the whiskers are individual outlier requests that were unusually fast or slow.
+- The **whiskers** extend out to show faster and slower extremes.
+- Dots beyond the whiskers are individual unusually fast or slow requests.
 
-A **narrow box** means the bot responded consistently — most users got a similar experience. A **wide box** means high variance — some users waited much longer than others. When comparing scenarios, look for whose box sits furthest to the right (slowest).
+A narrow box means consistent performance. A wide box means high variability — some users waited much longer than others.
 
 **Latency heatmap**
-This is a grid. Each row is a different utterance (a specific question). Each column is a 30-second time window during the test. Each cell is colour-coded by how slow the median was in that window for that utterance — lighter/cooler colours are fast, darker/warmer colours are slow.
+A grid where each row is a different message and each column is a 30-second window during the test. Each cell is colour-coded: lighter colours are fast, darker colours are slow.
 
-Use the heatmap to spot patterns you would miss in averages:
-- A single row that is always warm → one particular question is consistently slow no matter what
-- A column that turns warm near the right side → the bot starts degrading as more users join
-- A speckled random pattern → occasional slowdowns, probably network noise rather than a real capacity issue
+Use the heatmap to spot patterns:
+- A single row that is always dark — one particular message is consistently slow no matter what.
+- Columns that turn dark towards the right side — the bot starts slowing down as more users join.
+- A random speckled pattern — occasional slowdowns, probably network noise rather than a real capacity issue.
 
-**Per-utterance table — p99.9 log-normal projection**
-We often cannot run a test long enough to collect 1000 measurements for every utterance. But if we assume response times follow a "log-normal distribution" (a statistical model that fits timing data well in practice), we can project what the 99.9th percentile would probably be with more data. This projection requires at least 10 samples and is labelled with `~` to remind you it is an estimate. A log-normal p99.9 that is many times larger than your p99 is a warning sign of a heavy tail.
+**Per-utterance anomaly flag**
+Some rows in the utterance table may be flagged with a dot (•). This means that message is unusually slow compared to all the others in your script. The flag uses a statistical method that is not thrown off by a few extreme outliers.
 
-**Per-utterance table — MAD anomaly flag**
-MAD stands for **Median Absolute Deviation**. It is a way of measuring how unusual one utterance is compared to all the others.
-
-Step by step:
-1. Calculate the median response time across all utterances.
-2. For each utterance, calculate how far it sits from that median.
-3. Take the median of *those* distances — that is the MAD.
-4. Any utterance whose distance from the median is more than 3× the MAD gets flagged with a dot (•).
-
-In plain terms: if most questions take around 1.5 seconds and one particular question consistently takes 6 seconds, the MAD calculation will flag it as an anomaly. The MAD method is more robust than comparing to the average because a few extreme outliers do not distort it.
+**Per-utterance p99.9 projection**
+This is a statistical estimate of how slow the very worst 1-in-1000 request might be, extrapolated from the data you collected. It is labelled with `~` to remind you it is an estimate, not a measured value.
 
 **Profile comparison**
-For any two profiles, the report shows the percentage difference in median (p50) response time. If the IT Support profile has a p50 of 1,400 ms and the HR profile has a p50 of 2,100 ms, the comparison will show +50% for HR. This tells you which profile is putting more strain on the bot.
+Shows the percentage difference in median response time between any two user accounts. If one account's messages consistently take longer than another's, it may indicate the bot behaves differently depending on the user — worth investigating.
 
 ### 10.4 Interpreting results
 
 **The bot passes the performance test if:**
-- 95th-percentile response time stays below 2000ms (or your configured target)
-- Error rate stays below 1% (timeouts are the most common error — investigate any T/O count above a handful)
+- The 95th-percentile response time stays below 2000 ms (or your configured target)
+- Error rate stays below 1%
 
 **Signs of trouble:**
-- Response times climbing steadily → bot is under capacity pressure; add message capacity in Power Platform
-- Error rate above 1% → bot may be throttling or returning errors; check Copilot Studio analytics
-- `T/O` count rising → bot is taking too long to respond; increase the Reply Timeout in Run Configuration or reduce peak users
-- `429` column rising in RAMP STEPS → bot is rate-limiting; reduce concurrent users or increase think time
+- Response times climbing steadily — the bot is under capacity pressure. Add message capacity in Power Platform Admin Center.
+- Error rate above 1% — the bot may be throttling or returning errors. Check Copilot Studio analytics.
+- T/O count rising — the bot is taking too long to respond. Increase the Reply Timeout in Run Configuration or reduce peak users.
+- 429 column rising in RAMP STEPS — the bot is rate-limiting. Reduce concurrent users or increase think time.
 
 ---
 
-## 11. Architecture Notes
+## 11. How it handles problems
 
-### 11.1 Timeout model
+**If the bot does not reply in time (timeout):** The tool waits up to your Reply Timeout setting for the first word from the bot. Once the bot starts replying, it waits another 15 seconds for any follow-up messages. If nothing arrives in time, the request is recorded as a timeout.
 
-Two timeouts work in sequence for every utterance:
+**If the same user gets two timeouts in a row:** The tool assumes the conversation is stuck and starts a fresh one for that user. The event is logged in the EVENTS feed on the dashboard.
 
-- **`response_timeout`** (default 30s, minimum enforced at 15s) — the tool waits this long for the *first* bot reply activity after sending a message. Configurable in the Run Configuration menu.
-- **`_SILENCE_TIMEOUT`** (fixed at 15s, not configurable) — once the first reply arrives, the tool waits this long with no new activity before deciding the bot has finished. Some bots send multiple cards or follow-up messages.
+**If the bot returns a rate-limit error (429):** The tool stops all users for 60 seconds to let the bot recover, then resumes automatically. A red banner appears on the dashboard while users are paused:
 
-Worst case per utterance = `response_timeout + _SILENCE_TIMEOUT` = 45 seconds at default settings before the request is abandoned and counted as a timeout.
+```
+⚡ CIRCUIT OPEN — DirectLine rate limit (429) hit — all users paused — resuming in Xs
+```
 
-### 11.2 Retry logic
+This prevents a flood of failing requests from distorting your results.
 
-When setting up a new conversation (opening the DirectLine token, starting the conversation, connecting the WebSocket), the tool uses `_retry_call` with 3 attempts and exponential back-off:
+**Retrying failed connections:** When starting a new conversation, the tool tries up to 3 times before giving up. Each retry waits a little longer than the last. When sending a message, the tool tries up to 2 times before recording the failure.
 
-- Attempt 1 fails → wait ~1 second + random jitter, try again
-- Attempt 2 fails → wait ~2 seconds + random jitter, try again
-- Attempt 3 fails → raise the error and stop the user
-
-When sending an utterance, the tool makes 2 attempts with a 1-second pause between them before giving up.
-
-### 11.3 Consecutive timeout guard
-
-If a single virtual user receives 2 consecutive timeouts (no reply received), the tool assumes the conversation is in a bad state and reopens it: closes the WebSocket, fetches a new DirectLine token, starts a new conversation, and reconnects. This resets the user to utterance 1 and clears the timeout counter. The event is logged to the EVENTS feed.
-
-### 11.4 Circuit breaker
-
-If any request receives a 429 (Too Many Requests) response from DirectLine, the circuit breaker trips:
-
-1. `_run_state.circuit_open_until` is set to `now + 60 seconds`.
-2. All virtual users check `_is_circuit_open()` before each send. If the circuit is open, they skip that iteration and sleep.
-3. The dashboard shows a red banner: `⚡ CIRCUIT OPEN — DirectLine rate limit (429) hit — all users paused — resuming in Xs`.
-4. After 60 seconds, the circuit closes automatically and all users resume.
-
-The 60-second default is used when no `Retry-After` header is present in the 429 response. The 429 is also counted in the current ramp window's `rate_limited` column.
-
-### 11.5 Connection pool
-
-All HTTP requests (DirectLine token fetch, conversation start, utterance send) use a single shared `requests.Session` (`_session`). Before the test starts, the session's connection pool is sized to `peak_users + 50` with `pool_block=False` (requests never block waiting for a free connection — they open a new one if needed).
-
-### 11.6 Adversarial audit
-
-After every test run, the tool runs `_audit()` — four independent checks on the recorded data:
-
-1. **Timestamp round-trip** — re-computes `response_ms` from the CSV's `utterance_sent_at` and `response_received_at` columns and compares to the stored `response_ms` value. Note: `response_received_at` is derived from `send_time + response_ms`, so this is a serialisation round-trip check (detects CSV write/read corruption), not a fully independent measurement. Flags any row where the re-computed value differs from the stored value by more than 10ms.
-2. **Count reconciliation** — checks that the number of rows in the CSV matches the count the dashboard tracked in memory. A mismatch means some events were logged but not counted, or vice versa.
-3. **Percentile cross-check** — recalculates the overall p95 using numpy and pandas and compares to the tool's own `_pct()` function. A mismatch means the dashboard was showing wrong numbers.
-4. **Profile sum check** — sums up request counts per profile and checks they add up to the total. Detects if any rows were assigned to a profile that was not expected.
-
-If all four checks pass, the audit prints green checkmarks. If any fail, it prints a red warning: "Audit found discrepancies — review before sharing results." A failure does not stop the tool — it is a post-run diagnostic.
-
-The audit requires `pandas` and `numpy`. If either is not installed, the affected check is silently skipped.
+**Connection reuse:** All simulated users share a single pool of HTTPS connections to Direct Line. The pool is sized automatically based on how many users you are running. Connections are reused across requests so the test does not need to set up a new connection for every single message.
 
 ---
 
@@ -916,7 +734,7 @@ Fix: Re-run the wizard, navigate to the profile, and choose "Re-authenticate now
 
 ### Bot gives "sign in" prompt during the test
 
-The SSO token exchange is not completing. The tool sent an OAuthCard but the bot did not accept the token.
+The SSO token exchange is not completing. The tool sent the sign-in proof but the bot did not accept it.
 
 Likely causes:
 1. `Bot Client ID (SSO)` is blank or wrong — the tool cannot acquire a token for the bot's scope.
@@ -961,19 +779,19 @@ $env:GRUNTMASTER_TRANSPORT = ""
 
 ---
 
-## File Reference
+## 14. File Reference
 
 | File | Purpose |
 |---|---|
-| `run.py` | The main file. Run this to start the tool. Contains everything: wizard, live dashboard, Locust user classes, DirectLine client, auth helpers. |
-| `requirements.txt` | Python package dependencies. Install with `pip install -r requirements.txt`. |
-| `.env.example` | Template showing all supported environment variables. Copy to `.env` if not using the wizard (advanced use). |
-| `utterances/*.csv` | Test script files. One CSV per scenario. Drop any CSV here and it becomes a scenario automatically. |
-| `profiles/profiles.json` | List of test user accounts (created/managed by the wizard). Not committed to version control. |
-| `profiles/.tokens/` | Encrypted cached tokens. One file per user account. Not committed to version control. |
-| `profiles/profiles.example.json` | Example of the profiles.json format, for reference. |
-| `report.py` | HTML report generator. Auto-runs after each test; also callable standalone: `python report.py`. |
-| `report/detail_*.csv` | Per-run detail logs. One CSV per test run. Not committed to version control. |
-| `report/events_*.csv` | Per-run event log (ramp starts, errors, 429s, etc.). Paired with the detail CSV by timestamp. Not committed to version control. |
-| `report/report_*.html` | Auto-generated HTML reports. One file per test run. Not committed to version control. |
-| `report/ci_*.json` | CI summary JSON written after every test. Contains p50/p95/p99, error_rate, total_requests, passed (bool). Set `GRUNTMASTER_CI=1` to also print this to stdout and exit 0/1 based on pass/fail. |
+| `run.py` | The main file. Run this to start the tool. |
+| `requirements.txt` | The list of software packages the tool needs. Install them with `pip install -r requirements.txt`. |
+| `.env.example` | A template showing advanced configuration options. Copy to `.env` only if you need to override settings without using the wizard. |
+| `utterances/*.csv` | Your test script files. One CSV per scenario. Drop any CSV file here and it becomes a scenario automatically. |
+| `profiles/profiles.json` | The list of test user accounts created by the wizard. Not included when you share the repository. |
+| `profiles/.tokens/` | Saved sign-in tokens, one per user account. Encrypted and stored locally. Not included when you share the repository. |
+| `profiles/profiles.example.json` | An example showing what a profiles file looks like, for reference. |
+| `report.py` | The HTML report generator. Runs automatically after each test. You can also run it on its own with `python report.py`. |
+| `report/detail_*.csv` | Per-run results files. One CSV per test run. Not included when you share the repository. |
+| `report/events_*.csv` | Per-run event log (ramp starts, errors, rate-limit hits, etc.). Paired with the detail CSV by timestamp. Not included when you share the repository. |
+| `report/report_*.html` | Auto-generated HTML reports. One file per test run. Not included when you share the repository. |
+| `report/ci_*.json` | A summary file written after every test containing key metrics (pass/fail, p95, error rate). Set the environment variable `GRUNTMASTER_CI=1` to also print this to the terminal and exit with a success or failure code — useful for automated pipelines. |
