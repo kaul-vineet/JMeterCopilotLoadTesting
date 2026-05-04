@@ -19,7 +19,6 @@ A load testing tool for Microsoft Copilot Studio bots. It simulates many users h
 11. [Architecture notes](#11-architecture-notes)
 12. [Troubleshooting](#12-troubleshooting)
 13. [Beta Testing](#13-beta-testing)
-14. [Adversarial Self-Check](#14-adversarial-self-check)
 
 ---
 
@@ -978,61 +977,3 @@ $env:GRUNTMASTER_TRANSPORT = ""
 | `report/events_*.csv` | Per-run event log (ramp starts, errors, 429s, etc.). Paired with the detail CSV by timestamp. Not committed to version control. |
 | `report/report_*.html` | Auto-generated HTML reports. One file per test run. Not committed to version control. |
 | `report/ci_*.json` | CI summary JSON written after every test. Contains p50/p95/p99, error_rate, total_requests, passed (bool). Set `GRUNTMASTER_CI=1` to also print this to stdout and exit 0/1 based on pass/fail. |
-
----
-
-## 14. Adversarial Self-Check
-
-This section re-reads the README above as a skeptic and checks every major claim against the actual code. Line numbers are omitted — they drift; search for the identifier instead.
-
-### Claims verified as correct
-
-- **response_timeout default is 30s** — `test_config["response_timeout"] = 30.0` ✓
-- **_SILENCE_TIMEOUT fixed at 15s** — `_SILENCE_TIMEOUT = 15.0` — not configurable; shown read-only in the menu ✓
-- **Minimum response_timeout enforced at 15s** — `_TestConfig` bounds `(15.0, 300.0)` and `max(15, ...)` in `_collect_run_params` ✓
-- **Token valid threshold 10 minutes** — `is_token_valid(token_data, min_ttl_seconds=600)` ✓
-- **_retry_call 3 attempts, exponential back-off** — `for i in range(3)` with `base_delay * (2**i) + random.uniform(0,1)` ✓
-- **send_utterance 2 attempts** — `for _attempt in range(2)` in `_send_and_measure` ✓
-- **Consecutive timeout threshold is 2** — `if self._consecutive_timeouts >= 2` ✓
-- **Circuit breaker default 60s** — `_run_state.circuit_open_until = time.time() + 60.0` ✓
-- **Connection pool users+50, pool_block=False** — `pool_maxsize=user_count + 50, pool_block=False` in `_init_session` ✓
-- **RAMP STEPS has 429 column** — `rate_limited` field in ramp step dict ✓
-- **Events as sub-rows in RAMP STEPS** — event loop inside ramp table rendering ✓
-- **EVENTS section, not LIVE FEED** — section labelled `"  EVENTS"` ✓
-- **EVENTS shows last 8** — `for ev in vm["p_events"][:8]` ✓; deque maxlen=20 ✓
-- **Q key runs in an OS thread** — `threading.Thread(target=_keywatch, daemon=True)` using `msvcrt` ✓
-- **Adversarial audit has 4 checks** — timestamp round-trip, count reconciliation, p95 cross-check, profile sum check ✓
-- **Report has 4 tabs** — Summary, Response Time Distribution, Utterance Analysis, Config ✓
-- **Profile comparison uses p50** — `_pct(..., 0.50)` — only median, not p95/p99 ✓
-- **Ramp windows are 60 seconds** — `self._ramp_window = 60.0` ✓
-- **Last 5 ramp rows shown** — `(_finalized + _active_r)[-5:]` ✓
-- **Default peak users 10, spawn rate 5** — `"users": 10, "spawn_rate": 5` in `test_config` initialiser ✓
-- **Default think time 30–60s** — `"think_min": 30, "think_max": 60` ✓
-- **Pre-flight check uses response_timeout=30.0** — `read_response(..., response_timeout=30.0, ...)` in `_preflight_bot_check` ✓
-- **Silence window row in config menu is read-only** — `_gprint("  Silence window is fixed…")` in `_collect_run_params` ✓
-- **Percentile method "lower"** — `_pct` uses `sorted_list[min(int(len(s) * p), len(s)-1)]` ✓
-- **think_min edit minimum is 25** — `state["think"] = max(25, _edit(...))` ✓ (default is 30, but 25 is the edit floor)
-- **Detail CSV includes `user_count` column** — header in `_init_detail_log` includes `"user_count"` ✓
-- **gevent monkey-patch at top of file** — `gevent.monkey.patch_all()` before any I/O imports ✓
-- **One-shot user design** — `StopUser()` raised when `_idx >= len(utterances)`; `all_users_done` flag prevents Locust respawn ✓
-
-### Claims that were inaccurate (now corrected in this README)
-
-- **Old README said users restart from utterance 1** — wrong; one-shot design. Fixed in §2.6.
-- **Old README said "loop runs continuously for the entire test duration"** — wrong. Fixed in §2.6.
-- **Clone URL was JMeterCopilotLoadTesting** — wrong; repo is GRUNTMASTER6000-CopilotLoadTesting. Fixed in §6.1.
-- **Token Endpoint shown conditionally** — now always shown. Fixed in §7.1 and §7.2.
-- **Run config field names wrong** — "Ramp-up rate" / "Run time" / "Wait between messages" not what the code renders. Fixed in §9.2.
-- **Est. rows and divider missing from config menu example** — added to §9.2.
-- **"time expires or you press Q" as only end conditions** — missing natural completion. Fixed in §9.5.
-- **EVENTS described only ramp/429/CPU** — now fires on all error types with reasons. Fixed in §9.4.
-- **Report described as 3 tabs** — now 4 tabs. Fixed in §10.3.
-- **Error Breakdown, utterance filter, baseline comparison not documented** — added to §10.3.
-- **`_circuit_open_until` reference** — should be `_run_state.circuit_open_until`. Fixed in §11.4.
-- **Timestamp check described as two independent measurement paths** — `response_received_at` is derived from `response_ms`, so it is a serialisation round-trip check, not independent. Fixed in §11.6.
-- **File Reference missing events_*.csv and ci_*.json** — added.
-
-### Claims that could not be fully verified
-
-- **"Retry-After header if present"** — the circuit breaker always uses 60s and does not read a `Retry-After` header. The 60s is unconditional. Documented as such.
-- **"Token expires typically after 90 days"** — determined by Microsoft Entra ID tenant policy, not this code. Standard Microsoft guidance; actual expiry varies by tenant configuration.
