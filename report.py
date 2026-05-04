@@ -57,6 +57,13 @@ tr:hover td{background:#f8fafc}
 .dl a{display:inline-block;padding:9px 22px;background:#0f172a;color:#fff;border-radius:6px;text-decoration:none;font-weight:600;font-size:13px}
 .dl a:hover{background:#1e293b}
 footer{text-align:center;color:#cbd5e1;font-size:11px;padding:20px 0}
+.filter-wrap{margin-bottom:8px}
+.filter-input{width:100%;padding:8px 12px;border:1px solid #e2e8f0;border-radius:6px;font-size:13px;outline:none}
+.filter-input:focus{border-color:#94a3b8}
+.cfg-table{width:100%;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:4px}
+.cfg-table th{background:#f1f5f9;color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:9px 14px;text-align:left}
+.cfg-table td{padding:9px 14px;border-top:1px solid #f1f5f9}
+.cfg-table tr:hover td{background:#f8fafc}
 """
 
 # ── JS ────────────────────────────────────────────────────────────────────────
@@ -92,6 +99,18 @@ document.querySelectorAll('th').forEach(th => {
     rows.forEach(r => tbl.querySelector('tbody').appendChild(r));
   });
 });
+
+// Utterance table filter
+const filterInput = document.getElementById('utt-filter');
+if (filterInput) {
+  filterInput.addEventListener('input', () => {
+    const q = filterInput.value.toLowerCase();
+    const rows = document.querySelectorAll('#utt-tbody tr');
+    rows.forEach(row => {
+      row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  });
+}
 """
 
 
@@ -158,7 +177,9 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
                     notes: str = "",
                     response_timeout: float = 30.0,
                     silence_timeout: float = 15.0,
-                    events_csv: "Path | None" = None) -> Path:
+                    events_csv: "Path | None" = None,
+                    run_config: "dict | None" = None,
+                    baseline_csv: "Path | None" = None) -> Path:
     _require_deps()
     import pandas as pd
     import plotly.graph_objects as go
@@ -306,6 +327,43 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
                     f'<tr><td colspan="9" style="padding:2px 14px 2px 28px;font-size:12px;{ec}">'
                     f'{ts_e}&nbsp;&nbsp;{icon}&nbsp;&nbsp;{msg}</td></tr>'
                 )
+        # ── Error breakdown ───────────────────────────────────────────────────
+        _error_counts: dict = {}
+        _error_example: dict = {}
+        _exclude_types = {"all_done"}
+        for _r_evs in events_by_ramp.values():
+            for _ev in _r_evs:
+                _et = _ev.get("event_type", "")
+                if _et and _et not in _exclude_types:
+                    _error_counts[_et] = _error_counts.get(_et, 0) + 1
+                    if _et not in _error_example:
+                        _error_example[_et] = _ev.get("message", "")
+
+        error_breakdown_html = ""
+        if _error_counts:
+            _eb_rows = []
+            for _et, _cnt in sorted(_error_counts.items(), key=lambda x: -x[1]):
+                if _et in ("rate_limit",):
+                    _tc = ' style="color:#ef4444;font-weight:700"'
+                elif _et == "timeout":
+                    _tc = ' style="color:#ef4444"'
+                elif _et in ("ws_closed", "ws_error"):
+                    _tc = ' style="color:#f97316"'
+                elif _et == "cpu_warn":
+                    _tc = ' style="color:#eab308"'
+                else:
+                    _tc = ""
+                _ex = _error_example.get(_et, "")[:120]
+                _eb_rows.append(
+                    f'<tr><td{_tc}>{_et}</td><td>{_cnt}</td><td style="color:#64748b;font-size:12px">{_ex}</td></tr>'
+                )
+            error_breakdown_html = (
+                '<h2>Error Breakdown</h2>'
+                '<p class="legend">Events fired during the test, grouped by type</p>'
+                '<table><thead><tr><th>Type</th><th>Count</th><th>Example message</th></tr></thead>'
+                '<tbody>' + "".join(_eb_rows) + '</tbody></table>'
+            )
+
         if step_rows:
             ramp_steps_html = (
                 '<h2>Ramp Steps</h2>'
@@ -319,6 +377,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
                 '<th>Ramp</th><th>Users</th><th>Requests</th><th>RPS</th>'
                 '<th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>T/O</th><th>Throttle</th>'
                 '</tr></thead><tbody>' + "".join(step_rows) + '</tbody></table>'
+                + error_breakdown_html
             )
 
     # ── Profile Summary ───────────────────────────────────────────────────────
@@ -382,6 +441,30 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
             anomalies=anomalies, p999=p999,
         ))
     utterances.sort(key=lambda x: x["p95"], reverse=True)
+
+    # ── Baseline comparison ───────────────────────────────────────────────────
+    baseline_deltas: dict = {}
+    has_baseline = False
+    if baseline_csv is not None and Path(baseline_csv).exists():
+        try:
+            df_bl = pd.read_csv(baseline_csv)
+            df_bl["response_ms"] = pd.to_numeric(df_bl["response_ms"], errors="coerce").fillna(0)
+            df_bl["timed_out"]   = pd.to_numeric(df_bl["timed_out"],   errors="coerce").fillna(0).astype(int)
+            if "profile" not in df_bl.columns:
+                df_bl["profile"] = df_bl.get("scenario", "unknown")
+            if "scenario" not in df_bl.columns:
+                df_bl["scenario"] = "default"
+            df_bl_ok = df_bl[df_bl["timed_out"] == 0].copy()
+            for (bl_utt, bl_scen), bl_grp in df_bl_ok.groupby(["utterance", "scenario"]):
+                bl_ms = bl_grp["response_ms"]
+                baseline_deltas[(str(bl_utt), str(bl_scen))] = {
+                    "p50": _pct(bl_ms, 0.50),
+                    "p95": _pct(bl_ms, 0.95),
+                    "p99": _pct(bl_ms, 0.99),
+                }
+            has_baseline = True
+        except Exception:
+            pass
 
     # ── Chart: box/whisker per profile ────────────────────────────────────────
     box_fig = go.Figure()
@@ -450,6 +533,13 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
             'rising colour signals degradation over time</p>'
             f'<div class="chart">{hm_html_inner}</div>'
         )
+    else:
+        heatmap_html = (
+            '<h2>Latency Heatmap</h2>'
+            '<p class="legend" style="color:#f59e0b">&#9888; Heatmap skipped — '
+            '<code>utterance_sent_at</code> column not present in CSV. '
+            'This column is written by GRUNTMASTER 6000 v2+; re-run the test to enable heatmap.</p>'
+        )
 
     # ── Profile comparison ────────────────────────────────────────────────────
     comparison_html = ""
@@ -517,13 +607,13 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
             f'</tr>'
         )
 
-    def _utt_row(u):
+    def _utt_row(u, bl_deltas=None):
         dot  = ' <span title="MAD anomaly" style="color:#ef4444;font-size:10px">&#9679;</span>' if u["anomalies"] else ""
         p999 = f'{u["p999"]:,}' if u["p999"] else "—"
         p95s = ' style="color:#ef4444;font-weight:700"' if u["p95"] > p95_target else ""
         ts   = ' style="color:#ef4444"' if u["timeouts"] > 0 else ""
         lbl  = u["utterance"][:80] + ("…" if len(u["utterance"]) > 80 else "")
-        return (
+        row = (
             f'<tr>'
             f'<td>{lbl}{dot}</td>'
             f'<td>{u["scenario"]}</td>'
@@ -534,12 +624,34 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
             f'<td>{u["p99"]:,}</td>'
             f'<td{ts}>{u["timeouts"]} ({u["timeout_pct"]})</td>'
             f'<td style="color:#64748b">{p999}</td>'
-            f'</tr>'
         )
+        if bl_deltas is not None:
+            key = (u["utterance"], u["scenario"])
+            if key in bl_deltas:
+                bl = bl_deltas[key]
+                def _badge(cur, base):
+                    if base <= 0:
+                        return '<span style="color:#94a3b8">new</span>'
+                    pct = (cur - base) / base * 100
+                    if pct > 10:
+                        return f'<span style="color:#ef4444">+{pct:.0f}% slower</span>'
+                    elif pct < -10:
+                        return f'<span style="color:#22c55e">−{abs(pct):.0f}% faster</span>'
+                    else:
+                        return '<span style="color:#64748b">&#8776; same</span>'
+                row += f'<td>{_badge(u["p95"], bl["p95"])}</td>'
+                row += f'<td>{_badge(u["p50"], bl["p50"])}</td>'
+            else:
+                row += '<td><span style="color:#94a3b8">new</span></td>'
+                row += '<td><span style="color:#94a3b8">new</span></td>'
+        row += '</tr>'
+        return row
 
     profile_rows_html  = "".join(_profile_row(p) for p in profile_rows_data)
     scenario_rows_html = "".join(_scenario_row(s) for s in scenario_rows_data)
-    utt_rows_html      = "".join(_utt_row(u) for u in utterances)
+    utt_rows_html      = "".join(
+        _utt_row(u, baseline_deltas if has_baseline else None) for u in utterances
+    )
 
     pass_badge = (
         '<span style="background:#22c55e;color:#fff;padding:4px 14px;border-radius:4px;font-weight:700">PASS</span>'
@@ -551,6 +663,31 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
     notes_html = (
         f'<div class="notes-box"><strong>Test notes:</strong> {notes}</div>'
         if notes else ""
+    )
+
+    # ── Config tab HTML ───────────────────────────────────────────────────────
+    _cfg_rows = []
+    _cfg_data = {}
+    if run_config:
+        _cfg_data.update(run_config)
+    _cfg_data["p95_target_ms"]       = p95_target
+    _cfg_data["response_timeout_s"]  = response_timeout
+    _cfg_data["silence_timeout_s"]   = silence_timeout
+    for _ck, _cv in _cfg_data.items():
+        _cfg_rows.append(f'<tr><td><strong>{_ck}</strong></td><td>{_cv}</td></tr>')
+    if _cfg_rows:
+        config_tab_content = (
+            '<h2>Test Configuration</h2>'
+            '<table class="cfg-table"><thead><tr><th>Parameter</th><th>Value</th></tr></thead>'
+            '<tbody>' + "".join(_cfg_rows) + '</tbody></table>'
+        )
+    else:
+        config_tab_content = '<p class="legend">No configuration data recorded for this run.</p>'
+
+    # ── Utterance table extra columns ─────────────────────────────────────────
+    _bl_extra_headers = (
+        '<th>&#916;p95 vs baseline</th><th>&#916;p50 vs baseline</th>'
+        if has_baseline else ""
     )
 
     # ── Final HTML with tabs ──────────────────────────────────────────────────
@@ -585,6 +722,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
     <button class="tab-btn active" data-tab="tab-summary">Summary</button>
     <button class="tab-btn" data-tab="tab-distribution">Response Time Distribution</button>
     <button class="tab-btn" data-tab="tab-utterances">Utterance Analysis</button>
+    <button class="tab-btn" data-tab="tab-config">Config</button>
   </div>
 
   <!-- ── Tab 1: Summary ─────────────────────────────────────────────────── -->
@@ -642,13 +780,22 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
       <span class="red">&#9679;</span> = MAD anomaly (response &gt; median&nbsp;+&nbsp;3&times;MAD) &nbsp;&middot;&nbsp;
       p99.9 proj = log-normal projection (requires &ge;10 samples)
     </p>
+    <div class="filter-wrap">
+      <input id="utt-filter" class="filter-input" type="text" placeholder="Filter utterances…">
+    </div>
     <table>
       <thead><tr>
         <th>Utterance</th><th>Scenario</th><th>Profile(s)</th><th>Requests</th>
         <th>p50 ms</th><th>p95 ms</th><th>p99 ms</th><th>Timeouts</th><th>p99.9 proj ms</th>
+        {_bl_extra_headers}
       </tr></thead>
-      <tbody>{utt_rows_html}</tbody>
+      <tbody id="utt-tbody">{utt_rows_html}</tbody>
     </table>
+  </div>
+
+  <!-- ── Tab 4: Config ──────────────────────────────────────────────────── -->
+  <div id="tab-config" class="tab-pane">
+    {config_tab_content}
   </div>
 
   <footer>
@@ -679,6 +826,7 @@ if __name__ == "__main__":
         "--browse", action="store_true",
         help="Open gum file browser to pick a CSV",
     )
+    parser.add_argument("--baseline", help="Path to baseline detail CSV for regression comparison")
     args = parser.parse_args()
 
     if args.browse:
@@ -705,7 +853,10 @@ if __name__ == "__main__":
     if _events:
         print(f"  Events log:             {_events}")
     try:
-        _out = generate_report(_csv, events_csv=_events)
+        _out = generate_report(
+            _csv, events_csv=_events,
+            baseline_csv=Path(args.baseline) if args.baseline else None,
+        )
         print(f"  Report saved to:        {_out}\n")
     except ImportError as _e:
         print(f"\n  {_e}\n")

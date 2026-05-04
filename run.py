@@ -137,11 +137,13 @@ def _init_session(user_count: int):
     _session.mount("http://", adapter)
 
 class _RunState:
-    __slots__ = ("dashboard", "circuit_open_until", "cpu_warn_ts")
+    __slots__ = ("dashboard", "circuit_open_until", "cpu_warn_ts", "all_users_done", "_completions")
     def __init__(self) -> None:
         self.dashboard: "Optional[_DashboardState]" = None
         self.circuit_open_until: float = 0.0
         self.cpu_warn_ts: float = 0.0
+        self.all_users_done: bool = False
+        self._completions: int = 0
 
 _run_state = _RunState()
 _spawn_counters: dict[str, int] = {}   # class_name → spawn sequence number
@@ -1458,8 +1460,7 @@ def run_wizard():
         c_ok  = bool(state["client"]  and _GUID_RE.match(state["client"]))
         dl_ok = bool(state["secret"]  or  state["endpoint"])
 
-        # Token Endpoint is only shown when Secret is absent or Endpoint is already set
-        _show_endpoint = not state["secret"] or bool(state["endpoint"])
+        _show_endpoint = True
 
         items = [
             _mrow("Tenant ID",           _val(state["tenant"]),
@@ -1472,21 +1473,20 @@ def run_wizard():
                   opt_note="(not set)"),
                   True if state["secret"] else (False if not state["endpoint"] else None)),
         ]
-        if _show_endpoint:
-            items.append(_mrow("Token Endpoint", _val(state["endpoint"], opt_note="(not set)"),
-                               True if state["endpoint"] else None))
+        items.append(_mrow("Token Endpoint", _val(state["endpoint"], opt_note="(not set)"),
+                           True if state["endpoint"] else None))
         _N_CRED = len(items)
 
         items.append("")
         items.append("  ─  PROFILES  ─  Each profile is a real M365 account. Assign a scenario")
         items.append("     to control which utterances it sends. Multiple profiles = more load.")
 
-        for p in state["profiles"]:
+        for p_idx, p in enumerate(state["profiles"]):
             display  = p.get("display_name", p["username"])
             tok      = load_token(p["username"])
             ready    = bool(tok and is_token_valid(tok))
             scenario = f"  → {p['scenario']}" if p.get("scenario") else "  → (auto-assign)"
-            items.append(_mrow(f"Profile: {display}",
+            items.append(_mrow(f"Profile [{p_idx}]: {display}",
                                p["username"] + scenario, ready))
 
         items += ["", _ADD, _SAVE, _BACK, _EXIT]
@@ -1555,6 +1555,9 @@ def run_wizard():
                 if scenario:
                     new_p["scenario"] = scenario
                 state["profiles"].append(new_p)
+                _do_auth = _gconfirm("Authenticate this profile now? (requires browser sign-in)", default=True)
+                if _do_auth:
+                    _rocket_auth(uname)
                 _gprint(f"  ✓  Added: {disp}  ({uname})",
                         fg=_G_GREEN, bold=True, padding="0 2", margin="0 1")
                 if not _gconfirm("Add another profile?", default=False):
@@ -1619,8 +1622,21 @@ def run_wizard():
             v = _ginput("paste secret here (input is hidden)", password=True)
             if v:
                 state["secret"] = v
+                try:
+                    _test_resp = _session.post(
+                        f"{DIRECTLINE_BASE}/v3/directline/tokens/generate",
+                        headers={"Authorization": f"Bearer {v}"},
+                        timeout=8,
+                    )
+                    if _test_resp.ok:
+                        _gprint("  ✓  DirectLine Secret validated — token endpoint reachable.", fg=_G_GREEN, padding="0 2")
+                    else:
+                        _gprint(f"  ⚠  Validation returned HTTP {_test_resp.status_code} — check the secret.", fg=_G_YELLOW, padding="0 2")
+                except Exception as _ve:
+                    _gprint(f"  ⚠  Could not validate (no network?): {_ve}", fg=_G_YELLOW, padding="0 2")
+                time.sleep(1.2)
 
-        elif idx == 4 and _show_endpoint:
+        elif idx == 4:
             os.system("cls" if os.name == "nt" else "clear")
             v = _ginput(
                 "https://…",
@@ -1634,6 +1650,15 @@ def run_wizard():
                     "Does this Token Endpoint require an AAD Bearer token?",
                     default=state.get("endpoint_needs_auth", False),
                 )
+                try:
+                    _test_resp = _session.get(state["endpoint"], timeout=8)
+                    if _test_resp.ok:
+                        _gprint("  ✓  Token endpoint reachable.", fg=_G_GREEN, padding="0 2")
+                    else:
+                        _gprint(f"  ⚠  Endpoint returned HTTP {_test_resp.status_code}.", fg=_G_YELLOW, padding="0 2")
+                except Exception as _ve:
+                    _gprint(f"  ⚠  Could not reach endpoint: {_ve}", fg=_G_YELLOW, padding="0 2")
+                time.sleep(1.2)
 
         elif _N_CRED + 3 <= idx < _N_CRED + 3 + len(state["profiles"]):
             p_idx = idx - _N_CRED - 3
@@ -1736,6 +1761,8 @@ def run_wizard():
             )
             needs_auth = chosen if chosen else needs_auth
         for username in needs_auth:
+            if not _gconfirm(f"Authenticate {username} now?", default=True):
+                continue
             _rocket_auth(username)
 
     _celebrate("  ✦  SETUP COMPLETE!  ALL SYSTEMS READY  ✦")
@@ -2065,6 +2092,25 @@ def _retry_call(fn, attempts: int = 3, base_delay: float = 1.0):
             gevent.sleep(delay)
 
 
+def _err_reason(e: Exception, max_len: int = 70) -> str:
+    """Extract a short human-readable reason from an exception for EVENTS feed."""
+    if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+        reason = f"HTTP {e.response.status_code}"
+        try:
+            body = e.response.json()
+            msg  = body.get("message") or body.get("error", {}).get("message", "")
+        except Exception:
+            msg = (e.response.text or "").strip()
+        if msg:
+            msg = msg.replace("\n", " ")[:max_len]
+            reason += f" — {msg}"
+        return reason
+    msg = str(e).strip().replace("\n", " ")
+    if not msg or msg == type(e).__name__:
+        return type(e).__name__
+    return msg[:max_len]
+
+
 def _trip_circuit():
     _run_state.circuit_open_until = time.time() + 60.0
     if _run_state.dashboard is not None:
@@ -2174,6 +2220,8 @@ class CopilotBaseUser(User):
     _transport_cls = _WsTransport
 
     def on_start(self):
+        if _run_state.all_users_done:
+            raise StopUser()
         self.profile     = self.__class__.fixed_profile
         self._transport  = self.__class__._transport_cls()
         self.conversation          = None
@@ -2197,9 +2245,10 @@ class CopilotBaseUser(User):
                 self.aad_token = get_valid_token(self.profile["username"])
             except RuntimeError as e:
                 log.error("Auth failed for %s: %s", self.profile["username"], e)
+                _reason = _err_reason(e)
                 if _run_state.dashboard is not None:
-                    _run_state.dashboard.on_event("✗", f"Auth failed — {_who}")
-                _log_event("✗", "auth_error", f"Auth failed — {_who}")
+                    _run_state.dashboard.on_event("✗", f"Auth failed — {_who} — {_reason}")
+                _log_event("✗", "auth_error", f"Auth failed — {_who} — {_reason}")
                 raise StopUser()
 
         try:
@@ -2207,9 +2256,10 @@ class CopilotBaseUser(User):
         except Exception as e:
             log.error("DirectLine token fetch failed after retries: %s", e)
             _fire_metric(self.environment, "Fetch Token", 0, error=e)
+            _reason = _err_reason(e)
             if _run_state.dashboard is not None:
-                _run_state.dashboard.on_event("✗", f"DL token fetch failed — {_who}")
-            _log_event("✗", "token_error", f"DL token fetch failed — {_who}")
+                _run_state.dashboard.on_event("✗", f"DL token fetch failed — {_who} — {_reason}")
+            _log_event("✗", "token_error", f"DL token fetch failed — {_who} — {_reason}")
             raise StopUser()
 
         try:
@@ -2217,9 +2267,10 @@ class CopilotBaseUser(User):
         except Exception as e:
             log.error("Start conversation failed after retries: %s", e)
             _fire_metric(self.environment, "Start Conversation", 0, error=e)
+            _reason = _err_reason(e)
             if _run_state.dashboard is not None:
-                _run_state.dashboard.on_event("✗", f"Start conversation failed — {_who}")
-            _log_event("✗", "conv_error", f"Start conversation failed — {_who}")
+                _run_state.dashboard.on_event("✗", f"Start conversation failed — {_who} — {_reason}")
+            _log_event("✗", "conv_error", f"Start conversation failed — {_who} — {_reason}")
             raise StopUser()
 
         self._idx = 0
@@ -2264,18 +2315,20 @@ class CopilotBaseUser(User):
                 if _attempt == 1:
                     log.error("Send utterance failed: %s", e)
                     _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    _reason = _err_reason(e)
                     if _run_state.dashboard is not None:
-                        _run_state.dashboard.on_event("✗", f"Send failed ({e.response.status_code}) — {profile_label}")
-                    _log_event("✗", "send_error", f"Send HTTP {e.response.status_code} — {profile_label}")
+                        _run_state.dashboard.on_event("✗", f"Send failed — {profile_label} — {_reason}")
+                    _log_event("✗", "send_error", f"Send failed — {profile_label} — {_reason}")
                     raise StopUser()
                 gevent.sleep(1)
             except Exception as e:
                 if _attempt == 1:
                     log.error("Send utterance failed: %s", e)
                     _fire_metric(self.environment, "Send Utterance", 0, error=e)
+                    _reason = _err_reason(e)
                     if _run_state.dashboard is not None:
-                        _run_state.dashboard.on_event("✗", f"Send error ({type(e).__name__}) — {profile_label}")
-                    _log_event("✗", "send_error", f"Send {type(e).__name__} — {profile_label}")
+                        _run_state.dashboard.on_event("✗", f"Send failed — {profile_label} — {_reason}")
+                    _log_event("✗", "send_error", f"Send failed — {profile_label} — {_reason}")
                     raise StopUser()
                 gevent.sleep(1)
 
@@ -2288,9 +2341,10 @@ class CopilotBaseUser(User):
         except Exception as e:
             log.error("Read response failed: %s", e)
             _fire_metric(self.environment, "Copilot Response", 0, error=e)
+            _reason = _err_reason(e)
             if _run_state.dashboard is not None:
-                _run_state.dashboard.on_event("✗", f"Read error ({type(e).__name__}) — {profile_label}")
-            _log_event("✗", "read_error", f"Read {type(e).__name__} — {profile_label}")
+                _run_state.dashboard.on_event("✗", f"Read failed — {profile_label} — {_reason}")
+            _log_event("✗", "read_error", f"Read failed — {profile_label} — {_reason}")
             raise StopUser()
 
         _uc = _run_state.dashboard._current_users if _run_state.dashboard is not None else 0
@@ -2311,9 +2365,11 @@ class CopilotBaseUser(User):
                     self._idx, len(self.utterances), response.latency_ms, True)
             # Fire a P1 event for every timeout — not just after 2 consecutive
             utt_short = (utterance[:35] + "…") if len(utterance) > 36 else utterance
+            _to_msg = (f"T/O — {profile_label} — no reply in {int(response.latency_ms/1000)}s"
+                       f" — \"{utt_short}\"")
             if _run_state.dashboard is not None:
-                _run_state.dashboard.on_event("✗", f"T/O — {profile_label} — \"{utt_short}\"")
-            _log_event("✗", "timeout", f"T/O — {profile_label} — {utt_short}")
+                _run_state.dashboard.on_event("✗", _to_msg)
+            _log_event("✗", "timeout", _to_msg)
             self._consecutive_timeouts += 1
             if self._consecutive_timeouts >= 2:
                 if _run_state.dashboard is not None:
@@ -2341,6 +2397,13 @@ class CopilotBaseUser(User):
         gevent.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
         if self._idx >= len(self.utterances):
+            with _spawn_lock:
+                _run_state._completions += 1
+                if _run_state._completions >= test_config["users"] and not _run_state.all_users_done:
+                    _run_state.all_users_done = True
+                    if _run_state.dashboard is not None:
+                        _run_state.dashboard.on_event("✓", "All users completed scripts — winding down")
+                    _log_event("✓", "all_done", "All users completed scripts — winding down")
             raise StopUser()
 
 
@@ -3489,6 +3552,9 @@ if __name__ == "__main__":
             )
             _needs_auth = _chosen if _chosen else _needs_auth
         for _username in _needs_auth:
+            if not _gconfirm(f"Authenticate {_username} now?", default=True):
+                console.print(f"  [dim]Skipping auth for {_username}[/dim]")
+                continue
             if not _rocket_auth(_username):
                 console.print(f"[bold red]Auth failed for {_username}. Stopping.[/bold red]")
                 sys.exit(1)
@@ -3520,6 +3586,8 @@ if __name__ == "__main__":
             profile_map=_profile_map,
         )
         _run_state.dashboard = _dash
+        _run_state.all_users_done = False
+        _run_state._completions = 0
         _env.events.request.add_listener(_dash.on_request)
         _init_session(_params["users"])
         _runner.start(user_count=_params["users"], spawn_rate=max(0.01, _params["spawn_rate"] / 60))
@@ -3558,6 +3626,8 @@ if __name__ == "__main__":
                     _prev_users[0] = _curr
                 _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
                 _live.refresh()
+                if _run_state.all_users_done and _curr == 0:
+                    break
                 gevent.sleep(0.5)
             _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
             _live.refresh()
@@ -3585,6 +3655,32 @@ if __name__ == "__main__":
         if _detail_path and _detail_path.exists():
             _audit(_detail_path, _final_snap)
 
+        # ── CI JSON summary ───────────────────────────────────────────────────
+        _ts_ci = (_detail_path.stem.replace("detail_", "") if _detail_path else
+                  datetime.now().strftime("%Y%m%d_%H%M%S"))
+        _snap_times = _final_snap.get("times", {})
+        _snap_tout  = _final_snap.get("tout", {})
+        _ci_all_times = [v for vlist in _snap_times.values() for v in vlist]
+        _ci_total_req = sum(len(v) for v in _snap_times.values()) + sum(_snap_tout.values())
+        _ci_total_err = sum(_snap_tout.values())
+        _ci_result = {
+            "total_requests": _ci_total_req,
+            "total_errors":   _ci_total_err,
+            "p50":  _pct(_ci_all_times, 0.50),
+            "p95":  _pct(_ci_all_times, 0.95),
+            "p99":  _pct(_ci_all_times, 0.99),
+            "error_rate": round(_ci_total_err / max(1, _ci_total_req), 4),
+            "passed": _pct(_ci_all_times, 0.95) <= test_config["p95_target_ms"],
+        }
+        try:
+            _ci_json_path = REPORT_DIR / f"ci_{_ts_ci}.json"
+            _ci_json_path.write_text(json.dumps(_ci_result, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        if os.getenv("GRUNTMASTER_CI"):
+            print(json.dumps(_ci_result, indent=2))
+            sys.exit(0 if _ci_result["passed"] else 1)
+
         _run_state.dashboard = None
         with _spawn_lock:
             _spawn_counters.clear()
@@ -3595,6 +3691,9 @@ if __name__ == "__main__":
                 sys.stdout.flush()
                 from report import generate_report as _gen_report
                 _run_notes = _params.get("notes", "")
+                _all_detail = sorted(REPORT_DIR.glob("detail_*.csv"), key=lambda p: p.stat().st_mtime)
+                _other = [p for p in _all_detail if p != _detail_path]
+                _baseline = _other[-1] if _other else None
                 _rep = _with_spinner(
                     "Generating HTML report…",
                     lambda: _gen_report(
@@ -3604,6 +3703,8 @@ if __name__ == "__main__":
                         response_timeout=test_config["response_timeout"],
                         silence_timeout=_SILENCE_TIMEOUT,
                         events_csv=_events_path,
+                        run_config=_params,
+                        baseline_csv=_baseline,
                     ),
                 )
                 _gprint(f"  Report → {_rep}", fg=_G_CYAN, bold=True, padding="0 2", margin="0 1")
