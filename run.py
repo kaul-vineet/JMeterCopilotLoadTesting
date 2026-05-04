@@ -12,6 +12,8 @@ Headless (pre-authenticate all profiles first):
 # gevent monkey-patch must happen before any I/O library imports
 import gevent
 import gevent.monkey
+import threading as _threading_pre_patch   # save real Thread before gevent patches it
+_RealThread = _threading_pre_patch.Thread
 gevent.monkey.patch_all()
 
 import base64
@@ -3598,17 +3600,22 @@ if __name__ == "__main__":
         def _keywatch():
             if os.name == "nt":
                 import msvcrt as _m
+                import ctypes
+                _k32 = ctypes.windll.kernel32
                 while not _stop_run[0]:
                     try:
                         if _m.kbhit():
-                            if _m.getch() in (b"q", b"Q"):
+                            ch = _m.getch()
+                            if ch in (b"q", b"Q"):
                                 _stop_run[0] = True
                                 return
+                            if ch in (b"\x00", b"\xe0") and _m.kbhit():
+                                _m.getch()  # consume second byte of extended key
                     except Exception:
                         pass
-                    time.sleep(0.05)
+                    _k32.Sleep(50)  # raw Windows syscall — bypasses gevent.sleep patching
 
-        _kw = threading.Thread(target=_keywatch, daemon=True)
+        _kw = _RealThread(target=_keywatch, daemon=True)
         _kw.start()
 
         os.system("cls" if os.name == "nt" else "clear")
