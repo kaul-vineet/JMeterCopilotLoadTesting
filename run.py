@@ -3635,9 +3635,6 @@ if __name__ == "__main__":
         _kw = _RealThread(target=_keywatch, daemon=True)
         _kw.start()
 
-        os.system("cls" if os.name == "nt" else "clear")
-        sys.stdout.write("  GRUNTMASTER 6000  Loading dashboard…\n")
-        sys.stdout.flush()
         # Silence all log output to the terminal during the live dashboard — events feed carries what matters
         _null_handler = logging.NullHandler()
         logging.root.addHandler(_null_handler)
@@ -3645,7 +3642,7 @@ if __name__ == "__main__":
         logging.root.setLevel(logging.CRITICAL)
         _dash_err: "Exception | None" = None
         try:
-            with Live(console=console, auto_refresh=False, screen=False) as _live:
+            with Live(console=console, auto_refresh=False, screen=True) as _live:
                 _deadline = time.time() + _params["run_time"]
                 while time.time() < _deadline and not _stop_run[0]:
                     _curr = getattr(_runner, "user_count", 0)
@@ -3657,8 +3654,6 @@ if __name__ == "__main__":
                     if _run_state.all_users_done and _curr == 0:
                         break
                     gevent.sleep(0.5)
-                _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
-                _live.refresh()
         except Exception as _e:
             _dash_err = _e
             import traceback as _tb
