@@ -9,17 +9,13 @@ A load testing tool for Microsoft Copilot Studio bots. It simulates many users h
 1. [What this tool does](#1-what-this-tool-does)
 2. [How it works](#2-how-it-works)
 3. [Prerequisites — what you need before starting](#3-prerequisites)
-4. [Azure setup — step-by-step](#4-azure-setup)
-5. [Copilot Studio setup](#5-copilot-studio-setup)
-6. [First-time installation](#6-first-time-installation)
-7. [Running the setup wizard](#7-running-the-setup-wizard)
-8. [Writing test scripts (utterance files)](#8-writing-test-scripts-utterance-files)
-9. [Running the load test](#9-running-the-load-test)
-10. [Reading the results](#10-reading-the-results)
-11. [How it handles problems](#11-how-it-handles-problems)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Beta Testing](#13-beta-testing)
-14. [File Reference](#14-file-reference)
+4. [Setup — end to end](#4-setup)
+5. [Running the load test](#5-running-the-load-test)
+6. [Reading the results](#6-reading-the-results)
+7. [How it handles problems](#7-how-it-handles-problems)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Beta Testing](#9-beta-testing)
+10. [File Reference](#10-file-reference)
 
 ---
 
@@ -89,7 +85,7 @@ Before you start, make sure you have the following:
 |---|---|
 | **Windows 10/11 machine** | Required for the secure credential storage this tool uses. |
 | **Python 3.10 or newer** | Download from python.org. During installation, tick "Add Python to PATH". |
-| **Charm Gum CLI** | Required for the interactive menus. Install with `winget install charmbracelet.gum` (see Section 6.4). |
+| **Charm Gum CLI** | Required for the interactive menus. Install with `winget install charmbracelet.gum` (see Step 1 in Section 4). |
 | **A published Copilot Studio bot** | The bot must be published and have the Direct Line channel enabled. |
 | **Two test user accounts** | Real Microsoft 365 accounts in your tenant (e.g. `loadtest.user1@yourcompany.com`). These accounts will be used as simulated users. They need a Copilot Studio licence or a Teams licence. |
 | **Azure portal access** | You need permission to register applications in Microsoft Entra ID. The "Application Developer" role is sufficient. |
@@ -97,105 +93,17 @@ Before you start, make sure you have the following:
 
 ---
 
-## 4. Azure Setup
+## 4. Setup
 
-This section walks through everything you need to create in Azure to make authenticated load testing work. If your bot does **not** use authentication (it is a public bot anyone can use without signing in), skip to Section 6.
-
-### 4.1 Understand the goal
-
-You are creating one Azure App Registration that represents the load test tool. The Copilot Studio bot already has its own App Registration (created automatically when you configure authentication in Copilot Studio). You need to connect them.
-
-### 4.2 Find the bot's existing App Registration (the Resource App)
-
-1. Sign in to the Azure portal: https://portal.azure.com
-2. In the search bar at the top, type **Microsoft Entra ID** and click on it.
-3. In the left menu, click **App registrations**.
-4. Click the **All applications** tab.
-5. Search for an app that includes "CopilotStudio" or your bot's name in its name. It was created automatically by Copilot Studio.
-6. Click on that app and copy its **Application (client) ID**. It looks like `a172951c-2123-4f0a-9a63-3c5477d034d5`. Save this as your `AGENT_APP_ID` — you will need it in the setup wizard.
-
-> **Shortcut:** In Copilot Studio → Settings → Security → Authentication, there is usually a link called **View application** or the Client ID is shown directly. Copy that Client ID and use it to search in Azure portal instead of browsing the app list.
-
-> **How to confirm it is the right app:** In the app's left menu, click **Expose an API**. You should see a scope listed that ends in `/access_as_user`. If you see that, this is the right app.
-
-### 4.3 Create the Load Test Client App Registration
-
-This is the new app you are creating to represent the load test tool.
-
-1. In Microsoft Entra ID → App registrations, click **New registration**.
-2. Give it a name like `CopilotStudio-LoadTest-Client`.
-3. Under **Supported account types**, choose **Accounts in this organizational directory only**.
-4. Leave the Redirect URI blank.
-5. Click **Register**.
-6. On the overview page, copy the **Application (client) ID**. Save this as your `CLIENT_ID`.
-7. Also copy the **Directory (tenant) ID** from the same page. Save this as your `TENANT_ID`.
-
-### 4.4 Make the load test app a "public client"
-
-The load test tool uses a flow called "device code flow" where the user approves sign-in on a separate device/browser. This flow requires the app to be configured as a public client.
-
-1. In your new app registration, click **Authentication** in the left menu.
-2. Scroll down to **Advanced settings**.
-3. Under **Allow public client flows**, toggle **Enable the following mobile and desktop flows** to **Yes**.
-4. Click **Save**.
-
-### 4.5 Grant the load test app permission to call the bot's resource app
-
-1. In your new app registration, click **API permissions** in the left menu.
-2. Click **Add a permission**.
-3. In the panel that opens, click the **APIs my organization uses** tab.
-4. Search for the name of the bot's resource app (the one you found in Step 4.2, e.g. `CopilotStudioAuthApp`).
-5. Click on it.
-6. Under **Delegated permissions**, tick `access_as_user`.
-7. Click **Add permissions**.
-8. Back on the API permissions page, click **Grant admin consent for [your organisation]** and confirm. This step requires a Global Administrator or Privileged Role Administrator.
-
-> **What admin consent means:** By granting admin consent, an administrator approves this permission on behalf of every user in the organisation. This means individual test users will NOT be shown a "Do you allow this app to access...?" pop-up when they sign in — the administrator has pre-approved it. Without admin consent, each user's first sign-in would require them to manually approve the permission in a browser, which defeats the purpose of automation.
-
-> **What "delegated permissions" means:** The load test tool will act **on behalf of** a signed-in user. It does not act as itself. This is "delegated" access — the user's rights are delegated to the tool. This is distinct from "application permissions" where an app acts entirely on its own authority.
-
-### 4.6 Verify the scope
-
-After completing section 4.5, the load test tool will request this specific OAuth 2.0 scope when signing in:
-
-```
-api://<AGENT_APP_ID>/access_as_user
-```
-
-Where `<AGENT_APP_ID>` is the client ID you copied in step 4.2. The tool fills this in automatically.
+**Setup journey:** Step 1: Install the tool → Step 2: Create your Azure app → Step 3: Configure Copilot Studio → Step 4: Run the setup wizard → Step 5: Write your test scripts
 
 ---
 
-## 5. Copilot Studio Setup
+### Step 1: Install the tool
 
-### 5.1 Enable the Direct Line channel
+> **Step 1 of 5**
 
-Direct Line is the API channel this tool uses to talk to the bot.
-
-1. Open Copilot Studio and select your bot.
-2. Go to **Settings → Channels**.
-3. Click **Direct Line**.
-4. If it is not already enabled, enable it.
-5. Under **Secret keys**, click **Show** next to one of the keys and copy it. Save this as your `DIRECTLINE_SECRET`.
-
-> **Important:** Keep the DirectLine Secret private. Anyone with this secret can send messages to your bot and consume your bot's capacity. Do not commit it to version control.
-
-### 5.2 Confirm the bot's authentication mode
-
-1. In Copilot Studio, go to **Settings → Security → Authentication**.
-2. Check whether authentication is set to "No authentication", "Authenticate with Microsoft", or "Authenticate manually".
-
-- **No authentication:** The bot is public. Skip sections 4.1–4.6 and leave `AGENT_APP_ID` blank in the wizard.
-- **Authenticate with Microsoft:** Uses Entra ID SSO. You must complete all of Section 4.
-- **Authenticate manually:** Also uses Entra ID. You must complete all of Section 4.
-
-3. If authentication is enabled, note the **Client ID** shown on this page. This is the `AGENT_APP_ID` you need.
-
----
-
-## 6. First-time Installation
-
-### 6.1 Get the code
+#### 1a. Get the code
 
 ```
 git clone https://github.com/kaul-vineet/GRUNTMASTER6000-CopilotLoadTesting.git
@@ -204,7 +112,7 @@ cd GRUNTMASTER6000-CopilotLoadTesting
 
 > **New machine / new clone:** If you clone this repository to a different machine, you will need to re-run the setup wizard and re-authenticate each profile. Credentials and tokens are stored securely on the local machine — they are intentionally not included in the repository download (they would be a security risk if they were).
 
-### 6.2 Create a Python virtual environment
+#### 1b. Create a Python virtual environment
 
 This command creates a private, isolated space for GRUNTMASTER 6000's software packages. It keeps the tool's packages separate from anything else on your machine so nothing conflicts.
 
@@ -221,7 +129,7 @@ After running `activate`, your terminal prompt will show `(.venv)` at the start.
 > ```
 > Then try `.venv\Scripts\activate` again. This is a Windows security setting. The command above allows scripts you create on your own machine to run.
 
-### 6.3 Install dependencies
+#### 1c. Install dependencies
 
 ```
 pip install -r requirements.txt
@@ -235,7 +143,7 @@ This command downloads and installs all the software packages GRUNTMASTER 6000 n
 - The library that draws the live dashboard in your terminal
 - Tools for generating the HTML report at the end of the test
 
-### 6.4 Install Charm Gum (TUI menus)
+#### 1d. Install Charm Gum (TUI menus)
 
 GRUNTMASTER 6000 uses a tool called [Charm Gum](https://github.com/charmbracelet/gum) to draw the interactive menus you navigate with arrow keys. Install it once:
 
@@ -247,13 +155,129 @@ Or with Scoop: `scoop install charm-gum`
 
 Gum is a standalone program. It has no effect on Python or the virtual environment.
 
-### 6.5 Create your utterance files
-
-Before running the wizard, put at least one CSV file in the `utterances/` folder. See Section 8 for the format. There is an example file `utterances/it_support.csv` already included.
+**What's next:** Step 2 walks through the Azure configuration your bot needs for authenticated testing. If your bot is public (no sign-in required), you can skip Steps 2 and 3 entirely.
 
 ---
 
-## 7. Running the Setup Wizard
+### Step 2: Create your Azure app
+
+> **Step 2 of 5**
+
+> ---
+> **PUBLIC BOT? SKIP THIS STEP.**
+> If your bot does not require sign-in (anyone can use it without logging in, no Microsoft login prompt), skip Steps 2 and 3 entirely and go straight to Step 4.
+> ---
+
+This section walks through everything you need to create in Azure to make authenticated load testing work.
+
+#### 2.1 Understand the goal
+
+You are creating one Azure App Registration that represents the load test tool. The Copilot Studio bot already has its own App Registration (created automatically when you configure authentication in Copilot Studio). You need to connect them.
+
+#### 2.2 Find the bot's existing App Registration (the Resource App)
+
+1. Sign in to the Azure portal: https://portal.azure.com
+2. In the search bar at the top, type **Microsoft Entra ID** and click on it.
+3. In the left menu, click **App registrations**.
+4. Click the **All applications** tab.
+5. Search for an app that includes "CopilotStudio" or your bot's name in its name. It was created automatically by Copilot Studio.
+6. Click on that app and copy its **Application (client) ID**. It looks like `a172951c-2123-4f0a-9a63-3c5477d034d5`. Save this as your `AGENT_APP_ID` — you will need it in the setup wizard.
+
+> **Shortcut:** In Copilot Studio → Settings → Security → Authentication, there is usually a link called **View application** or the Client ID is shown directly. Copy that Client ID and use it to search in Azure portal instead of browsing the app list.
+
+> **How to confirm it is the right app:** In the app's left menu, click **Expose an API**. You should see a scope listed that ends in `/access_as_user`. If you see that, this is the right app.
+
+#### 2.3 Create the Load Test Client App Registration
+
+This is the new app you are creating to represent the load test tool.
+
+1. In Microsoft Entra ID → App registrations, click **New registration**.
+2. Give it a name like `CopilotStudio-LoadTest-Client`.
+3. Under **Supported account types**, choose **Accounts in this organizational directory only**.
+4. Leave the Redirect URI blank.
+5. Click **Register**.
+6. On the overview page, copy the **Application (client) ID**. Save this as your `CLIENT_ID`.
+7. Also copy the **Directory (tenant) ID** from the same page. Save this as your `TENANT_ID`.
+
+#### 2.4 Make the load test app a "public client"
+
+The load test tool uses a flow called "device code flow" where the user approves sign-in on a separate device/browser. This flow requires the app to be configured as a public client.
+
+1. In your new app registration, click **Authentication** in the left menu.
+2. Scroll down to **Advanced settings**.
+3. Under **Allow public client flows**, toggle **Enable the following mobile and desktop flows** to **Yes**.
+4. Click **Save**.
+
+#### 2.5 Grant the load test app permission to call the bot's resource app
+
+1. In your new app registration, click **API permissions** in the left menu.
+2. Click **Add a permission**.
+3. In the panel that opens, click the **APIs my organization uses** tab.
+4. Search for the name of the bot's resource app (the one you found in Step 2.2, e.g. `CopilotStudioAuthApp`).
+5. Click on it.
+6. Under **Delegated permissions**, tick `access_as_user`.
+7. Click **Add permissions**.
+8. Back on the API permissions page, click **Grant admin consent for [your organisation]** and confirm. This step requires a Global Administrator or Privileged Role Administrator.
+
+> **What admin consent means:** By granting admin consent, an administrator approves this permission on behalf of every user in the organisation. This means individual test users will NOT be shown a "Do you allow this app to access...?" pop-up when they sign in — the administrator has pre-approved it. Without admin consent, each user's first sign-in would require them to manually approve the permission in a browser, which defeats the purpose of automation.
+
+> **What "delegated permissions" means:** The load test tool will act **on behalf of** a signed-in user. It does not act as itself. This is "delegated" access — the user's rights are delegated to the tool. This is distinct from "application permissions" where an app acts entirely on its own authority.
+
+#### 2.6 Verify the scope
+
+After completing section 2.5, the load test tool will request this specific OAuth 2.0 scope when signing in:
+
+```
+api://<AGENT_APP_ID>/access_as_user
+```
+
+Where `<AGENT_APP_ID>` is the client ID you copied in step 2.2. The tool fills this in automatically.
+
+**What's next:** Step 3 covers the two settings you need to confirm in Copilot Studio before running the wizard.
+
+---
+
+### Step 3: Configure Copilot Studio
+
+> **Step 3 of 5**
+
+> ---
+> **PUBLIC BOT? SKIP THIS STEP.**
+> If your bot does not require sign-in, skip this step and go straight to Step 4.
+> ---
+
+#### 3.1 Enable the Direct Line channel
+
+Direct Line is the API channel this tool uses to talk to the bot.
+
+1. Open Copilot Studio and select your bot.
+2. Go to **Settings → Channels**.
+3. Click **Direct Line**.
+4. If it is not already enabled, enable it.
+5. Under **Secret keys**, click **Show** next to one of the keys and copy it. Save this as your `DIRECTLINE_SECRET`.
+
+> **Important:** Keep the DirectLine Secret private. Anyone with this secret can send messages to your bot and consume your bot's capacity. Do not commit it to version control.
+
+#### 3.2 Confirm the bot's authentication mode
+
+1. In Copilot Studio, go to **Settings → Security → Authentication**.
+2. Check whether authentication is set to "No authentication", "Authenticate with Microsoft", or "Authenticate manually".
+
+- **No authentication:** The bot is public. Skip Steps 2 and 3 and leave `AGENT_APP_ID` blank in the wizard.
+- **Authenticate with Microsoft:** Uses Entra ID SSO. You must complete all of Step 2.
+- **Authenticate manually:** Also uses Entra ID. You must complete all of Step 2.
+
+3. If authentication is enabled, note the **Client ID** shown on this page. This is the `AGENT_APP_ID` you need.
+
+**What's next:** Step 4 runs the interactive setup wizard, which stores all your credentials and test accounts securely.
+
+---
+
+### Step 4: Run the setup wizard
+
+> **Step 4 of 5**
+
+Before running the wizard, put at least one CSV file in the `utterances/` folder. See Step 5 for the format. There is an example file `utterances/it_support.csv` already included.
 
 Run:
 
@@ -263,7 +287,7 @@ python run.py
 
 The first time you run this (or if not yet configured), the setup wizard opens automatically. The wizard saves all credentials into **Windows Credential Manager** — the same secure store that browsers use to save passwords. Nothing sensitive is written to a plain text file.
 
-### 7.1 The wizard menu
+#### 4.1 The wizard menu
 
 The wizard uses arrow-key navigation. Each row is a setting. Navigate to it and press Enter to edit:
 
@@ -287,7 +311,7 @@ The wizard uses arrow-key navigation. Each row is a setting. Navigate to it and 
 
 Navigate up/down with arrow keys. Press Enter to edit a field or take an action. Press **← Back** to leave without saving, **✕ Exit** to quit the tool.
 
-### 7.2 Field-by-field guide
+#### 4.2 Field-by-field guide
 
 **Tenant ID**
 The unique identifier for your Microsoft 365 organisation in Azure.
@@ -299,7 +323,7 @@ It looks like: `72f988bf-86f1-41af-91ab-2d7cd011db47`
 ---
 
 **Client ID**
-The identifier of the load test client app you created in Section 4.3.
+The identifier of the load test client app you created in Step 2.3.
 
 Where to find it: Azure portal → App registrations → [your app] → Application (client) ID.
 
@@ -342,7 +366,7 @@ For each profile you need:
 
 After adding a profile, the wizard asks whether to add another.
 
-### 7.3 Authentication
+#### 4.3 Authentication
 
 After saving, the wizard checks whether each profile already has a valid saved sign-in token. For any that do not, it starts the device code sign-in process:
 
@@ -357,19 +381,23 @@ After saving, the wizard checks whether each profile already has a valid saved s
 
 Open a browser, go to that URL, enter the code shown, and sign in with the test user account. The tool waits. When sign-in completes, the token is saved securely to your machine. You will not need to do this again for that account for up to 90 days.
 
-### 7.4 Pre-flight check
+#### 4.4 Pre-flight check
 
 Before showing the run configuration, the tool sends "hi" to the bot and waits for a reply. This confirms the credentials work and the bot is reachable. If this fails, an error message explains what to check.
 
 > **Note:** The pre-flight check sends one real message to your bot. If you are testing a production bot, this will appear in the bot's analytics as one conversation. This is unavoidable and harmless — it is a single "hi" message sent once at startup.
 
+**What's next:** Step 5 covers how to write the CSV scripts that simulated users follow during the test.
+
 ---
 
-## 8. Writing Test Scripts (Utterance Files)
+### Step 5: Write your test scripts (utterance files)
+
+> **Step 5 of 5**
 
 Utterance files are the scripts GRUNTMASTER 6000 follows when simulating users. Each file lives in the `utterances/` folder. Each file represents one type of user — one "scenario".
 
-### 8.1 Format
+#### 5.1 Format
 
 The file must be a CSV (comma-separated values) file with a header row containing the word `utterance`. Each row after that is one message to send to the bot, in order.
 
@@ -383,24 +411,26 @@ Please escalate this to a human.
 
 The tool sends these messages one at a time in order. It waits for the bot to reply before sending the next one.
 
-### 8.2 What makes a good test script
+#### 5.2 What makes a good test script
 
 - **Cover the full journey.** Include the greeting, the main questions, and the closing. A realistic conversation has 5–10 turns.
 - **Include escalations and edge cases.** Test what happens when the bot is asked something it does not know, or when the user asks to speak to a human.
 - **Match real usage patterns.** If analytics show most users ask 3 questions per session, keep scripts to 3 utterances.
 - **One script per scenario.** If your bot handles both HR and IT topics, create `utterances/hr.csv` and `utterances/it_support.csv` separately.
 
-### 8.3 Assigning profiles to scenarios
+#### 5.3 Assigning profiles to scenarios
 
 If you have two CSV files and two profiles, assign each profile to one scenario in the wizard (the "Scenario" field when adding a profile). That profile's simulated users will only use messages from that scenario's script.
 
 If you have more CSV files than profiles, profiles are reused in rotation across scenarios.
 
+**What's next:** Setup is complete. Go to Section 5 to run your first load test.
+
 ---
 
-## 9. Running the Load Test
+## 5. Running the Load Test
 
-### 9.1 Start the tool
+### 5.1 Start the tool
 
 Make sure the virtual environment is active (you see `(.venv)` in your terminal prompt). Then run:
 
@@ -410,7 +440,7 @@ python run.py
 
 If already configured, the wizard is skipped. The tool checks credentials, verifies sign-in tokens, and runs the pre-flight check, then shows the **Run Configuration** menu.
 
-### 9.2 Run Configuration menu
+### 5.2 Run Configuration menu
 
 All test settings are shown with their current values. Navigate to any row and press Enter to change it:
 
@@ -459,11 +489,11 @@ Select **▶ Start test** when ready.
 2. Step up to 5 users, watch for errors.
 3. Step up to 10, 20, 50 users incrementally.
 
-### 9.3 Understanding the rate limit ceiling
+### 5.3 Understanding the rate limit ceiling
 
 Direct Line (the messaging channel the tool uses) has a hard rate limit of approximately 8,000 messages per minute. You cannot exceed this regardless of how many users you run. In practice, the more likely bottleneck for a typical Copilot Studio deployment is the bot's message capacity setting in Power Platform Admin Center, not this ceiling.
 
-### 9.4 Live dashboard
+### 5.4 Live dashboard
 
 The test runs entirely in the terminal. A live dashboard updates every half-second:
 
@@ -534,7 +564,7 @@ The test runs entirely in the terminal. A live dashboard updates every half-seco
 
 Press **Q** at any time to stop the test early.
 
-### 9.5 After the test
+### 5.5 After the test
 
 When the test ends (all users finish their scripts, the safety cut-off expires, or you press Q):
 
@@ -551,9 +581,9 @@ All results are automatically saved to `report/detail_YYYYMMDD_HHMMSS.csv`.
 
 ---
 
-## 10. Reading the Results
+## 6. Reading the Results
 
-### 10.1 Live dashboard metrics explained
+### 6.1 Live dashboard metrics explained
 
 **Response time (latency)**
 Think of it like a stopwatch. Every time a simulated user sends a message, the tool starts a stopwatch. It stops the moment the bot finishes all its replies. That elapsed time — measured in milliseconds — is the response time. 1000 ms equals 1 second. A well-performing bot usually replies in under 2000 ms.
@@ -594,7 +624,7 @@ A single line of labeled sparklines where each bar is one completed 60-second wi
 **UTTERANCES table**
 Shows the 4 slowest messages (highlighted red) and 4 fastest (highlighted green) in a single table, separated by a dim divider. With 50 messages in your script, you still only see 8 rows — the extremes most worth your attention.
 
-### 10.2 The detail CSV
+### 6.2 The detail CSV
 
 Every bot reply is recorded to `report/detail_YYYYMMDD_HHMMSS.csv`. One file is created per test run.
 
@@ -602,7 +632,7 @@ The file contains one row per message exchange: which test user sent the message
 
 You can open this file in Excel, Power BI, or any analysis tool to produce your own charts and summaries.
 
-### 10.3 HTML report
+### 6.3 HTML report
 
 After every test run, an HTML report is automatically generated in `report/report_YYYYMMDD_HHMMSS.html`. It has four tabs:
 
@@ -649,7 +679,7 @@ This is a statistical estimate of how slow the very worst 1-in-1000 request migh
 **Profile comparison**
 Shows the percentage difference in median response time between any two user accounts. If one account's messages consistently take longer than another's, it may indicate the bot behaves differently depending on the user — worth investigating.
 
-### 10.4 Interpreting results
+### 6.4 Interpreting results
 
 **The bot passes the performance test if:**
 - The 95th-percentile response time stays below 2000 ms (or your configured target)
@@ -663,7 +693,7 @@ Shows the percentage difference in median response time between any two user acc
 
 ---
 
-## 11. How it handles problems
+## 7. How it handles problems
 
 **If the bot does not reply in time (timeout):** The tool waits up to your Reply Timeout setting for the first word from the bot. Once the bot starts replying, it waits another 15 seconds for any follow-up messages. If nothing arrives in time, the request is recorded as a timeout.
 
@@ -683,7 +713,7 @@ This prevents a flood of failing requests from distorting your results.
 
 ---
 
-## 12. Troubleshooting
+## 8. Troubleshooting
 
 ### "This agent is currently unavailable. It has reached its usage limit."
 
@@ -701,7 +731,7 @@ This means the token was requested for a resource (application) that has not bee
 
 Likely causes:
 1. The `Bot Client ID (SSO)` field in the wizard is set to the wrong value (e.g., it matches the Client ID instead of the Agent App ID).
-2. The `access_as_user` API permission was not added in Azure (see Section 4.5).
+2. The `access_as_user` API permission was not added in Azure (see Step 2.5).
 3. Admin consent was not granted after adding the permission.
 
 ---
@@ -743,7 +773,7 @@ Likely causes:
 
 ---
 
-## 13. Beta Testing
+## 9. Beta Testing
 
 ### HTTP Transport (experimental)
 
@@ -779,7 +809,7 @@ $env:GRUNTMASTER_TRANSPORT = ""
 
 ---
 
-## 14. File Reference
+## 10. File Reference
 
 | File | Purpose |
 |---|---|
