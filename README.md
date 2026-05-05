@@ -59,7 +59,7 @@ The tool handles this by signing in to a real Microsoft 365 account once before 
 
 The sign-in process happens once per account, in a browser. After that, the tool handles renewals silently for up to 90 days.
 
-If your bot does **not** require sign-in (anyone can use it without logging in), you can skip the Azure setup sections entirely.
+This tool currently requires authentication to be configured — the bot must use Microsoft Entra ID sign-in. Public bots (no sign-in required) are not yet supported.
 
 ### 2.3 How the test works end-to-end
 
@@ -155,18 +155,13 @@ Or with Scoop: `scoop install charm-gum`
 
 Gum is a standalone program. It has no effect on Python or the virtual environment.
 
-**What's next:** Step 2 walks through the Azure configuration your bot needs for authenticated testing. If your bot is public (no sign-in required), you can skip Steps 2 and 3 entirely.
+**What's next:** Step 2 walks through the Azure configuration your bot needs for authenticated testing.
 
 ---
 
 ### Step 2: Create your Azure app
 
 > **Step 2 of 5**
-
-> ---
-> **PUBLIC BOT? SKIP THIS STEP.**
-> If your bot does not require sign-in (anyone can use it without logging in, no Microsoft login prompt), skip Steps 2 and 3 entirely and go straight to Step 4.
-> ---
 
 This section walks through everything you need to create in Azure to make authenticated load testing work.
 
@@ -241,11 +236,6 @@ Where `<AGENT_APP_ID>` is the client ID you copied in step 2.2. The tool fills t
 
 > **Step 3 of 5**
 
-> ---
-> **PUBLIC BOT? SKIP THIS STEP.**
-> If your bot does not require sign-in, skip this step and go straight to Step 4.
-> ---
-
 #### 3.1 Enable the Direct Line channel
 
 Direct Line is the API channel this tool uses to talk to the bot.
@@ -263,7 +253,7 @@ Direct Line is the API channel this tool uses to talk to the bot.
 1. In Copilot Studio, go to **Settings → Security → Authentication**.
 2. Check whether authentication is set to "No authentication", "Authenticate with Microsoft", or "Authenticate manually".
 
-- **No authentication:** The bot is public. Skip Steps 2 and 3 and leave `AGENT_APP_ID` blank in the wizard.
+- **No authentication:** Public bots are not currently supported by this tool. The bot must require sign-in.
 - **Authenticate with Microsoft:** Uses Entra ID SSO. You must complete all of Step 2.
 - **Authenticate manually:** Also uses Entra ID. You must complete all of Step 2.
 
@@ -334,7 +324,7 @@ The identifier of the bot's resource app — the one Copilot Studio created auto
 
 Where to find it: Copilot Studio → Settings → Security → Authentication → Client ID.
 
-Leave this blank if your bot does not use authentication.
+This field is required. The tool does not currently support bots that have no authentication configured.
 
 ---
 
