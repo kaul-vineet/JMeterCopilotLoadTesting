@@ -3620,25 +3620,38 @@ if __name__ == "__main__":
         _kw.start()
 
         os.system("cls" if os.name == "nt" else "clear")
+        sys.stdout.write("  GRUNTMASTER 6000  Loading dashboard…\n")
+        sys.stdout.flush()
         # Silence all log output to the terminal during the live dashboard — events feed carries what matters
         _null_handler = logging.NullHandler()
         logging.root.addHandler(_null_handler)
         _prev_log_level = logging.root.level
         logging.root.setLevel(logging.CRITICAL)
-        with Live(console=console, auto_refresh=False, screen=False) as _live:
-            _deadline = time.time() + _params["run_time"]
-            while time.time() < _deadline and not _stop_run[0]:
-                _curr = getattr(_runner, "user_count", 0)
-                if _curr != _prev_users[0]:
-                    _dash.set_user_count(_curr)
-                    _prev_users[0] = _curr
+        _dash_err: "Exception | None" = None
+        try:
+            with Live(console=console, auto_refresh=False, screen=False) as _live:
+                _deadline = time.time() + _params["run_time"]
+                while time.time() < _deadline and not _stop_run[0]:
+                    _curr = getattr(_runner, "user_count", 0)
+                    if _curr != _prev_users[0]:
+                        _dash.set_user_count(_curr)
+                        _prev_users[0] = _curr
+                    _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
+                    _live.refresh()
+                    if _run_state.all_users_done and _curr == 0:
+                        break
+                    gevent.sleep(0.5)
                 _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
                 _live.refresh()
-                if _run_state.all_users_done and _curr == 0:
-                    break
-                gevent.sleep(0.5)
-            _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
-            _live.refresh()
+        except Exception as _e:
+            _dash_err = _e
+            import traceback as _tb
+            _dbg_path = REPORT_DIR / "debug.log"
+            with open(_dbg_path, "a", encoding="utf-8") as _f:
+                _f.write(f"\n[{datetime.now().isoformat()}] Dashboard crash:\n")
+                _tb.print_exc(file=_f)
+            console.print(f"\n[bold red]Dashboard error: {_e}[/bold red]")
+            console.print(f"[dim]Details written to {_dbg_path}[/dim]")
 
         _stop_run[0] = True
         _kw.join(timeout=0.2)
