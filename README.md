@@ -376,11 +376,18 @@ The value is a long string of random characters. It is hidden as you type it.
 ---
 
 **Token Endpoint URL**
-An alternative to the DirectLine Secret. Some organisations use a Token Endpoint — a URL on their own server that gives out temporary access tokens without exposing the raw secret.
+An alternative to the DirectLine Secret. Instead of giving the tool the raw secret, your organisation hosts a small service that hands out short-lived DirectLine tokens on request — the raw secret stays on your server and is never shared.
 
 Where to find it: Copilot Studio → Settings → Channels → Direct Line → Token Endpoint URL.
 
-If you set this, leave the DirectLine Secret blank (or vice versa). If both are set, the Token Endpoint takes priority. After you enter the URL, the wizard asks: **"Does this Token Endpoint require an AAD Bearer token?"** — answer Yes if your endpoint is protected by Azure AD and expects an Authorization header; answer No if it is publicly accessible. After that, the tool makes a quick test to confirm the address is reachable before continuing.
+Use either the DirectLine Secret **or** the Token Endpoint URL — not both. If both are saved, the Token Endpoint takes priority.
+
+After you paste the URL, the wizard asks one follow-up question:
+
+> **"Does this Token Endpoint require an AAD Bearer token?"**
+
+Answer **Yes** if your endpoint is protected by Azure AD — the tool will attach an `Authorization: Bearer <token>` header to every token request.
+Answer **No** if your endpoint is publicly accessible with no authentication.
 
 ---
 
