@@ -2157,6 +2157,10 @@ class _WsTransport:
         except Exception as e:
             log.error("WebSocket open failed after retries: %s", e)
             _fire_metric(environment, "Open WebSocket", 0, error=e)
+            _reason = _err_reason(e)
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("✗", f"WS open failed — {_reason}")
+            _log_event("✗", "ws_open_failed", f"WS open failed — {_reason}")
             raise StopUser()
 
     def close(self) -> None:
@@ -3592,6 +3596,18 @@ if __name__ == "__main__":
         _run_state.all_users_done = False
         _run_state._completions = 0
         _env.events.request.add_listener(_dash.on_request)
+
+        def _on_user_error(user_instance, exception, tb, **kw):
+            from locust.exception import StopUser as _StopUser
+            if isinstance(exception, _StopUser):
+                return
+            _reason = _err_reason(exception)
+            if _run_state.dashboard is not None:
+                _run_state.dashboard.on_event("✗", f"Unhandled error — {type(exception).__name__}: {_reason}")
+            _log_event("✗", "unhandled_error", f"{type(exception).__name__}: {_reason}")
+
+        _env.events.user_error.add_listener(_on_user_error)
+
         _init_session(_params["users"])
         _runner.start(user_count=_params["users"], spawn_rate=max(0.01, _params["spawn_rate"] / 60))
 
