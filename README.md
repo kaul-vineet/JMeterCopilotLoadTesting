@@ -251,13 +251,51 @@ Direct Line is the API channel this tool uses to talk to the bot.
 #### 3.2 Confirm the bot's authentication mode
 
 1. In Copilot Studio, go to **Settings → Security → Authentication**.
-2. Check whether authentication is set to "No authentication", "Authenticate with Microsoft", or "Authenticate manually".
+2. Check which mode is selected.
 
 - **No authentication:** Public bots are not currently supported by this tool. The bot must require sign-in.
-- **Authenticate with Microsoft:** Uses Entra ID SSO. You must complete all of Step 2.
-- **Authenticate manually:** Also uses Entra ID. You must complete all of Step 2.
+- **Authenticate with Microsoft:** See Section 3.2.1 below.
+- **Authenticate manually:** See Section 3.2.2 below.
 
-3. If authentication is enabled, note the **Client ID** shown on this page. This is the `AGENT_APP_ID` you need.
+---
+
+#### 3.2.1 Authenticate with Microsoft
+
+This is the simpler of the two modes. Copilot Studio creates and manages the App Registration for the bot automatically.
+
+**What you need from this screen:**
+1. In Copilot Studio → Settings → Security → Authentication, make sure **Authenticate with Microsoft** is selected.
+2. Copy the **Client ID** shown on this page. Save it as your `AGENT_APP_ID`.
+
+That Client ID is the bot's resource app. You already granted your load test client app permission to call it in Step 2.5. No further configuration is needed in Copilot Studio.
+
+---
+
+#### 3.2.2 Authenticate manually
+
+This mode means your bot uses a custom OAuth 2.0 configuration — you chose the service provider and entered the settings yourself rather than letting Copilot Studio create them automatically. Both modes ultimately use Entra ID; the difference is whether Copilot Studio manages the App Registration or you do.
+
+**Step-by-step to configure Authenticate manually:**
+
+1. In Copilot Studio → Settings → Security → Authentication, select **Authenticate manually**.
+
+2. Fill in the fields as follows:
+
+   | Field | Value |
+   |---|---|
+   | **Service provider** | Azure Active Directory v2 |
+   | **Client ID** | The Application (client) ID of the bot's resource app from Azure (the one you found in Step 2.2 — the app that has `access_as_user` exposed) |
+   | **Client secret** | A client secret from that same app registration. To create one: Azure portal → App registrations → [bot resource app] → Certificates & secrets → New client secret. Copy the **Value** (not the Secret ID). |
+   | **Scopes** | `openid profile` |
+   | **Token exchange URL (for SSO)** | Leave blank unless you have a custom token exchange service. |
+
+3. Click **Save**.
+
+4. Copy the **Client ID** you entered above. Save it as your `AGENT_APP_ID` for the setup wizard.
+
+> **Why a client secret is needed here:** In "Authenticate manually" mode, Copilot Studio acts as a confidential client when exchanging tokens — it needs a secret to authenticate itself to Entra ID. In "Authenticate with Microsoft" mode, Copilot Studio handles this internally and you never see it.
+
+> **Keep the client secret safe:** Add it to the bot's App Registration in Azure, but do not put it in the load test wizard — the wizard only needs the `AGENT_APP_ID` (the Client ID), not the secret.
 
 **What's next:** Step 4 runs the interactive setup wizard, which stores all your credentials and test accounts securely.
 
