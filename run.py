@@ -993,6 +993,7 @@ def _rocket_auth(username: str) -> bool:
             "Waiting for sign-in…",
             lambda: app.acquire_token_by_device_flow(flow),
             spinner="moon",
+            timeout=float(flow.get("expires_in", 900)),
         )
         if "access_token" not in result:
             _fail_line("Auth failed", result.get("error_description", result.get("error", "unknown")))
