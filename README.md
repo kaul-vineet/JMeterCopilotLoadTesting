@@ -133,15 +133,16 @@ After running `activate`, your terminal prompt will show `(.venv)` at the start.
 
 ```
 pip install -r requirements.txt
+pip install -e .
 ```
 
-This command downloads and installs all the software packages GRUNTMASTER 6000 needs to run. You only need to do this once. The packages include:
+The first command installs all the software packages GRUNTMASTER 6000 needs. The second registers the `run-gruntmaster` command so you can launch the tool by name instead of typing `python run.py`. You only need to do this once.
 
-- The load testing engine that runs the simulated users
-- The Microsoft sign-in library that handles authentication
-- Tools for sending messages to the bot and receiving replies
-- The library that draws the live dashboard in your terminal
-- Tools for generating the HTML report at the end of the test
+After this, start the tool with:
+
+```
+run-gruntmaster
+```
 
 #### 1d. Install Charm Gum (TUI menus)
 

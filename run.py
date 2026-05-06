@@ -3287,29 +3287,56 @@ _HELP_MD = """
 ## What does it test?
 Fires concurrent simulated users at your Copilot Studio bot, measures
 response latency for each utterance, and generates a per-profile HTML report.
+Each simulated user follows a CSV script — one message per row — then stops.
+
+## Settings
+
+**Peak users**
+The total number of simulated users that will be active at the same time once
+ramping is complete. Start with a number close to your expected production
+concurrency. Too high will affect real users; too low won't stress the bot.
+
+**Spawn rate (users/min)**
+How quickly users are added. At 5/min, a new user joins every 12 seconds.
+A slower ramp gives you clearer per-step data; a fast ramp reaches peak sooner.
+
+**Think time (seconds)**
+How long each user pauses between sending messages. Simulates reading time.
+Minimum 25s — shorter values produce unrealistically high load.
+
+**Reply timeout (seconds)**
+How long to wait for the bot's first reply before recording a timeout.
+Set this above your bot's known worst-case response time. Minimum 15s.
+The silence window (15s fixed) adds on top — total wait = timeout + 15s.
+
+**Max run time (safety cap)**
+Forces the test to stop at this many minutes even if users are still running.
+Set it above the Est. total so it only triggers as a safety net.
 
 ## Key metrics
 | Metric | Meaning |
 |--------|---------|
-| **p50** | Median response time — half of requests were faster |
-| **p95** | 95th percentile — 5% of requests took longer than this |
-| **p99** | 99th percentile — worst-1% threshold |
-| **T/O** | Timed-out requests (no bot reply within Reply Timeout) |
-| **RPS** | Requests per second at a given user-count step |
-
-## Trend column (live dashboard)
-Each bar in the Trend sparkline = p95 latency in a **30-second window**.
-Taller bar = slower responses. ▁ = fast · █ = slow.
+| **p50** | Median — half of responses were faster than this |
+| **p95** | 95th percentile — only 5% of responses took longer |
+| **p99** | 99th percentile — worst 1% threshold |
+| **T/O** | Timeouts — bot did not reply within the Reply Timeout |
+| **RPS** | Requests per second at each user-count level |
 
 ## Ramp steps
-The dashboard tracks RPS / p50 / p95 / p99 at each user-count level as the
-load ramps up. Use this to find your bot's scaling knee.
+The dashboard and HTML report track p50 / p95 / p99 / RPS at each 60-second
+window as load increases. Use this to find the point where response times
+start climbing — that is your bot's capacity knee.
+
+## Trend column (live dashboard)
+Each bar = p95 latency in a 30-second window. Taller bar = slower responses.
+▁ = fast   █ = slow
 
 ## Tips
-- Set **Peak users** to your expected peak concurrent load.
-- **Ramp-up rate** controls how fast you reach that peak (users per minute).
-- Run time should be ≥5 min for stable p95 readings.
-- Keep **Reply timeout** ≥ your bot's known worst-case response time.
+- Run for at least 5 minutes at peak load for stable p95 readings.
+- A T/O rate above 5% means the bot is struggling — reduce Peak users or
+  increase Reply timeout.
+- Press Q at any time to stop the test and go straight to results.
+- Results are saved automatically — the HTML report opens after the test.
 """
 
 
@@ -3528,7 +3555,7 @@ def _collect_run_params() -> dict:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def main():
     if not _is_configured():
         run_wizard()
 
@@ -3763,3 +3790,7 @@ if __name__ == "__main__":
                 sys.exit(0)
             else:
                 break  # New Run → outer loop continues
+
+
+if __name__ == "__main__":
+    main()
