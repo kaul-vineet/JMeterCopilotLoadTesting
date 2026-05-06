@@ -3662,6 +3662,8 @@ def main():
         _kw = _RealThread(target=_keywatch, daemon=True)
         _kw.start()
 
+        os.system("cls" if os.name == "nt" else "clear")
+
         # Silence all log output to the terminal during the live dashboard — events feed carries what matters
         _null_handler = logging.NullHandler()
         logging.root.addHandler(_null_handler)
@@ -3669,7 +3671,7 @@ def main():
         logging.root.setLevel(logging.CRITICAL)
         _dash_err: "Exception | None" = None
         try:
-            with Live(console=console, auto_refresh=False, screen=True) as _live:
+            with Live(console=console, auto_refresh=False, screen=False) as _live:
                 _deadline = time.time() + _params["run_time"]
                 while time.time() < _deadline and not _stop_run[0]:
                     _curr = getattr(_runner, "user_count", 0)
