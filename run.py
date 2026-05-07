@@ -1480,14 +1480,18 @@ def run_wizard(*, _screen1_mode: bool = False) -> None:
         os.system("cls" if os.name == "nt" else "clear")
         _gprint(
             "  ✦  GRUNTMASTER 6000  ·  SETUP WIZARD  ✦\n\n"
-            "  Saves credentials to Windows Credential Manager.",
+            "  Connect GRUNTMASTER to your Copilot Studio agent.\n\n"
+            "  You need: an Azure AD app registration (Tenant ID + Client ID + Bot Client ID),\n"
+            "  a DirectLine Secret or Token Endpoint, and at least one M365 test account.\n"
+            "  All credentials are saved to Windows Credential Manager.",
             border="double", fg=_G_CYAN, bold=True,
             border_fg=_G_PURPLE, padding="1 3", margin="1 0",
         )
 
-        t_ok  = bool(state["tenant"]  and _GUID_RE.match(state["tenant"]))
-        c_ok  = bool(state["client"]  and _GUID_RE.match(state["client"]))
-        dl_ok = bool(state["secret"]  or  state["endpoint"])
+        t_ok  = bool(state["tenant"]    and _GUID_RE.match(state["tenant"]))
+        c_ok  = bool(state["client"]    and _GUID_RE.match(state["client"]))
+        a_ok  = bool(state["agent_app"] and _GUID_RE.match(state["agent_app"]))
+        dl_ok = bool(state["secret"]    or  state["endpoint"])
 
         _show_endpoint = True
 
@@ -1498,9 +1502,9 @@ def run_wizard(*, _screen1_mode: bool = False) -> None:
             _mrow("Client ID",           _val(state["client"]),
                   c_ok if state["client"] else False,
                   "required  ·  App registrations → your app → Application (client) ID"),
-            _mrow("Bot Client ID (SSO)", _val(state["agent_app"],
-                  opt_note="(optional — blank = SSO disabled)"), None,
-                  "optional  ·  Copilot Studio → Settings → Security → Authentication → Client ID"),
+            _mrow("Bot Client ID (SSO)", _val(state["agent_app"], opt_note="(not set)"),
+                  a_ok if state["agent_app"] else False,
+                  "required  ·  Copilot Studio → Settings → Security → Authentication → Client ID"),
             _mrow("DirectLine Secret",   _val(state["secret"], masked=True,
                   opt_note="(not set)"),
                   True if state["secret"] else (False if not state["endpoint"] else None),
@@ -1528,9 +1532,7 @@ def run_wizard(*, _screen1_mode: bool = False) -> None:
                                p["username"] + scenario, ready, auth_hint))
 
         if _screen1_mode:
-            # Auth tokens are optional — profiles without tokens will fail at runtime.
-            # Block Continue only on missing credentials or zero profiles.
-            _all_ok = t_ok and c_ok and dl_ok and bool(state["profiles"])
+            _all_ok = t_ok and c_ok and a_ok and dl_ok and bool(state["profiles"])
             items += ["", _ADD]
             if _all_ok:
                 items.append(_CONTINUE)
@@ -1564,6 +1566,8 @@ def run_wizard(*, _screen1_mode: bool = False) -> None:
                 errs.append("Tenant ID is required and must be a valid GUID.")
             if not c_ok:
                 errs.append("Client ID is required and must be a valid GUID.")
+            if not a_ok:
+                errs.append("Bot Client ID (SSO) is required and must be a valid GUID.")
             if not dl_ok:
                 errs.append("DirectLine Secret or Token Endpoint URL is required.")
             if not state["profiles"]:
@@ -2090,6 +2094,8 @@ def _log_utterance(spawn_num: int, profile: str, utterance_num: int, scenario: s
 
 
 def _log_user_spawn(spawn_num: int, profile: str, conv_id: str, user_count: int) -> None:
+    if _run_state.dashboard is not None:
+        _run_state.dashboard.on_event("→", f"User {spawn_num} spawned — {profile}")
     if not _csv_writer.log_path:
         return
     _csv_writer.write([
@@ -2101,6 +2107,8 @@ def _log_user_spawn(spawn_num: int, profile: str, conv_id: str, user_count: int)
 
 
 def _log_user_exit(spawn_num: int, profile: str, conv_id: str, user_count: int) -> None:
+    if _run_state.dashboard is not None:
+        _run_state.dashboard.on_event("■", f"User {spawn_num} exited — {profile}")
     if not _csv_writer.log_path:
         return
     _csv_writer.write([
@@ -2508,6 +2516,9 @@ class CopilotBaseUser(User):
                 utterance, self.scenario_name, id(self), profile_label,
                 self._idx, len(self.utterances), response.latency_ms, False,
                 bot_response=bot_text)
+        # Pipeline: no think-time after the last utterance — exit immediately
+        if _run_state.mode == "Pipeline" and self._idx >= len(self.utterances):
+            raise StopUser()
         gevent.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
 
 
@@ -3790,9 +3801,10 @@ def main():
         def _on_spawning_complete(user_count, **kw):
             _run_state.spawning_complete = True
             if _run_state.mode == "Pipeline":
-                # Stop Locust spawning replacements — users exit naturally, no respawn
+                # Set target to 0 so Locust won't respawn users that raise StopUser.
+                # Don't call runner.stop() — that kills greenlets immediately.
                 try:
-                    _runner.stop()
+                    _runner.start(user_count=0, spawn_rate=_ramp_rate_ps)
                 except Exception:
                     pass
         _env.events.spawning_complete.add_listener(_on_spawning_complete)
@@ -3858,12 +3870,16 @@ def main():
                             _run_state.phase = "AT_PEAK"
                             _plateau_start   = _now
                             _log_event("⬤", "phase", f"AT PEAK — {_curr} users active")
+                            if _run_state.dashboard is not None:
+                                _run_state.dashboard.on_event("⬤", f"AT PEAK — {_curr} users active")
 
                         elif _run_state.phase == "AT_PEAK":
                             # Plateau duration elapsed → start ramp-down
                             if _now - _plateau_start >= _params["run_time"]:
                                 _run_state.phase = "RAMP_DOWN"
                                 _log_event("▼", "phase", f"RAMP DOWN — {_curr} users finishing current cycle")
+                                if _run_state.dashboard is not None:
+                                    _run_state.dashboard.on_event("▼", f"RAMP DOWN — {_curr} users finishing current cycle")
                                 # Tell Locust to stop spawning replacements
                                 try:
                                     _runner.start(user_count=0, spawn_rate=_ramp_rate_ps)
@@ -3941,28 +3957,48 @@ def main():
             _spawn_counters.clear()
 
         if _log_path and _log_path.exists():
+            sys.stdout.write("\n  ⏳  Generating report…\n")
+            sys.stdout.flush()
+            # Run in a real OS thread (pre-gevent Thread) so pandas/plotly are
+            # completely isolated from gevent's monkey-patched locks and I/O.
+            import queue as _rq
+            _rep_q: _rq.Queue = _rq.Queue()
+            def _run_report_thread():
+                try:
+                    from report import generate_report as _gen_report
+                    _run_notes = _params.get("notes", "")
+                    _all_logs = sorted(REPORT_DIR.glob("run_log_*.csv"), key=lambda p: p.stat().st_mtime)
+                    _other = [p for p in _all_logs if p != _log_path]
+                    _baseline = _other[-1] if _other else None
+                    _rep = _gen_report(
+                        _log_path,
+                        p95_target=test_config["p95_target_ms"],
+                        notes=_run_notes,
+                        response_timeout=test_config["response_timeout"],
+                        silence_timeout=_SILENCE_TIMEOUT,
+                        run_config=_params,
+                        baseline_csv=_baseline,
+                    )
+                    _rep_q.put(("ok", _rep))
+                except ImportError as _ie:
+                    _rep_q.put(("skip", str(_ie)))
+                except Exception as _re:
+                    _rep_q.put(("err", str(_re)))
+            _rt = _RealThread(target=_run_report_thread, daemon=True, name="report-gen")
+            _rt.start()
+            _rt.join(timeout=120)
             try:
-                sys.stdout.write("\n  ⏳  Generating report…\n")
-                sys.stdout.flush()
-                from report import generate_report as _gen_report
-                _run_notes = _params.get("notes", "")
-                _all_logs = sorted(REPORT_DIR.glob("run_log_*.csv"), key=lambda p: p.stat().st_mtime)
-                _other = [p for p in _all_logs if p != _log_path]
-                _baseline = _other[-1] if _other else None
-                _rep = _gen_report(
-                    _log_path,
-                    p95_target=test_config["p95_target_ms"],
-                    notes=_run_notes,
-                    response_timeout=test_config["response_timeout"],
-                    silence_timeout=_SILENCE_TIMEOUT,
-                    run_config=_params,
-                    baseline_csv=_baseline,
-                )
-                _gprint(f"  Report → {_rep}", fg=_G_CYAN, bold=True, padding="0 2", margin="0 1")
-            except ImportError:
-                pass
-            except Exception as _e:
-                sys.stdout.write(f"\n  Report error: {_e}\n")
+                _kind, _val = _rep_q.get_nowait()
+                if _kind == "ok":
+                    _gprint(f"  Report → {_val}", fg=_G_CYAN, bold=True, padding="0 2", margin="0 1")
+                elif _kind == "skip":
+                    sys.stdout.write(f"\n  HTML report skipped — install pandas + plotly to enable\n")
+                    sys.stdout.flush()
+                else:
+                    sys.stdout.write(f"\n  Report error: {_val}\n")
+                    sys.stdout.flush()
+            except _rq.Empty:
+                sys.stdout.write("\n  Report timed out (>120s) — CSV saved, report skipped\n")
                 sys.stdout.flush()
 
         # Drain any keypresses that accumulated during the test (e.g. 'q' to quit)
