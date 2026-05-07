@@ -142,7 +142,8 @@ def _init_session(user_count: int):
     _session.mount("http://", adapter)
 
 class _RunState:
-    __slots__ = ("dashboard", "circuit_open_until", "cpu_warn_ts", "spawning_complete", "phase", "mode")
+    __slots__ = ("dashboard", "circuit_open_until", "cpu_warn_ts", "spawning_complete", "phase", "mode",
+                 "pipeline_spawns_total", "pipeline_done")
     def __init__(self) -> None:
         self.dashboard: "Optional[_DashboardState]" = None
         self.circuit_open_until: float = 0.0
@@ -150,6 +151,8 @@ class _RunState:
         self.spawning_complete: bool = False
         self.phase: str = "RAMP_UP"   # Concurrent: "RAMP_UP"|"AT_PEAK"|"RAMP_DOWN"  Pipeline: "RUNNING"
         self.mode: str = "Concurrent"  # "Concurrent" | "Pipeline"
+        self.pipeline_spawns_total: int = 0
+        self.pipeline_done: int = 0
 
 _run_state = _RunState()
 _spawn_counters: dict[str, int] = {}   # class_name → spawn sequence number
@@ -2327,6 +2330,13 @@ class CopilotBaseUser(User):
             key = self.__class__.__name__
             _spawn_counters[key] = _spawn_counters.get(key, 0) + 1
             self._spawn_num = _spawn_counters[key]
+            if _run_state.mode == "Pipeline":
+                _run_state.pipeline_spawns_total += 1
+                self._is_pipeline_original = (_run_state.pipeline_spawns_total <= test_config.get("users", 999999))
+            else:
+                self._is_pipeline_original = True
+        if not self._is_pipeline_original:
+            return
         self._open_conversation()
         _log_user_spawn(
             self._spawn_num,
@@ -2336,6 +2346,10 @@ class CopilotBaseUser(User):
         )
 
     def on_stop(self):
+        if _run_state.mode == "Pipeline" and getattr(self, '_is_pipeline_original', True):
+            _run_state.pipeline_done += 1
+        if not getattr(self, '_is_pipeline_original', True):
+            return
         _log_user_exit(
             self._spawn_num,
             self.profile.get("display_name", self.profile.get("username", "?")),
@@ -2527,6 +2541,9 @@ class CopilotBaseUser(User):
 # Drop any CSV into utterances/ and it becomes a Locust scenario automatically.
 def _make_user_class(class_name: str, utterances: list[str], scenario: str, profile: dict) -> type:
     def send(self):
+        if not getattr(self, '_is_pipeline_original', True):
+            gevent.sleep(0.5)
+            return
         self._send_and_measure()
     send.__name__ = "send"
     base = CopilotHttpUser if test_config["transport"] == "http" else CopilotBaseUser
@@ -3806,19 +3823,12 @@ def main():
         )
         _run_state.spawning_complete = False
         _run_state.circuit_open_until = 0.0
+        _run_state.pipeline_spawns_total = 0
+        _run_state.pipeline_done = 0
         _run_state.dashboard = _dash
         _env.events.request.add_listener(_dash.on_request)
         def _on_spawning_complete(user_count, **kw):
             _run_state.spawning_complete = True
-            if _run_state.mode == "Pipeline":
-                # Set the target directly to 0 so Locust won't respawn users
-                # after they raise StopUser. Do NOT call runner.start(0) —
-                # that kills all existing greenlets immediately and triggers
-                # Locust to spawn replacements, causing an infinite cycle.
-                try:
-                    _runner.target_user_count = 0
-                except Exception:
-                    pass
         _env.events.spawning_complete.add_listener(_on_spawning_complete)
 
         def _on_user_error(user_instance, exception, tb, **kw):
@@ -3903,8 +3913,12 @@ def main():
                         _prev_users[0] = _curr
                     _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
                     _live.refresh()
-                    if _run_state.spawning_complete and _curr == 0:
-                        break
+                    if _run_state.mode == "Pipeline":
+                        if _run_state.spawning_complete and _run_state.pipeline_done >= _params["users"]:
+                            break
+                    else:
+                        if _run_state.spawning_complete and _curr == 0:
+                            break
                     gevent.sleep(0.5)
         except Exception as _e:
             _dash_err = _e
