@@ -177,15 +177,21 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
                     notes: str = "",
                     response_timeout: float = 30.0,
                     silence_timeout: float = 15.0,
-                    events_csv: "Path | None" = None,
                     run_config: "dict | None" = None,
                     baseline_csv: "Path | None" = None) -> Path:
     _require_deps()
     import pandas as pd
     import plotly.graph_objects as go
 
-    # ── Load ──────────────────────────────────────────────────────────────────
-    df = pd.read_csv(csv_path)
+    # ── Load — run_log_*.csv contains USER and SYSTEM rows; split them here ───
+    _df_full = pd.read_csv(csv_path)
+    if "event_category" in _df_full.columns:
+        df         = _df_full[_df_full["event_category"] == "USER"][_df_full["event"] == "UTTERANCE"].copy()
+        _df_system = _df_full[_df_full["event_category"] == "SYSTEM"].copy()
+    else:
+        df         = _df_full.copy()   # legacy file — treat all rows as utterances
+        _df_system = pd.DataFrame()
+
     df["response_ms"] = pd.to_numeric(df["response_ms"], errors="coerce").fillna(0)
     df["timed_out"]   = pd.to_numeric(df["timed_out"],   errors="coerce").fillna(0).astype(int)
 
@@ -223,7 +229,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
         test_date_str = t_start.strftime("%Y-%m-%d %H:%M UTC")
         duration_str  = f"{duration_s // 60}m {duration_s % 60}s"
     else:
-        test_date_str = csv_path.stem.replace("detail_", "")
+        test_date_str = csv_path.stem.replace("run_log_", "")
         duration_str  = "—"
 
     # ── Ramp steps (Tab 1) — one row per 60-second window ────────────────────
@@ -233,29 +239,23 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
         t0_ramp = df["sent_dt"].min()
         df["_ramp_idx"] = ((df["sent_dt"] - t0_ramp).dt.total_seconds() // RAMP_WINDOW).astype(int)
 
-        # Load events CSV (optional) — group by ramp (1-based)
+        # Group SYSTEM events by ramp window (derived from elapsed_s)
         events_by_ramp: dict = {}
-        _eff_events_csv = events_csv
-        if _eff_events_csv is None:
-            # Auto-derive: events_YYYYMMDD_HHMMSS.csv alongside detail_YYYYMMDD_HHMMSS.csv
-            _stem = csv_path.stem.replace("detail_", "events_")
-            _candidate = csv_path.parent / f"{_stem}.csv"
-            if _candidate.exists():
-                _eff_events_csv = _candidate
-        if _eff_events_csv is not None and Path(_eff_events_csv).exists():
+        if not _df_system.empty and "elapsed_s" in _df_system.columns:
             try:
-                import csv as _csv_mod
-                with open(_eff_events_csv, newline="", encoding="utf-8") as _ef:
-                    for _row in _csv_mod.DictReader(_ef):
-                        _r = int(_row.get("ramp", 0))
-                        events_by_ramp.setdefault(_r, []).append(_row)
+                _df_system["_ramp_idx"] = (
+                    pd.to_numeric(_df_system["elapsed_s"], errors="coerce").fillna(0) // 60
+                ).astype(int)
+                for _, _row in _df_system.iterrows():
+                    _r = int(_row.get("_ramp_idx", 0)) + 1   # 1-based for display
+                    events_by_ramp.setdefault(_r, []).append(_row.to_dict())
             except Exception:
                 pass
 
         # Build per-ramp 429 count from events
         ramp_429: dict = {}
         for _r, _evs in events_by_ramp.items():
-            ramp_429[_r] = sum(1 for e in _evs if e.get("event_type") == "rate_limit")
+            ramp_429[_r] = sum(1 for e in _evs if e.get("event") == "rate_limit")
 
         step_data = []
         for ridx, grp in df.groupby("_ramp_idx"):
@@ -807,7 +807,7 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
 </body>
 </html>"""
 
-    out = csv_path.parent / (csv_path.stem.replace("detail_", "report_") + ".html")
+    out = csv_path.parent / (csv_path.stem.replace("run_log_", "run_report_") + ".html")
     out.write_text(html, encoding="utf-8")
     return out
 
@@ -816,17 +816,17 @@ def generate_report(csv_path: Path, p95_target: int = P95_TARGET_MS,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Generate HTML report from a Copilot load test detail CSV"
+        description="Generate HTML report from a run_log_*.csv"
     )
     parser.add_argument(
         "csv", nargs="?",
-        help="Path to detail CSV (default: latest in report/)",
+        help="Path to run_log CSV (default: latest in report/)",
     )
     parser.add_argument(
         "--browse", action="store_true",
         help="Open gum file browser to pick a CSV",
     )
-    parser.add_argument("--baseline", help="Path to baseline detail CSV for regression comparison")
+    parser.add_argument("--baseline", help="Path to baseline run_log CSV for regression comparison")
     args = parser.parse_args()
 
     if args.browse:
@@ -838,23 +838,16 @@ if __name__ == "__main__":
     elif args.csv:
         _csv = Path(args.csv)
     else:
-        _csvs = sorted(REPORT_DIR.glob("detail_*.csv"), key=lambda p: p.stat().st_mtime)
+        _csvs = sorted(REPORT_DIR.glob("run_log_*.csv"), key=lambda p: p.stat().st_mtime)
         if not _csvs:
-            print("No detail_*.csv found in report/  —  run a test first.")
+            print("No run_log_*.csv found in report/  —  run a test first.")
             sys.exit(1)
         _csv = _csvs[-1]
 
-    # Auto-derive events CSV from detail CSV name
-    _events = _csv.parent / _csv.name.replace("detail_", "events_")
-    if not _events.exists():
-        _events = None
-
     print(f"\n  Generating report from: {_csv}")
-    if _events:
-        print(f"  Events log:             {_events}")
     try:
         _out = generate_report(
-            _csv, events_csv=_events,
+            _csv,
             baseline_csv=Path(args.baseline) if args.baseline else None,
         )
         print(f"  Report saved to:        {_out}\n")

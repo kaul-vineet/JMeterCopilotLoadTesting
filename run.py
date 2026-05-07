@@ -23,6 +23,7 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -65,8 +66,10 @@ PROFILES_JSON  = _HERE / "profiles" / "profiles.json"
 TOKENS_DIR     = _HERE / "profiles" / ".tokens"
 UTTERANCES_DIR = _HERE / "utterances"
 REPORT_DIR     = _HERE / "report"
+TMP_DIR        = REPORT_DIR / "tmp"
 TOKENS_DIR.mkdir(parents=True, exist_ok=True)
 REPORT_DIR.mkdir(exist_ok=True)
+TMP_DIR.mkdir(exist_ok=True)
 
 # ── Windows Credential Manager helpers ───────────────────────────────────────
 
@@ -139,13 +142,14 @@ def _init_session(user_count: int):
     _session.mount("http://", adapter)
 
 class _RunState:
-    __slots__ = ("dashboard", "circuit_open_until", "cpu_warn_ts", "all_users_done", "_completions")
+    __slots__ = ("dashboard", "circuit_open_until", "cpu_warn_ts", "spawning_complete", "phase", "mode")
     def __init__(self) -> None:
         self.dashboard: "Optional[_DashboardState]" = None
         self.circuit_open_until: float = 0.0
         self.cpu_warn_ts: float = 0.0
-        self.all_users_done: bool = False
-        self._completions: int = 0
+        self.spawning_complete: bool = False
+        self.phase: str = "RAMP_UP"   # Concurrent: "RAMP_UP"|"AT_PEAK"|"RAMP_DOWN"  Pipeline: "RUNNING"
+        self.mode: str = "Concurrent"  # "Concurrent" | "Pipeline"
 
 _run_state = _RunState()
 _spawn_counters: dict[str, int] = {}   # class_name → spawn sequence number
@@ -736,6 +740,15 @@ def _gformat(text: str):
         print(text)
 
 
+def _gpager(text: str):
+    """Show text in a scrollable pager via `gum pager`, falls back to plain print."""
+    if not _gum_ok():
+        print(text)
+        return
+    subprocess.run(["gum", "pager", "--show-line-numbers=false"], input=text,
+                   text=True, encoding="utf-8")
+
+
 _GUM_ENV = {**os.environ, "PYTHONUTF8": "1"}   # ensure UTF-8 I/O on Windows
 
 # ── Banner animation helpers ──────────────────────────────────────────────────
@@ -943,6 +956,7 @@ def _show_profile_status(profiles: list[dict]) -> list[str]:
     _section_header("✦  PROFILE STATUS  ✦")
 
     needs_auth = []
+    _seen_auth = set()
     for i, profile in enumerate(profiles):
         username = profile["username"]
         display  = profile.get("display_name", username)
@@ -957,7 +971,9 @@ def _show_profile_status(profiles: list[dict]) -> list[str]:
             sys.stdout.flush()
         except RuntimeError:
             _fail_line(display, "NEEDS AUTH ✗")
-            needs_auth.append(username)
+            if username not in _seen_auth:
+                needs_auth.append(username)
+                _seen_auth.add(username)
 
     print()
     return needs_auth
@@ -989,12 +1005,24 @@ def _rocket_auth(username: str) -> bool:
         )
         print()
 
-        result = _with_spinner(
-            "Waiting for sign-in…",
-            lambda: app.acquire_token_by_device_flow(flow),
-            spinner="moon",
-            timeout=float(flow.get("expires_in", 900)),
-        )
+        result = {}
+        for _attempt in range(3):
+            try:
+                result = _with_spinner(
+                    "Waiting for sign-in…",
+                    lambda: app.acquire_token_by_device_flow(flow),
+                    spinner="moon",
+                    timeout=float(flow.get("expires_in", 900)),
+                )
+                break
+            except (requests.exceptions.ConnectionError, ConnectionError, OSError):
+                if _attempt < 2:
+                    _fail_line("Connection dropped", f"Retrying… (attempt {_attempt + 2}/3)")
+                    time.sleep(2)
+                    continue
+                _fail_line("Auth failed", "Network error — check connectivity and try again")
+                return False
+
         if "access_token" not in result:
             _fail_line("Auth failed", result.get("error_description", result.get("error", "unknown")))
             return False
@@ -1084,24 +1112,27 @@ def _bomb_countdown():
 def _check_credentials() -> str:
     """
     Scans Credential Manager for required values.
-    Returns 'ok', 'update', or 'missing'.
+    Returns 'ok' silently when all credentials are present.
+    Returns 'missing' and shows detail when something is absent.
     """
+    # Silent fast-path — no UI if everything is already set
+    tenant_val = _load_credential("CS_TENANT_ID")
+    client_val = _load_credential("CS_CLIENT_ID")
+    secret_val = _load_credential("CS_DIRECTLINE_SECRET")
+    endpt_val  = _load_credential("CS_TOKEN_ENDPOINT")
+    tenant_ok  = bool(tenant_val and _GUID_RE.match(tenant_val))
+    client_ok  = bool(client_val and _GUID_RE.match(client_val))
+    dl_ok      = bool(secret_val or endpt_val)
+    if tenant_ok and client_ok and dl_ok:
+        return "ok"
+
+    # Something is missing — show what's wrong
     if _gum_ok():
         _gprint("  CREDENTIAL CHECK", border="rounded", fg=_G_CYAN,
                 bold=True, padding="0 3", margin="1 0", border_fg=_G_PURPLE)
         print()
-        tenant_val = _with_spinner("Entra Tenant ID…",            lambda: _load_credential("CS_TENANT_ID"))
-        client_val = _with_spinner("App Registration Client ID…",  lambda: _load_credential("CS_CLIENT_ID"))
-        secret_val = _with_spinner("DirectLine Secret…",           lambda: _load_credential("CS_DIRECTLINE_SECRET"))
-        endpt_val  = _with_spinner("Token Endpoint URL…",          lambda: _load_credential("CS_TOKEN_ENDPOINT"))
-
-        tenant_ok = bool(tenant_val and _GUID_RE.match(tenant_val))
-        client_ok = bool(client_val and _GUID_RE.match(client_val))
-        dl_ok     = bool(secret_val or endpt_val)
-
         _ok_line("Entra Tenant ID",             "FOUND")    if tenant_ok else _fail_line("Entra Tenant ID",             "MISSING")
         _ok_line("App Registration Client ID",  "FOUND")    if client_ok else _fail_line("App Registration Client ID",  "MISSING")
-
         if secret_val and endpt_val:
             _ok_line("DirectLine Secret",   "FOUND")
             _ok_line("Token Endpoint URL",  "FOUND  (both set — Token Endpoint takes priority)")
@@ -1112,79 +1143,41 @@ def _check_credentials() -> str:
         else:
             _fail_line("DirectLine Secret",  "MISSING  (need Secret or Token Endpoint)")
             _fail_line("Token Endpoint URL", "MISSING  (need Secret or Token Endpoint)")
-
         print()
+        _gprint("  ✗  Missing credentials — run:  python run.py --setup",
+                border="rounded", fg=_G_RED,
+                padding="1 2", margin="0 1", border_fg=_G_RED)
+        print()
+        return "missing"
 
-        if not (tenant_ok and client_ok and dl_ok):
-            _gprint("  ✗  Missing credentials — run:  python run.py --setup",
-                    border="rounded", fg=_G_RED,
-                    padding="1 2", margin="0 1", border_fg=_G_RED)
-            print()
-            return "missing"
-
-        if _gconfirm("  All credentials found. Update before continuing?", default=False):
-            return "update"
-        return "ok"
-
-    # ── Rich fallback ─────────────────────────────────────────────────────
-    spinner = itertools.cycle(_SPINNER)
-    console.print(Panel("[bold cyan]  🔍  CREDENTIAL CHECK  [/bold cyan]", border_style="cyan"))
-    console.print()
-
-    def _spin_check(label: str, key: str) -> str:
-        for _ in range(10):
-            console.print(f"  [cyan]{next(spinner)}[/cyan]  [dim]{label}[/dim]", end="\r")
-            time.sleep(0.05)
-        return _load_credential(key)
-
-    tenant_val = _spin_check("Entra Tenant ID",            "CS_TENANT_ID")
-    client_val = _spin_check("App Registration Client ID", "CS_CLIENT_ID")
-    secret_val = _spin_check("DirectLine Secret",          "CS_DIRECTLINE_SECRET")
-    endpt_val  = _spin_check("Token Endpoint URL",         "CS_TOKEN_ENDPOINT")
-
-    tenant_ok = bool(tenant_val and _GUID_RE.match(tenant_val))
-    client_ok = bool(client_val and _GUID_RE.match(client_val))
-    dl_ok     = bool(secret_val or endpt_val)
-
+    # ── Rich fallback — gum not available; values already loaded above ──────
     def _row(ok: bool, label: str, note: str = ""):
         icon   = "[bold green]✓[/bold green]" if ok else "[bold red]✗[/bold red]"
         status = "[bold green]FOUND[/bold green]" if ok else "[bold red]MISSING[/bold red]"
         extra  = f"  [dim]{note}[/dim]" if note else ""
         console.print(f"  {icon}  {label:<35} {status}{extra}")
 
+    console.print(Panel("[bold cyan]  CREDENTIAL CHECK  [/bold cyan]", border_style="cyan"))
+    console.print()
     _row(tenant_ok, "Entra Tenant ID")
     _row(client_ok, "App Registration Client ID")
-
     if secret_val and endpt_val:
         _row(True, "DirectLine Secret")
         _row(True, "Token Endpoint URL", "(both set — Token Endpoint takes priority)")
     elif secret_val:
-        _row(True,  "DirectLine Secret")
-        console.print(f"  [dim]─[/dim]  {'Token Endpoint URL':<35} [dim](not needed — DirectLine Secret is used)[/dim]")
+        _row(True, "DirectLine Secret")
     elif endpt_val:
-        console.print(f"  [dim]─[/dim]  {'DirectLine Secret':<35} [dim](not needed — Token Endpoint is used)[/dim]")
-        _row(True,  "Token Endpoint URL")
+        _row(True, "Token Endpoint URL")
     else:
         _row(False, "DirectLine Secret",  "(need Secret or Token Endpoint)")
         _row(False, "Token Endpoint URL", "(need Secret or Token Endpoint)")
-
     console.print()
-
-    if not (tenant_ok and client_ok and dl_ok):
-        console.print(Panel(
-            "[bold red]  ✗  Missing credentials — run:  python run.py --setup[/bold red]",
-            border_style="red",
-        ))
-        console.print()
-        return "missing"
-
-    console.print(
-        "  [bold green]✓  All credentials found.[/bold green]  "
-        "[dim]Press [bold]U[/bold] to update, Enter to continue.[/dim]"
-    )
-    choice = input("  > ").strip().lower()
+    console.print(Panel(
+        "[bold red]  ✗  Missing credentials — run:  python run.py --setup[/bold red]",
+        border_style="red",
+    ))
     console.print()
-    return "update" if choice == "u" else "ok"
+    return "missing"
 
 
 _ERROR_HINTS = {
@@ -1301,22 +1294,52 @@ def _preflight_bot_check(profiles: list[dict]) -> bool:
         close_websocket(ws)
         return False
 
+    _pf_log = TMP_DIR / "_preflight_last.txt"
     try:
-        response = _spin("Waiting for bot reply…",
-                         lambda: read_response(ws, activity_id, response_timeout=30.0,
-                                               conversation=conversation,
-                                               aad_token=aad_token_for_bot))
+        with open(_pf_log, "w") as _f:
+            _f.write(f"activity_id={activity_id}\naad_token={'set' if aad_token_for_bot else 'none'}\n")
+    except Exception:
+        pass
+
+    print("  Waiting for bot reply (30s)…", flush=True)
+    try:
+        response = read_response(ws, activity_id, response_timeout=30.0,
+                                 conversation=conversation,
+                                 aad_token=aad_token_for_bot)
     except Exception as e:
         _fail_line("Bot response", f"FAILED — {e}")
         return False
     finally:
         close_websocket(ws)
 
+    try:
+        with open(_pf_log, "a") as _f:
+            _f.write(f"timed_out={response.timed_out}\nws_closed={response.ws_closed}\n"
+                     f"matched={len(response.activities)}\n"
+                     f"activities={[a.get('type') + ':' + a.get('from', {}).get('role', '?') for a in response.activities]}\n")
+    except Exception:
+        pass
+
     if response.timed_out:
-        _fail_line("Bot response", "NO REPLY (15s timeout)")
+        _fail_line("Bot response", "NO REPLY (30s timeout)")
         print()
-        _gprint("  The bot did not respond. Check it is published and the channel is configured.",
-                fg=_G_YELLOW, padding="0 2", margin="0 1")
+        _gprint(
+            "  No matching reply received.\n\n"
+            "  Possible causes:\n"
+            "  • Direct Line channel disabled in Copilot Studio → Channels\n"
+            "  • Bot sends adaptive cards or typing events only — not plain text\n"
+            "  • replyToId not set in bot response\n"
+            "  • Network / proxy blocking directline.botframework.com",
+            border="rounded", fg=_G_YELLOW, padding="1 2", margin="0 1", border_fg=_G_YELLOW,
+        )
+        print(f"  (Debug log: {_pf_log})")
+        print()
+        try:
+            ans = input("  Bot did not respond. Continue to test anyway? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = ""
+        if ans == "y":
+            return True
         return False
 
     first_reply = response.activities[0].get("text", "").strip()
@@ -1420,9 +1443,10 @@ def _write_profiles(profiles: list[dict]):
         json.dump(profiles, f, indent=2)
 
 
-def run_wizard():
+def run_wizard(*, _screen1_mode: bool = False) -> None:
     _gum_require()
-    _wizard_rocket_float()
+    if not _screen1_mode:
+        _wizard_rocket_float()
 
     state = {
         "tenant":              _load_credential("CS_TENANT_ID"),
@@ -1434,10 +1458,11 @@ def run_wizard():
         "profiles":            load_profiles(),
     }
 
-    _SAVE = "  ✓  Save & continue"
-    _ADD  = "  +  Add profile"
-    _BACK = "  ←  Back"
-    _EXIT = "  ✕  Exit"
+    _SAVE     = "  ✓  Save & continue"
+    _CONTINUE = "  ▶  Continue"
+    _ADD      = "  +  Add profile"
+    _BACK     = "  ←  Back"
+    _EXIT     = "  ✕  Exit"
 
     def _val(v: str, *, masked: bool = False, opt_note: str = "") -> str:
         if not v:
@@ -1446,9 +1471,10 @@ def run_wizard():
             return "●●●●●●●● (saved)"
         return (v[:44] + "…") if len(v) > 45 else v
 
-    def _mrow(label: str, value: str, ok: bool | None = None) -> str:
-        mark = "   ✓" if ok is True else ("   ✗" if ok is False else "")
-        return f"      {label:<32}  {value:<50}{mark}"
+    def _mrow(label: str, value: str, ok: bool | None = None, hint: str = "") -> str:
+        mark     = "   ✓" if ok is True else ("   ✗" if ok is False else "    ")
+        hint_col = f"  {hint}" if hint else ""
+        return f"      {label:<28}  {value:<46}{mark}{hint_col}"
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
@@ -1467,32 +1493,50 @@ def run_wizard():
 
         items = [
             _mrow("Tenant ID",           _val(state["tenant"]),
-                  t_ok if state["tenant"] else False),
+                  t_ok if state["tenant"] else False,
+                  "required  ·  Azure portal → Entra ID → Overview → Tenant ID"),
             _mrow("Client ID",           _val(state["client"]),
-                  c_ok if state["client"] else False),
+                  c_ok if state["client"] else False,
+                  "required  ·  App registrations → your app → Application (client) ID"),
             _mrow("Bot Client ID (SSO)", _val(state["agent_app"],
-                  opt_note="(optional — blank = SSO disabled)"), None),
+                  opt_note="(optional — blank = SSO disabled)"), None,
+                  "optional  ·  Copilot Studio → Settings → Security → Authentication → Client ID"),
             _mrow("DirectLine Secret",   _val(state["secret"], masked=True,
                   opt_note="(not set)"),
-                  True if state["secret"] else (False if not state["endpoint"] else None)),
+                  True if state["secret"] else (False if not state["endpoint"] else None),
+                  "required (or Token Endpoint)  ·  Copilot Studio → Channels → Direct Line → Secret keys"),
         ]
         items.append(_mrow("Token Endpoint", _val(state["endpoint"], opt_note="(not set)"),
-                           True if state["endpoint"] else None))
+                           True if state["endpoint"] else None,
+                           "required (or DirectLine Secret)  ·  Copilot Studio → Channels → Token Endpoint"))
         _N_CRED = len(items)
 
         items.append("")
         items.append("  ─  PROFILES  ─  Each profile is a real M365 account. Assign a scenario")
         items.append("     to control which utterances it sends. Multiple profiles = more load.")
 
+        _needs_auth_profiles: list[str] = []
         for p_idx, p in enumerate(state["profiles"]):
             display  = p.get("display_name", p["username"])
             tok      = load_token(p["username"])
-            ready    = bool(tok and is_token_valid(tok))
-            scenario = f"  → {p['scenario']}" if p.get("scenario") else "  → (auto-assign)"
+            ready    = (not _user_auth_required()) or bool(tok and is_token_valid(tok))
+            if _screen1_mode and not ready:
+                _needs_auth_profiles.append(p["username"])
+            scenario  = f"  → {p['scenario']}" if p.get("scenario") else "  → (auto-assign)"
+            auth_hint = "" if ready else "select to authenticate"
             items.append(_mrow(f"Profile [{p_idx}]: {display}",
-                               p["username"] + scenario, ready))
+                               p["username"] + scenario, ready, auth_hint))
 
-        items += ["", _ADD, _SAVE, _BACK, _EXIT]
+        if _screen1_mode:
+            # Auth tokens are optional — profiles without tokens will fail at runtime.
+            # Block Continue only on missing credentials or zero profiles.
+            _all_ok = t_ok and c_ok and dl_ok and bool(state["profiles"])
+            items += ["", _ADD]
+            if _all_ok:
+                items.append(_CONTINUE)
+            items.append(_EXIT)
+        else:
+            items += ["", _ADD, _SAVE, _BACK, _EXIT]
 
         choice = _gchoose(
             *items,
@@ -1501,10 +1545,18 @@ def run_wizard():
         )
 
         if choice and choice.strip() == _EXIT.strip():
+            os.system("cls" if os.name == "nt" else "clear")
             sys.exit(0)
 
         if choice and choice.strip() == _BACK.strip():
+            os.system("cls" if os.name == "nt" else "clear")
             return
+
+        if choice and _screen1_mode and choice.strip() == _CONTINUE.strip():
+            break  # all_ok guaranteed — fall through to save block
+
+        if _screen1_mode and not choice:
+            continue  # Escape in screen1 mode → just re-render
 
         if not choice or choice.strip() == _SAVE.strip():
             errs = []
@@ -1740,13 +1792,19 @@ def run_wizard():
             state["endpoint"].strip() and state.get("endpoint_needs_auth")) else "false",
     })
     _write_profiles(state["profiles"])
+
+    if _screen1_mode:
+        # Called as the first-page screen — just save and return to the run flow.
+        return
+
     _ok_line("Credentials saved to Windows Credential Manager.")
 
     # ── Auth profiles that still need it ──────────────────────────────────
-    needs_auth = [
+    # Deduplicate by username — multiple profiles can share the same M365 account
+    needs_auth = list(dict.fromkeys(
         p["username"] for p in state["profiles"]
         if not is_token_valid(load_token(p["username"]) or {})
-    ]
+    ))
     if needs_auth:
         print()
         _gprint(
@@ -1946,15 +2004,21 @@ def _on_locust_init(environment, **kwargs):
 class _CsvWriter:
     """Background-thread CSV writer — non-blocking puts from Locust greenlets."""
 
+    _COLS = [
+        "event_category", "event", "timestamp", "elapsed_s", "user_count",
+        "spawn_num", "profile", "conversation_id",
+        "utterance_num", "scenario", "utterance", "bot_response",
+        "utterance_sent_at", "response_received_at", "response_ms", "timed_out",
+        "icon", "message",
+    ]
+
     def __init__(self) -> None:
         self._q: _queue.Queue = _queue.Queue()
-        self.detail_path: Path | None = None
-        self.events_path: Path | None = None
+        self.log_path: Path | None = None
         self._thread: threading.Thread | None = None
 
-    def start(self, detail_path: Path, events_path: Path) -> None:
-        self.detail_path = detail_path
-        self.events_path = events_path
+    def start(self, log_path: Path) -> None:
+        self.log_path = log_path
         self._thread = threading.Thread(target=self._run, name="csv-writer", daemon=True)
         self._thread.start()
 
@@ -1963,11 +2027,8 @@ class _CsvWriter:
         if self._thread:
             self._thread.join(timeout=8)
 
-    def write_detail(self, row: list) -> None:
-        self._q.put(("d", row))
-
-    def write_event(self, row: list) -> None:
-        self._q.put(("e", row))
+    def write(self, row: list) -> None:
+        self._q.put(row)
 
     def _run(self) -> None:
         while True:
@@ -1983,69 +2044,91 @@ class _CsvWriter:
                 return
             self._flush(item)
 
-    def _flush(self, item: tuple) -> None:
-        kind, row = item
-        path = self.detail_path if kind == "d" else self.events_path
-        if path:
-            with open(path, "a", newline="", encoding="utf-8") as f:
+    def _flush(self, row: list) -> None:
+        if self.log_path:
+            with open(self.log_path, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(row)
 
 
 _csv_writer = _CsvWriter()
 
 
-def _init_detail_log() -> None:
+def _init_run_log() -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    detail_path = REPORT_DIR / f"detail_{ts}.csv"
-    events_path = REPORT_DIR / f"events_{ts}.csv"
-    with open(detail_path, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([
-            "profile", "event_number", "scenario", "conversation_id",
-            "utterance", "bot_response",
-            "utterance_sent_at", "response_received_at", "response_ms",
-            "timed_out", "user_count",
-        ])
-    with open(events_path, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["timestamp", "elapsed_s", "icon", "event_type", "message", "ramp"])
-    _csv_writer.start(detail_path, events_path)
-    log.info("Detail log → %s", detail_path)
+    log_path = REPORT_DIR / f"run_log_{ts}.csv"
+    with open(log_path, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(_CsvWriter._COLS)
+    _csv_writer.start(log_path)
+    log.info("Run log → %s", log_path)
 
 
-def _log_request(profile: str, event_number: int, scenario: str, conv_id: str,
-                 utterance: str, bot_response: str,
-                 send_time: float, response_ms: float, timed_out: bool,
-                 user_count: int = 0) -> None:
-    if not _csv_writer.detail_path:
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _elapsed() -> float:
+    if _run_state.dashboard is not None:
+        return round(time.time() - _run_state.dashboard.start_time, 1)
+    return 0.0
+
+
+def _log_utterance(spawn_num: int, profile: str, utterance_num: int, scenario: str,
+                   conv_id: str, utterance: str, bot_response: str,
+                   send_time: float, response_ms: float, timed_out: bool,
+                   user_count: int = 0) -> None:
+    if not _csv_writer.log_path:
         return
     sent_at     = datetime.fromtimestamp(send_time, tz=timezone.utc).isoformat(timespec="milliseconds")
     received_at = datetime.fromtimestamp(send_time + response_ms / 1000, tz=timezone.utc).isoformat(timespec="milliseconds")
-    _csv_writer.write_detail([
-        profile, event_number, scenario, conv_id,
-        utterance, bot_response,
-        sent_at, received_at, f"{response_ms:.0f}",
-        "1" if timed_out else "0",
-        str(user_count),
+    _csv_writer.write([
+        "USER", "UTTERANCE", sent_at, _elapsed(), user_count,
+        spawn_num, profile, conv_id,
+        utterance_num, scenario, utterance, bot_response,
+        sent_at, received_at, f"{response_ms:.0f}", "1" if timed_out else "0",
+        "", "",
+    ])
+
+
+def _log_user_spawn(spawn_num: int, profile: str, conv_id: str, user_count: int) -> None:
+    if not _csv_writer.log_path:
+        return
+    _csv_writer.write([
+        "USER", "SPAWNED", _now_iso(), _elapsed(), user_count,
+        spawn_num, profile, conv_id,
+        "", "", "", "", "", "", "", "",
+        "", "",
+    ])
+
+
+def _log_user_exit(spawn_num: int, profile: str, conv_id: str, user_count: int) -> None:
+    if not _csv_writer.log_path:
+        return
+    _csv_writer.write([
+        "USER", "EXITED", _now_iso(), _elapsed(), user_count,
+        spawn_num, profile, conv_id,
+        "", "", "", "", "", "", "", "",
+        "", "",
     ])
 
 
 def _log_event(icon: str, event_type: str, message: str) -> None:
-    if not _csv_writer.events_path:
+    if not _csv_writer.log_path:
         return
-    ramp = 0
+    ramp_window = 0
     if _run_state.dashboard is not None:
         with _run_state.dashboard._lock:
-            ramp = _run_state.dashboard._cur_ramp_idx + 1
-    elapsed = 0.0
-    if _run_state.dashboard is not None:
-        elapsed = round(time.time() - _run_state.dashboard.start_time, 1)
-    _csv_writer.write_event([
-        datetime.now().strftime("%H:%M:%S"), elapsed, icon, event_type, message, ramp,
+            ramp_window = _run_state.dashboard._cur_ramp_idx + 1
+    _csv_writer.write([
+        "SYSTEM", event_type, _now_iso(), _elapsed(), ramp_window,
+        "", "", "",
+        "", "", "", "", "", "", "", "",
+        icon, message,
     ])
 
 
 @events.test_start.add_listener
 def _on_test_start(environment, **kwargs):
-    _init_detail_log()
+    _init_run_log()
     if "--headless" not in sys.argv and "-headless" not in sys.argv:
         return
     if not _user_auth_required():
@@ -2227,8 +2310,6 @@ class CopilotBaseUser(User):
     _transport_cls = _WsTransport
 
     def on_start(self):
-        if _run_state.all_users_done:
-            raise StopUser()
         self.profile     = self.__class__.fixed_profile
         self._transport  = self.__class__._transport_cls()
         self.conversation          = None
@@ -2239,6 +2320,21 @@ class CopilotBaseUser(User):
             _spawn_counters[key] = _spawn_counters.get(key, 0) + 1
             self._spawn_num = _spawn_counters[key]
         self._open_conversation()
+        _log_user_spawn(
+            self._spawn_num,
+            self.profile.get("display_name", self.profile.get("username", "?")),
+            self.conversation.id if self.conversation else "",
+            getattr(self.environment.runner, "user_count", 0),
+        )
+
+    def on_stop(self):
+        _log_user_exit(
+            self._spawn_num,
+            self.profile.get("display_name", self.profile.get("username", "?")),
+            self.conversation.id if self.conversation else "",
+            getattr(self.environment.runner, "user_count", 0),
+        )
+        self._transport.close()
 
     def _open_conversation(self):
         """Opens a fresh DirectLine conversation. Replaces any existing stream."""
@@ -2249,8 +2345,10 @@ class CopilotBaseUser(User):
         self.aad_token = None
         if _user_auth_required():
             try:
-                self.aad_token = get_valid_token(self.profile["username"])
-            except RuntimeError as e:
+                from gevent import Timeout as _GTimeout
+                with _GTimeout(30, RuntimeError("get_valid_token timed out after 30s")):
+                    self.aad_token = get_valid_token(self.profile["username"])
+            except Exception as e:
                 log.error("Auth failed for %s: %s", self.profile["username"], e)
                 _reason = _err_reason(e)
                 if _run_state.dashboard is not None:
@@ -2259,7 +2357,9 @@ class CopilotBaseUser(User):
                 raise StopUser()
 
         try:
-            dl_token = _retry_call(lambda: fetch_directline_token(self.aad_token))
+            from gevent import Timeout as _GTimeout
+            with _GTimeout(15, RuntimeError("fetch_directline_token timed out after 15s")):
+                dl_token = _retry_call(lambda: fetch_directline_token(self.aad_token))
         except Exception as e:
             log.error("DirectLine token fetch failed after retries: %s", e)
             _fire_metric(self.environment, "Fetch Token", 0, error=e)
@@ -2270,7 +2370,9 @@ class CopilotBaseUser(User):
             raise StopUser()
 
         try:
-            self.conversation = _retry_call(lambda: start_conversation(dl_token))
+            from gevent import Timeout as _GTimeout
+            with _GTimeout(15, RuntimeError("start_conversation timed out after 15s")):
+                self.conversation = _retry_call(lambda: start_conversation(dl_token))
         except Exception as e:
             log.error("Start conversation failed after retries: %s", e)
             _fire_metric(self.environment, "Start Conversation", 0, error=e)
@@ -2288,12 +2390,13 @@ class CopilotBaseUser(User):
         if not self._transport.refresh(self.conversation, self.environment):
             self._open_conversation()
 
-    def on_stop(self):
-        self._transport.close()
-
     def _send_and_measure(self):
         if self._idx >= len(self.utterances):
-            raise StopUser()
+            # Concurrent: loop same conversation unless ramp-down flag is set
+            if _run_state.mode == "Concurrent" and _run_state.phase != "RAMP_DOWN":
+                self._idx = 0
+            else:
+                raise StopUser()
         utterance = self.utterances[self._idx]
         self._idx += 1
 
@@ -2360,10 +2463,10 @@ class CopilotBaseUser(User):
                 # DirectLine closed the stream — not a bot failure. Reconnect silently.
                 self._refresh_stream()
                 return
-            _log_request(profile_label, self._idx, self.scenario_name,
-                         self.conversation.id, utterance, "",
-                         send_time, response.latency_ms, timed_out=True,
-                         user_count=_uc)
+            _log_utterance(self._spawn_num, profile_label, self._idx + 1, self.scenario_name,
+                           self.conversation.id, utterance, "",
+                           send_time, response.latency_ms, timed_out=True,
+                           user_count=_uc)
             _fire_metric(self.environment, _metric_name, response.latency_ms,
                          error=Exception("No bot reply received"))
             if _run_state.dashboard is not None:
@@ -2379,10 +2482,14 @@ class CopilotBaseUser(User):
             _log_event("✗", "timeout", _to_msg)
             self._consecutive_timeouts += 1
             if self._consecutive_timeouts >= 2:
+                if _run_state.phase == "RAMP_DOWN" or _run_state.mode == "Pipeline":
+                    # Ramp-down: don't restart, exit cleanly so count drops naturally
+                    # Pipeline: each user runs once, failure means stop
+                    raise StopUser()
                 if _run_state.dashboard is not None:
                     _run_state.dashboard.on_event("✗", f"2 consecutive T/Os — restarting — {profile_label}")
                 _log_event("✗", "timeout_consecutive", f"2 consecutive T/Os — restarting — {profile_label}")
-                self._open_conversation()
+                self._open_conversation()   # fetches fresh token — handles expiry
             return
 
         bot_text = " | ".join(
@@ -2390,10 +2497,10 @@ class CopilotBaseUser(User):
             for a in response.activities
             if a.get("text", "").strip()
         )[:500]
-        _log_request(profile_label, self._idx, self.scenario_name,
-                     self.conversation.id, utterance, bot_text,
-                     send_time, response.latency_ms, timed_out=False,
-                     user_count=_uc)
+        _log_utterance(self._spawn_num, profile_label, self._idx + 1, self.scenario_name,
+                       self.conversation.id, utterance, bot_text,
+                       send_time, response.latency_ms, timed_out=False,
+                       user_count=_uc)
         self._consecutive_timeouts = 0
         _fire_metric(self.environment, _metric_name, response.latency_ms)
         if _run_state.dashboard is not None:
@@ -2402,16 +2509,6 @@ class CopilotBaseUser(User):
                 self._idx, len(self.utterances), response.latency_ms, False,
                 bot_response=bot_text)
         gevent.sleep(random.randint(test_config.get("think_min", 30), test_config.get("think_max", 60)))
-
-        if self._idx >= len(self.utterances):
-            with _spawn_lock:
-                _run_state._completions += 1
-                if _run_state._completions >= test_config["users"] and not _run_state.all_users_done:
-                    _run_state.all_users_done = True
-                    if _run_state.dashboard is not None:
-                        _run_state.dashboard.on_event("✓", "All users completed scripts — winding down")
-                    _log_event("✓", "all_done", "All users completed scripts — winding down")
-            raise StopUser()
 
 
 # Dynamically create one User class per CSV file found in utterances/.
@@ -2792,10 +2889,17 @@ def _compute_dashboard_vm(snap: dict, runner, params: dict, state: "_DashboardSt
     p95_bar   = "█" * p95_fill + "░" * (10 - p95_fill)
     p95_warn  = " ⚠" if all_p95 > p95_tgt else ""
 
-    _spawn_done = elapsed >= (target / max(1, params.get("spawn_rate", 1))) * 60
-    if _spawn_done and curr < target:
-        phase_label, phase_style = "FINISHING",  "bold yellow"
-    elif curr >= target:
+    _phase    = _run_state.phase
+    _mode     = _run_state.mode
+    _finished = curr == 0 and _run_state.spawning_complete
+    if _finished:
+        phase_label, phase_style = "FINISHED ",  "bold cyan"
+        spawn_bar = "▓" * 10
+    elif _mode == "Pipeline":
+        phase_label, phase_style = "RUNNING  ",  "bold green"
+    elif _phase == "RAMP_DOWN":
+        phase_label, phase_style = "RAMP DOWN",  "bold yellow"
+    elif _phase == "AT_PEAK":
         phase_label, phase_style = "AT PEAK  ",  "bold green"
     else:
         phase_label, phase_style = "RAMPING UP", "bold white"
@@ -2870,7 +2974,7 @@ def _compute_dashboard_vm(snap: dict, runner, params: dict, state: "_DashboardSt
         "err_rate": err_rate, "rps": rps,
         "health": health, "hcol": hcol,
         "spawn_bar": spawn_bar, "p95_bar": p95_bar, "p95_warn": p95_warn,
-        "phase_label": phase_label, "phase_style": phase_style,
+        "phase_label": phase_label, "phase_style": phase_style, "finished": _finished,
         "ramps": ramps, "ramps_disp": ramps_disp,
         "finalized_count": len(_finalized),
         "knee_ramp": knee_ramp, "events_by_ramp": events_by_ramp,
@@ -2908,12 +3012,15 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
     root.add_column()
 
     # ── Header box ───────────────────────────────────────────────────────────
+    _user_col = "bold green" if curr > 0 else f"color({_G_DIM})"
     hdr = Table.grid(expand=True, padding=(0, 2))
-    hdr.add_column(ratio=5)
+    hdr.add_column(ratio=4)
+    hdr.add_column(ratio=2, justify="center")
     hdr.add_column(ratio=3, justify="center")
     hdr.add_column(ratio=2, justify="right")
     hdr.add_row(
-        Text("  GRUNTMASTER 6000  ·  LIVE", style="bold cyan"),
+        Text("  GRUNTMASTER 6000  ·  " + ("FINISHED" if vm["finished"] else "LIVE"), style="bold cyan"),
+        Text(f"⬤  {curr} / {target} active", style=_user_col),
         Text(health, style=f"bold {hcol}"),
         Text(f"{h:02d}:{m:02d}:{s:02d}", style="bold white"),
     )
@@ -2921,13 +3028,15 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
 
     # ── Spawning bar (own line) ───────────────────────────────────────────────
     root.add_row(Text(
-        f"  {vm['phase_label']}  {spawn_bar}  {curr} / {target} users",
+        f"  {vm['phase_label']}  {spawn_bar}",
         style=vm["phase_style"],
     ))
     # ── Config FYI ───────────────────────────────────────────────────────────
     root.add_row(Text(
-        f"  Peak: {target} users   Ramp: {params.get('spawn_rate', 0)}/min   "
-        f"Run time: {params.get('run_time', 0) // 60} min",
+        f"  Mode: {params.get('mode', 'Concurrent')}   "
+        f"Users: {target}   Ramp: {params.get('spawn_rate', 0)}/min"
+        + (f"   Run time: {params.get('run_time', 0) // 60} min"
+           if params.get('mode', 'Concurrent') == 'Concurrent' else ""),
         style=f"color({_G_DIM})",
     ))
     # ── Stats summary (own line) ──────────────────────────────────────────────
@@ -3141,11 +3250,12 @@ def _audit(csv_path: Path, snapshot: dict):
     all_ok = True
 
     # ── 1. Timestamp recheck ─────────────────────────────────────────
-    # NOTE: response_received_at is derived from send_time + response_ms/1000 (see _log_request).
+    # NOTE: response_received_at is derived from send_time + response_ms/1000 (see _log_utterance).
     # This check verifies that CSV serialisation round-trips cleanly, not measurement independence.
     try:
         import pandas as pd
-        df = pd.read_csv(csv_path)
+        _df_full = pd.read_csv(csv_path)
+        df = _df_full[_df_full["event"] == "UTTERANCE"].copy() if "event" in _df_full.columns else _df_full
         if "utterance_sent_at" in df.columns and "response_received_at" in df.columns:
             sent = pd.to_datetime(df["utterance_sent_at"], utc=True, errors="coerce")
             recv = pd.to_datetime(df["response_received_at"], utc=True, errors="coerce")
@@ -3167,7 +3277,8 @@ def _audit(csv_path: Path, snapshot: dict):
     # ── 2. Count reconciliation ──────────────────────────────────────
     try:
         import pandas as pd
-        df = pd.read_csv(csv_path)
+        _df_full = pd.read_csv(csv_path)
+        df = _df_full[_df_full["event"] == "UTTERANCE"].copy() if "event" in _df_full.columns else _df_full
         csv_total = len(df)
         dash_total = sum(len(v) for v in snapshot["times"].values()) + sum(snapshot["tout"].values())
         if csv_total == dash_total:
@@ -3217,29 +3328,29 @@ def _audit(csv_path: Path, snapshot: dict):
         console.print(Text(f"  Profile sum check      error: {e}", style="dim"))
 
     # ── 5. WS closure vs timeout classification ──────────────────────
-    # ws_closed events must be a strict subset of timed_out rows.
-    # If ws_closed > timed_out, a closure was not recorded as a timeout — counting bug.
-    _events_csv = csv_path.parent / csv_path.name.replace("detail_", "events_")
-    if _events_csv.exists():
-        try:
-            import pandas as pd
-            edf = pd.read_csv(_events_csv)
-            ws_closed_count = int((edf["event_type"] == "ws_closed").sum())
-            ddf = pd.read_csv(csv_path)
-            timed_out_count = int((ddf["timed_out"].astype(str) == "1").sum()) if "timed_out" in ddf.columns else 0
-            if ws_closed_count <= timed_out_count:
-                console.print(Text(
-                    f"  WS close vs T/O        ws_closed={ws_closed_count} ≤ timed_out={timed_out_count}   ✓",
-                    style="green"))
-            else:
-                console.print(Text(
-                    f"  WS close vs T/O        ws_closed={ws_closed_count} > timed_out={timed_out_count}  ← ws_close not counted as T/O   ✗",
-                    style="bold red"))
-                all_ok = False
-        except Exception as e:
-            console.print(Text(f"  WS close vs T/O        error: {e}", style="dim"))
-    else:
-        console.print(Text("  WS close vs T/O        skipped — events CSV not found", style="dim"))
+    # ws_closed SYSTEM events must be a strict subset of timed_out UTTERANCE rows.
+    try:
+        import pandas as pd
+        _df_all = pd.read_csv(csv_path)
+        if "event_category" in _df_all.columns:
+            edf = _df_all[_df_all["event_category"] == "SYSTEM"]
+            ddf = _df_all[(_df_all["event_category"] == "USER") & (_df_all["event"] == "UTTERANCE")]
+        else:
+            edf = pd.DataFrame()
+            ddf = _df_all
+        ws_closed_count = int((edf["event"] == "ws_closed").sum()) if not edf.empty and "event" in edf.columns else 0
+        timed_out_count = int((ddf["timed_out"].astype(str) == "1").sum()) if "timed_out" in ddf.columns else 0
+        if ws_closed_count <= timed_out_count:
+            console.print(Text(
+                f"  WS close vs T/O        ws_closed={ws_closed_count} ≤ timed_out={timed_out_count}   ✓",
+                style="green"))
+        else:
+            console.print(Text(
+                f"  WS close vs T/O        ws_closed={ws_closed_count} > timed_out={timed_out_count}  ← ws_close not counted as T/O   ✗",
+                style="bold red"))
+            all_ok = False
+    except Exception as e:
+        console.print(Text(f"  WS close vs T/O        error: {e}", style="dim"))
 
     # ── 6. Response time bounds sanity ───────────────────────────────
     # Non-timeout rows must be < (response_timeout + silence_timeout + 2s buffer).
@@ -3291,10 +3402,10 @@ Each simulated user follows a CSV script — one message per row — then stops.
 
 ## Settings
 
-**Peak users**
-The total number of simulated users that will be active at the same time once
-ramping is complete. Start with a number close to your expected production
-concurrency. Too high will affect real users; too low won't stress the bot.
+**Concurrent users**
+The number of simulated users running simultaneously at peak load.
+Start with a number close to your expected production concurrency.
+Too high will affect real users; too low won't stress the bot.
 
 **Spawn rate (users/min)**
 How quickly users are added. At 5/min, a new user joins every 12 seconds.
@@ -3346,41 +3457,46 @@ def _collect_run_params() -> dict:
     _HELP  = "  ?  Help"
     _EXIT  = "  ✕  Exit"
 
-    # Max utterances across all loaded CSVs — used for script duration estimate
     _utt_count = max(
         (len(_load_utterances(f)) for f in _csv_files),
         default=1,
     )
 
-    def _estimates(users: int, spawn: int, think: int, timeout: int) -> dict:
-        spawn_safe      = max(1, spawn)
-        ramp_mins       = round(users / spawn_safe, 1)
-        # Each user: utterances × (think + typical response time); use reply_timeout as ceiling
-        script_min_s    = _utt_count * (think + 5)          # optimistic: 5s response
-        script_max_s    = _utt_count * (think + timeout)    # pessimistic: full timeout each turn
-        script_min_m    = round(script_min_s / 60, 1)
-        script_max_m    = round(script_max_s / 60, 1)
-        total_min_m     = round(ramp_mins + script_min_m, 1)
-        total_max_m     = round(ramp_mins + script_max_m, 1)
-        cap_default     = int(total_max_m * 1.25) + 5       # 25% headroom + 5 min floor
+    def _estimates(users: int, spawn: int, think: int, timeout: int, mode: str, runtime_m: int) -> dict:
+        spawn_safe   = max(1, spawn)
+        ramp_mins    = round(users / spawn_safe, 1)
+        script_min_s = _utt_count * (think + 5)
+        script_max_s = _utt_count * (think + timeout)
+        script_min_m = round(script_min_s / 60, 1)
+        script_max_m = round(script_max_s / 60, 1)
+        if mode == "Concurrent":
+            # ramp_up + plateau + ramp_down (ramp_down ≈ ramp_up, natural stagger)
+            total_min_m = round(ramp_mins * 2 + runtime_m, 1)
+            total_max_m = round(ramp_mins * 2 + runtime_m, 1)
+        else:
+            # Pipeline: ramp_up + last user's utterances
+            total_min_m = round(ramp_mins + script_min_m, 1)
+            total_max_m = round(ramp_mins + script_max_m, 1)
         return dict(
             ramp_mins=ramp_mins,
             script_range=f"{script_min_m}–{script_max_m}",
             total_range=f"{total_min_m}–{total_max_m}",
-            cap_default=cap_default,
         )
 
-    est = _estimates(
-        test_config["users"], test_config["spawn_rate"],
-        test_config["think_min"], int(test_config["response_timeout"]),
-    )
+    _LAST_RUN_PATH = _HERE / "profiles" / "last_run.json"
+    _saved: dict = {}
+    try:
+        _saved = json.loads(_LAST_RUN_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
 
     state = {
-        "users":   test_config["users"],
-        "spawn":   test_config["spawn_rate"],
-        "think":   test_config["think_min"],
-        "timeout": int(test_config["response_timeout"]),
-        "cap":     test_config.get("run_time_mins", est["cap_default"]),
+        "mode":    _saved.get("mode",    "Concurrent"),
+        "users":   _saved.get("users",   test_config["users"]),
+        "spawn":   _saved.get("spawn",   test_config["spawn_rate"]),
+        "think":   _saved.get("think",   test_config["think_min"]),
+        "timeout": _saved.get("timeout", int(test_config["response_timeout"])),
+        "runtime": _saved.get("runtime", test_config.get("run_time_mins", 5)),
         "notes":   "",
     }
 
@@ -3389,6 +3505,13 @@ def _collect_run_params() -> dict:
 
     def _divider() -> str:
         return f"    {'─' * 80}"
+
+    def _edit(prompt: str, current) -> int:
+        v = _ginput(str(current), header=prompt, default=str(current))
+        try:
+            return int(v.strip()) if v and v.strip() else current
+        except ValueError:
+            return current
 
     while True:
         os.system("cls" if os.name == "nt" else "clear")
@@ -3399,202 +3522,199 @@ def _collect_run_params() -> dict:
             border_fg="99", padding="1 4", margin="1 0 1 0",
         )
 
-        est = _estimates(state["users"], state["spawn"], state["think"], state["timeout"])
+        _mode       = state["mode"]
+        _concurrent = _mode == "Concurrent"
+        est         = _estimates(state["users"], state["spawn"], state["think"],
+                                 state["timeout"], _mode, state["runtime"])
         notes_label = (state["notes"][:40] + "…") if len(state["notes"]) > 40 else (state["notes"] or "none")
+        _users_label = "Concurrent users" if _concurrent else "Total users"
+        _users_hint  = (
+            f"Number of users running simultaneously at peak load — each loops indefinitely for {state['runtime']} min"
+            if _concurrent else
+            f"Total users to run — each sends {_utt_count} message(s) once then exits"
+        )
 
-        # Indices for selectable items (read-only rows are skipped by index checks below)
-        # 0  Peak users
-        # 1  Spawn rate
-        # 2  Think time
-        # 3  Reply timeout
-        # 4  Max run time  (safety cap)
-        # 5  (divider — not selectable)
-        # 6  (Est. ramp-up — read-only)
-        # 7  (Est. script — read-only)
-        # 8  (Est. total — read-only)
-        # 9  (Silence window — read-only)
-        # 10 (Protocol — read-only)
-        # 11 Notes
-        # 12 Start / Help / Exit
+        # Build items + parallel action_keys for mode-independent dispatch
+        items       = []
+        action_keys = []
 
-        items = [
-            _prow("Peak users",
-                  state["users"], "users",
-                  f"Total users spawned — each runs {_utt_count} message(s) then leaves"),
-            _prow("Spawn rate",
-                  state["spawn"], "users/min",
-                  f"New users per minute — 1 user every {round(60/max(1,state['spawn']),0):.0f}s"),
-            _prow("Think time",
-                  state["think"], "seconds",
-                  "How long each user pauses between sending messages (simulates reading time)"),
-            _prow("Reply timeout",
-                  state["timeout"], "seconds",
-                  "Abort and record timeout if bot has not started responding within this long (min 15s)"),
-            _prow("Max run time  (safety cap)",
-                  state["cap"], "min",
-                  "Test force-stops here even if users are still running — set above Est. total"),
-            _divider(),
-            _prow("  ↳ Est. ramp-up",
-                  est["ramp_mins"], "min",
-                  f"Time until all {state['users']} users are active  ({state['users']} ÷ {state['spawn']}/min)"),
-            _prow("  ↳ Est. script / user",
-                  est["script_range"], "min",
-                  f"{_utt_count} msg × (think {state['think']}s + 5–{state['timeout']}s response)"),
-            _prow("  ↳ Est. total duration",
-                  est["total_range"], "min",
-                  "Ramp-up + last user's script — test ends when all users finish"),
-            _prow("Silence window",
-                  int(_SILENCE_TIMEOUT), "seconds",
-                  "Fixed — extra wait after bot's last message before declaring response complete"),
-            _prow("Protocol",
-                  "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket 🔒", "",
-                  "set by GRUNTMASTER_TRANSPORT env var" if test_config["transport"] == "http" else "DirectLine WebSocket over TLS — traffic is encrypted"),
-            _prow("Notes",
-                  notes_label, "",
-                  "Free-text label embedded in the HTML report for this run"),
-            _START,
-            _HELP,
-            _EXIT,
-        ]
+        items.append(_prow("Mode", _mode, "",
+                           "Concurrent = users loop at peak load for run time  ·  Pipeline = each user runs once"))
+        action_keys.append("mode")
 
-        choice = _gchoose(*items, header="\n  ↑ ↓  navigate     Enter  select     ↳ rows update as you change settings\n",
+        items.append(_prow(_users_label, state["users"], "users", _users_hint))
+        action_keys.append("users")
+
+        items.append(_prow("Spawn rate", state["spawn"], "users/min",
+                           f"New users per minute — 1 user every {round(60/max(1,state['spawn']),0):.0f}s"))
+        action_keys.append("spawn")
+
+        items.append(_prow("Think time", state["think"], "seconds",
+                           "Pause between sending messages (simulates reading time)"))
+        action_keys.append("think")
+
+        items.append(_prow("Reply timeout", state["timeout"], "seconds",
+                           f"Abort and record timeout if bot has not replied within this long (min 15s)"))
+        action_keys.append("timeout")
+
+        if _concurrent:
+            items.append(_prow("Run time", state["runtime"], "min",
+                               "Time to sustain peak load — ramp-up and ramp-down are separate"))
+            action_keys.append("runtime")
+
+        items.append(_divider())
+        action_keys.append(None)
+
+        items.append(_prow("  ↳ Est. ramp-up", est["ramp_mins"], "min",
+                           f"{state['users']} users ÷ {state['spawn']}/min"))
+        action_keys.append("_est")
+
+        if _concurrent:
+            items.append(_prow("  ↳ Est. total", est["total_range"], "min",
+                               "Ramp-up + run time + ramp-down  (ramp-down mirrors ramp-up)"))
+        else:
+            items.append(_prow("  ↳ Est. total", est["total_range"], "min",
+                               "Ramp-up + last user's utterances — ends when last user exits"))
+        action_keys.append("_est")
+
+        items.append(_prow("Silence window", int(_SILENCE_TIMEOUT), "seconds",
+                           "Fixed — extra wait after bot's last message before declaring response complete"))
+        action_keys.append("_silence")
+
+        items.append(_prow("Protocol",
+                           "HTTP ⚠ TEST MODE" if test_config["transport"] == "http" else "WebSocket 🔒", "",
+                           "set by GRUNTMASTER_TRANSPORT env var" if test_config["transport"] == "http"
+                           else "DirectLine WebSocket over TLS — traffic is encrypted"))
+        action_keys.append("_protocol")
+
+        items.append(_prow("Notes", notes_label, "",
+                           "Free-text label embedded in the HTML report for this run"))
+        action_keys.append("notes")
+
+        items.append(_START)
+        action_keys.append(None)
+        items.append(_HELP)
+        action_keys.append(None)
+        items.append(_EXIT)
+        action_keys.append(None)
+
+        choice = _gchoose(*items,
+                          header="\n  ↑ ↓  navigate     Enter  select     ↳ rows update as you change settings\n",
                           height=min(len(items) + 4, 22))
 
         if not choice:
             continue
         if choice.strip() == _EXIT.strip():
+            os.system("cls" if os.name == "nt" else "clear")
             sys.exit(0)
         if choice.strip() == _START.strip():
             break
         if choice.strip() == _HELP.strip():
-            if _gum_ok():
-                _gformat(_HELP_MD)
-            else:
-                print(_HELP_MD)
-            input("\n  Press Enter to return…")
+            _gpager(_HELP_MD)
             continue
 
-        idx = next((i for i, it in enumerate(items) if it.strip() == choice.strip()), -1)
+        idx    = next((i for i, it in enumerate(items) if it.strip() == choice.strip()), -1)
+        action = action_keys[idx] if 0 <= idx < len(action_keys) else None
 
-        def _edit(prompt: str, current) -> int:
-            v = _ginput(str(current), header=prompt, default=str(current))
-            try:
-                return int(v.strip()) if v and v.strip() else current
-            except ValueError:
-                return current
-
-        if idx == 0:
-            state["users"]  = _edit(
-                f"Total users to spawn  (each runs {_utt_count} message(s) once then leaves)\n"
-                f"  Current: {state['users']}",
-                state["users"])
-        elif idx == 1:
-            state["spawn"]  = max(1, _edit(
-                f"New users per minute  (controls how steeply load ramps up)\n"
-                f"  e.g. 5 = one new user every 12s   1 = one per minute\n"
-                f"  Current: {state['spawn']}",
+        if action == "users":
+            state["users"] = max(1, _edit(
+                f"{'Concurrent users at peak load' if _concurrent else 'Total users to run once'}"
+                f"  (current: {state['users']})",
+                state["users"]))
+        elif action == "spawn":
+            state["spawn"] = max(1, _edit(
+                f"New users per minute  (e.g. 5 = one every 12s)\n  Current: {state['spawn']}",
                 state["spawn"]))
-        elif idx == 2:
-            state["think"]  = max(25, _edit(
-                f"Pause each user takes between messages  (simulates time spent reading the reply)\n"
-                f"  Minimum 25s — shorter pauses are unrealistic and hammer the bot\n"
-                f"  Current: {state['think']}s",
+        elif action == "think":
+            state["think"] = max(25, _edit(
+                f"Pause between messages  (min 25s)\n  Current: {state['think']}s",
                 state["think"]))
-        elif idx == 3:
+        elif action == "timeout":
             state["timeout"] = max(15, _edit(
-                f"Seconds to wait for the bot's first reply before giving up\n"
-                f"  Minimum 15s — the silence window ({int(_SILENCE_TIMEOUT)}s) adds on top of this\n"
+                f"Seconds to wait for bot reply  (min 15s, silence window {int(_SILENCE_TIMEOUT)}s adds on top)\n"
                 f"  Current: {state['timeout']}s",
                 state["timeout"]))
-        elif idx == 4:
-            state["cap"] = max(1, _edit(
-                f"Safety cap — test force-stops at this many minutes even if users are still running\n"
-                f"  Set above the Est. total ({est['total_range']} min) to avoid cutting the test short\n"
-                f"  Current: {state['cap']} min",
-                state["cap"]))
-        elif idx in (5, 6, 7, 8):
+        elif action == "runtime":
+            state["runtime"] = max(1, _edit(
+                f"Minutes to sustain peak load  (ramp-up and ramp-down are not counted)\n"
+                f"  Current: {state['runtime']} min",
+                state["runtime"]))
+        elif action == "mode":
+            _picked = _gchoose("  Concurrent", "  Pipeline",
+                               header="\n  Concurrent — users loop at peak load\n"
+                                      "  Pipeline   — each user runs utterances once then exits\n")
+            if _picked:
+                state["mode"] = _picked.strip()
+        elif action == "_est":
             _gprint(
-                f"  Est. ramp-up {est['ramp_mins']} min  ·  "
-                f"Est. script {est['script_range']} min / user  ·  "
-                f"Est. total {est['total_range']} min\n"
-                f"  These update automatically — change Peak users, Spawn rate, or Think time to adjust.",
+                f"  Est. ramp-up {est['ramp_mins']} min  ·  Est. total {est['total_range']} min\n"
+                f"  These update automatically as you change settings.",
                 fg=_G_DIM, padding="0 2",
             )
-        elif idx == 9:
-            _gprint(f"  Silence window is fixed at {int(_SILENCE_TIMEOUT)}s — not configurable.", fg=_G_DIM, padding="0 2")
-        elif idx == 10:
-            _gprint("  Protocol is set by the GRUNTMASTER_TRANSPORT environment variable.", fg=_G_DIM, padding="0 2")
-        elif idx == 11:
+        elif action == "_silence":
+            _gprint(f"  Silence window is fixed at {int(_SILENCE_TIMEOUT)}s — not configurable.",
+                    fg=_G_DIM, padding="0 2")
+        elif action == "_protocol":
+            _gprint("  Protocol is set by the GRUNTMASTER_TRANSPORT environment variable.",
+                    fg=_G_DIM, padding="0 2")
+        elif action == "notes":
             if _gum_ok():
-                notes = _gwrite(
-                    "Describe this test run…",
-                    header="Test notes  (Ctrl-D to save · Esc to cancel)",
-                    width=68, height=6,
-                )
-                if notes:
-                    state["notes"] = notes
+                _nv = _gwrite("Describe this test run…",
+                              header="Test notes  (Ctrl-D to save · Esc to cancel)",
+                              width=68, height=6)
+                if _nv:
+                    state["notes"] = _nv
             else:
-                v = _ginput("Test notes", header="Describe this test run")
-                if v:
-                    state["notes"] = v
+                _nv = _ginput("Test notes", header="Describe this test run")
+                if _nv:
+                    state["notes"] = _nv
+
+    try:
+        _LAST_RUN_PATH.write_text(
+            json.dumps({
+                "mode":    state["mode"],
+                "users":   state["users"],
+                "spawn":   state["spawn"],
+                "think":   state["think"],
+                "timeout": state["timeout"],
+                "runtime": state["runtime"],
+            }, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
     test_config["think_min"]        = state["think"]
     test_config["think_max"]        = state["think"]
     test_config["response_timeout"] = max(15.0, float(state["timeout"]))
     test_config["users"]            = state["users"]
     test_config["spawn_rate"]       = state["spawn"]
-    test_config["run_time_mins"]    = state["cap"]
+    test_config["run_time_mins"]    = state["runtime"]
 
     return {
+        "mode":       state["mode"],
         "users":      state["users"],
         "spawn_rate": state["spawn"],
-        "run_time":   state["cap"] * 60,
+        "run_time":   state["runtime"] * 60 if state["mode"] == "Concurrent" else 0,
         "notes":      state["notes"],
     }
+
+
+
+
+def _screen1() -> None:
+    run_wizard(_screen1_mode=True)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    if not _is_configured():
+    # First run — no credentials at all → jump straight into wizard
+    if not any([_load_credential("CS_TENANT_ID"), _load_credential("CS_CLIENT_ID"),
+                _load_credential("CS_DIRECTLINE_SECRET"), _load_credential("CS_TOKEN_ENDPOINT")]):
         run_wizard()
-
-    _profiles = load_profiles()
 
     _show_startup_title()
-
-    _cred_status = _check_credentials()
-    if _cred_status == "missing":
-        sys.exit(1)
-    if _cred_status == "update":
-        run_wizard()
-        _profiles = load_profiles()
-
-    _needs_auth = _show_profile_status(_profiles)
-    if _needs_auth:
-        console.print(Panel(
-            f"[yellow]  {len(_needs_auth)} profile(s) need sign-in.\n"
-            "  Watch the prompts below — open the URL and enter the code.[/yellow]",
-            border_style="yellow",
-        ))
-        console.print()
-        if len(_needs_auth) > 1 and _gum_ok():
-            _chosen = _gchoose_multi(
-                *_needs_auth,
-                header="\n  Select profiles to authenticate now (Space = toggle, Enter = confirm):\n",
-                height=min(len(_needs_auth) + 4, 14),
-            )
-            _needs_auth = _chosen if _chosen else _needs_auth
-        for _username in _needs_auth:
-            if not _gconfirm(f"Authenticate {_username} now?", default=True):
-                console.print(f"  [dim]Skipping auth for {_username}[/dim]")
-                continue
-            if not _rocket_auth(_username):
-                console.print(f"[bold red]Auth failed for {_username}. Stopping.[/bold red]")
-                sys.exit(1)
-
-    if not _preflight_bot_check(_profiles):
-        sys.exit(1)
 
     os.environ["CS_SETUP_DONE"] = "1"
 
@@ -3602,8 +3722,52 @@ def main():
                      if isinstance(v, type) and issubclass(v, User)
                      and v not in (User, CopilotBaseUser, CopilotHttpUser)]
 
+    # "full"         → screen1 + preflight + collect params + run
+    # "params_only"  → collect params + run  (skip checks)
+    # "rerun"        → run with same params  (skip everything)
+    _next: str       = "full"
+    _params: dict    = {}
+
     while True:
-        _params = _collect_run_params()
+        if _next == "full":
+            # ── Screen 1: credentials + profiles ─────────────────────
+            _screen1()
+
+            # ── Screen 2: preflight ───────────────────────────────────
+            _profiles = load_profiles()
+            _ok = _preflight_bot_check(_profiles)
+            if not _ok:
+                # preflight failed — offer retry or go back to edit
+                _choice = _gchoose(
+                    "  ↺  Retry preflight",
+                    "  ⚙  Edit credentials / profiles",
+                    "  ✕  Exit",
+                    header="\n  Preflight failed. What next?\n",
+                    height=7,
+                )
+                if not _choice or "Exit" in _choice:
+                    os.system("cls" if os.name == "nt" else "clear")
+                    sys.exit(0)
+                if "Edit" in _choice:
+                    _next = "full"
+                    continue
+                # Retry → loop back (still "full")
+                continue
+
+            # ── Screen 3: test params ─────────────────────────────────
+            _params = _collect_run_params()
+
+        elif _next == "params_only":
+            _params = _collect_run_params()
+
+        # else: "rerun" — keep existing _params
+
+        _run_path = _next        # remember before resetting
+        _next = "full"           # default for next outer-loop iteration
+        if _run_path != "rerun":
+            os.system("cls" if os.name == "nt" else "clear")
+            sys.stdout.write("  Starting test…\n")
+            sys.stdout.flush()
 
         _profile_map = {
             cls.scenario_name: cls.fixed_profile.get(
@@ -3619,10 +3783,19 @@ def main():
             p95_target=test_config["p95_target_ms"],
             profile_map=_profile_map,
         )
+        _run_state.spawning_complete = False
+        _run_state.circuit_open_until = 0.0
         _run_state.dashboard = _dash
-        _run_state.all_users_done = False
-        _run_state._completions = 0
         _env.events.request.add_listener(_dash.on_request)
+        def _on_spawning_complete(user_count, **kw):
+            _run_state.spawning_complete = True
+            if _run_state.mode == "Pipeline":
+                # Stop Locust spawning replacements — users exit naturally, no respawn
+                try:
+                    _runner.stop()
+                except Exception:
+                    pass
+        _env.events.spawning_complete.add_listener(_on_spawning_complete)
 
         def _on_user_error(user_instance, exception, tb, **kw):
             from locust.exception import StopUser as _StopUser
@@ -3634,9 +3807,15 @@ def main():
             _log_event("✗", "unhandled_error", f"{type(exception).__name__}: {_reason}")
 
         _env.events.user_error.add_listener(_on_user_error)
+        _env.events.test_start.add_listener(_on_test_start)
+
+        _run_state.mode  = _params["mode"]
+        _run_state.phase = "RAMP_UP" if _params["mode"] == "Concurrent" else "RUNNING"
+        _ramp_rate_ps    = max(0.01, _params["spawn_rate"] / 60)   # users / second
+        _plateau_start   = 0.0
 
         _init_session(_params["users"])
-        _runner.start(user_count=_params["users"], spawn_rate=max(0.01, _params["spawn_rate"] / 60))
+        _runner.start(user_count=_params["users"], spawn_rate=_ramp_rate_ps)
 
         _stop_run   = [False]
         _prev_users = [0]
@@ -3644,8 +3823,6 @@ def main():
         def _keywatch():
             if os.name == "nt":
                 import msvcrt as _m
-                import ctypes
-                _k32 = ctypes.windll.kernel32
                 while not _stop_run[0]:
                     try:
                         if _m.kbhit():
@@ -3657,12 +3834,9 @@ def main():
                                 _m.getch()  # consume second byte of extended key
                     except Exception:
                         pass
-                    _k32.Sleep(50)  # raw Windows syscall — bypasses gevent.sleep patching
+                    gevent.sleep(0.05)
 
-        _kw = _RealThread(target=_keywatch, daemon=True)
-        _kw.start()
-
-        os.system("cls" if os.name == "nt" else "clear")
+        _kw = gevent.spawn(_keywatch)
 
         # Silence all log output to the terminal during the live dashboard — events feed carries what matters
         _null_handler = logging.NullHandler()
@@ -3671,30 +3845,51 @@ def main():
         logging.root.setLevel(logging.CRITICAL)
         _dash_err: "Exception | None" = None
         try:
-            with Live(console=console, auto_refresh=False, screen=False) as _live:
-                _deadline = time.time() + _params["run_time"]
+            with Live(console=console, auto_refresh=False, screen=True) as _live:
+                # Large safety backstop — natural exit fires first via spawning_complete + curr==0
+                _deadline = time.time() + 8 * 3600
                 while time.time() < _deadline and not _stop_run[0]:
                     _curr = getattr(_runner, "user_count", 0)
+                    _now  = time.time()
+
+                    # ── Phase transitions (Concurrent only) ──────────────────
+                    if _run_state.mode == "Concurrent":
+                        if _run_state.phase == "RAMP_UP" and _run_state.spawning_complete:
+                            _run_state.phase = "AT_PEAK"
+                            _plateau_start   = _now
+                            _log_event("⬤", "phase", f"AT PEAK — {_curr} users active")
+
+                        elif _run_state.phase == "AT_PEAK":
+                            # Plateau duration elapsed → start ramp-down
+                            if _now - _plateau_start >= _params["run_time"]:
+                                _run_state.phase = "RAMP_DOWN"
+                                _log_event("▼", "phase", f"RAMP DOWN — {_curr} users finishing current cycle")
+                                # Tell Locust to stop spawning replacements
+                                try:
+                                    _runner.start(user_count=0, spawn_rate=_ramp_rate_ps)
+                                except Exception:
+                                    pass
+
                     if _curr != _prev_users[0]:
                         _dash.set_user_count(_curr)
                         _prev_users[0] = _curr
                     _live.update(_render_dashboard(_dash.snapshot(), _runner, _params, _dash))
                     _live.refresh()
-                    if _run_state.all_users_done and _curr == 0:
+                    if _run_state.spawning_complete and _curr == 0:
                         break
                     gevent.sleep(0.5)
         except Exception as _e:
             _dash_err = _e
             import traceback as _tb
-            _dbg_path = REPORT_DIR / "debug.log"
-            with open(_dbg_path, "a", encoding="utf-8") as _f:
+            _debug_log_path = TMP_DIR / "_debug.log"
+            with open(_debug_log_path, "a", encoding="utf-8") as _f:
                 _f.write(f"\n[{datetime.now().isoformat()}] Dashboard crash:\n")
                 _tb.print_exc(file=_f)
             console.print(f"\n[bold red]Dashboard error: {_e}[/bold red]")
-            console.print(f"[dim]Details written to {_dbg_path}[/dim]")
+            console.print(f"[dim]Details written to {_debug_log_path}[/dim]")
 
         _stop_run[0] = True
-        _kw.join(timeout=0.2)
+        _kw.kill(block=False)
         try:
             _runner.quit()
             _runner.greenlet.join(timeout=8)   # don't hang if a user greenlet is mid-sleep
@@ -3711,13 +3906,12 @@ def main():
         # Print final dashboard snapshot to normal screen — options appear below it
         _final_snap = _dash.snapshot()
         console.print(_render_dashboard(_final_snap, _runner, _params, _dash))
-        _detail_path = _csv_writer.detail_path
-        _events_path = _csv_writer.events_path
-        if _detail_path and _detail_path.exists():
-            _audit(_detail_path, _final_snap)
+        _log_path = _csv_writer.log_path
+        if _log_path and _log_path.exists():
+            _audit(_log_path, _final_snap)
 
         # ── CI JSON summary ───────────────────────────────────────────────────
-        _ts_ci = (_detail_path.stem.replace("detail_", "") if _detail_path else
+        _ts_ci = (_log_path.stem.replace("run_log_", "") if _log_path else
                   datetime.now().strftime("%Y%m%d_%H%M%S"))
         _snap_times = _final_snap.get("times", {})
         _snap_tout  = _final_snap.get("tout", {})
@@ -3746,27 +3940,23 @@ def main():
         with _spawn_lock:
             _spawn_counters.clear()
 
-        if _detail_path and _detail_path.exists():
+        if _log_path and _log_path.exists():
             try:
                 sys.stdout.write("\n  ⏳  Generating report…\n")
                 sys.stdout.flush()
                 from report import generate_report as _gen_report
                 _run_notes = _params.get("notes", "")
-                _all_detail = sorted(REPORT_DIR.glob("detail_*.csv"), key=lambda p: p.stat().st_mtime)
-                _other = [p for p in _all_detail if p != _detail_path]
+                _all_logs = sorted(REPORT_DIR.glob("run_log_*.csv"), key=lambda p: p.stat().st_mtime)
+                _other = [p for p in _all_logs if p != _log_path]
                 _baseline = _other[-1] if _other else None
-                _rep = _with_spinner(
-                    "Generating HTML report…",
-                    lambda: _gen_report(
-                        _detail_path,
-                        p95_target=test_config["p95_target_ms"],
-                        notes=_run_notes,
-                        response_timeout=test_config["response_timeout"],
-                        silence_timeout=_SILENCE_TIMEOUT,
-                        events_csv=_events_path,
-                        run_config=_params,
-                        baseline_csv=_baseline,
-                    ),
+                _rep = _gen_report(
+                    _log_path,
+                    p95_target=test_config["p95_target_ms"],
+                    notes=_run_notes,
+                    response_timeout=test_config["response_timeout"],
+                    silence_timeout=_SILENCE_TIMEOUT,
+                    run_config=_params,
+                    baseline_csv=_baseline,
                 )
                 _gprint(f"  Report → {_rep}", fg=_G_CYAN, bold=True, padding="0 2", margin="0 1")
             except ImportError:
@@ -3775,23 +3965,36 @@ def main():
                 sys.stdout.write(f"\n  Report error: {_e}\n")
                 sys.stdout.flush()
 
+        # Drain any keypresses that accumulated during the test (e.g. 'q' to quit)
+        # so they don't auto-select a menu item in gum.
+        if os.name == "nt":
+            import msvcrt as _msvcrt
+            while _msvcrt.kbhit():
+                _msvcrt.getch()
+
         while True:
             _post = _gchoose(
-                "  ▶  New Run",
-                "  ⚙  Edit Settings",
+                "  ▶  Run again  (same settings)",
+                "  ⚙  New run  (edit params)",
+                "  ✎  Edit credentials",
                 "  ✕  Exit",
                 header="\n  What next?\n",
-                height=7,
+                height=8,
             )
             if not _post:
                 continue
-            if "Edit Settings" in _post:
-                run_wizard()
+            if "Edit credentials" in _post:
+                _next = "full"
                 break
             elif "Exit" in _post:
+                os.system("cls" if os.name == "nt" else "clear")
                 sys.exit(0)
-            else:
-                break  # New Run → outer loop continues
+            elif "Run again" in _post:
+                _next = "rerun"
+                break
+            else:  # New run (edit params)
+                _next = "params_only"
+                break
 
 
 if __name__ == "__main__":
