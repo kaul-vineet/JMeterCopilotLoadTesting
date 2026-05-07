@@ -3462,9 +3462,10 @@ Each bar = p95 latency in a 30-second window. Taller bar = slower responses.
 """
 
 
-def _collect_run_params() -> dict:
-    """Show all run params with defaults pre-filled. User selects any to change."""
+def _collect_run_params() -> "dict | None":
+    """Show all run params with defaults pre-filled. Returns None if user goes Back."""
     _START = "  ▶  Start test"
+    _BACK  = "  ←  Back"
     _HELP  = "  ?  Help"
     _EXIT  = "  ✕  Exit"
 
@@ -3604,6 +3605,8 @@ def _collect_run_params() -> dict:
 
         items.append(_START)
         action_keys.append(None)
+        items.append(_BACK)
+        action_keys.append(None)
         items.append(_HELP)
         action_keys.append(None)
         items.append(_EXIT)
@@ -3618,6 +3621,8 @@ def _collect_run_params() -> dict:
         if choice.strip() == _EXIT.strip():
             os.system("cls" if os.name == "nt" else "clear")
             sys.exit(0)
+        if choice.strip() == _BACK.strip():
+            return None
         if choice.strip() == _START.strip():
             break
         if choice.strip() == _HELP.strip():
@@ -3767,9 +3772,14 @@ def main():
 
             # ── Screen 3: test params ─────────────────────────────────
             _params = _collect_run_params()
+            if _params is None:       # Back → return to credentials screen
+                continue
 
         elif _next == "params_only":
             _params = _collect_run_params()
+            if _params is None:       # Back → return to credentials screen
+                _next = "full"
+                continue
 
         # else: "rerun" — keep existing _params
 
