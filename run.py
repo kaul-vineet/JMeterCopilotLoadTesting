@@ -3811,10 +3811,12 @@ def main():
         def _on_spawning_complete(user_count, **kw):
             _run_state.spawning_complete = True
             if _run_state.mode == "Pipeline":
-                # Set target to 0 so Locust won't respawn users that raise StopUser.
-                # Don't call runner.stop() — that kills greenlets immediately.
+                # Set the target directly to 0 so Locust won't respawn users
+                # after they raise StopUser. Do NOT call runner.start(0) —
+                # that kills all existing greenlets immediately and triggers
+                # Locust to spawn replacements, causing an infinite cycle.
                 try:
-                    _runner.start(user_count=0, spawn_rate=_ramp_rate_ps)
+                    _runner.target_user_count = 0
                 except Exception:
                     pass
         _env.events.spawning_complete.add_listener(_on_spawning_complete)
