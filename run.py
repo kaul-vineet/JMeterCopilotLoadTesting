@@ -3114,7 +3114,7 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
             )
             for _ev in events_by_ramp.get(s["ramp"], []):
                 _ic = _ev["icon"]
-                if _ic == "▶":
+                if _ic in ("▶", "→", "■"):   # skip lifecycle events — shown in EVENTS feed
                     continue
                 _es = "bold red" if _ic in ("⚡", "✗") else ("bold yellow" if _ic == "⚠" else "dim")
                 st.add_row(
@@ -3226,15 +3226,15 @@ def _render_dashboard(snap: dict, runner, params: dict, state: "_DashboardState"
             icon = ev.get("icon", "")
             if icon == "⚡":
                 prefix, style = "[P0] ", "bold red"
+                line = f"  {ev['ts']}  R{ev['ramp']}  {icon}  {prefix}{ev['message']}"
             elif icon in ("✗", "⚠"):
                 prefix = "[P1] "
                 style  = "bold yellow" if icon == "⚠" else "red"
+                line = f"  {ev['ts']}  R{ev['ramp']}  {icon}  {prefix}{ev['message']}"
             else:
-                prefix, style = "", "dim"
-            root.add_row(Text(
-                f"  {ev['ts']}  R{ev['ramp']}  {icon}  {prefix}{ev['message']}",
-                style=style,
-            ))
+                style = "dim"
+                line = f"  {icon}  {ev['message']}"
+            root.add_row(Text(line, style=style))
 
     # ── Acronym legend ────────────────────────────────────────────────────────
     legend = (
